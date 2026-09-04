@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "rangeStrategy": "update-lockfile",
+  "automerge": false,
+  "timezone": "Europe/Berlin",
+  "schedule": ["before 5am every weekday"],
+  "branchConcurrentLimit": 5,
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 0,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "schedule": ["at any time"],
+    "rangeStrategy": "bump",
+    "groupName": "security updates",
+    "groupSlug": "security",
+    "additionalBranchPrefix": "",
+    "commitMessagePrefix": "[security]",
+    "separateMajorMinor": false,
+  },
+  "osvVulnerabilityAlerts": true,
+  "packageRules": [
+    {
+      "matchPackageNames": ["*"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "all non-major dependencies",
+      "groupSlug": "deps-non-major",
+    },
+  ],
+}

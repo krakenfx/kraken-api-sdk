@@ -1,0 +1,5 @@
+[alias]
+ci-fmt = "fmt --all -- --check"
+ci-clippy = "clippy --all-targets --all-features --locked -- -Dwarnings -Drust-2018-idioms -Drust-2021-compatibility -Drust-2024-compatibility"
+ci-check = "check --all-targets --locked"
+ci-test = "test --locked"

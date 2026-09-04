@@ -1,0 +1,99 @@
+[package]
+name = "kraken-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Async-native Rust SDK for the Kraken exchange — one unified interface across Kraken Spot REST and Spot WebSocket v2."
+repository = "https://github.com/krakenfx/kraken-api-sdk"
+documentation = "https://docs.rs/kraken-sdk"
+readme = "README.md"
+keywords = ["kraken", "cryptocurrency", "trading", "exchange", "async"]
+categories = ["api-bindings", "asynchronous", "finance"]
+
+# Internal layering (callers never see this — it shapes the module tree):
+#   src/build/      construction: ClientBuilder + Client
+#   src/api/        public API: market / account / trade / subscription / events namespaces
+#   src/dispatch/   the async I/O reactor + event bus + dispatch table
+#   src/conn/       connection state machines, subscription registry
+#   src/rate_limit/ rate-limit trackers
+#   src/auth/       credential signing + WS-token lifecycle
+#   src/transport/  thin HTTP + WebSocket adapters
+
+[features]
+# Re-exports internal types for in-repo integration tests only. Not for callers.
+test-support = []
+
+[dependencies]
+
+# Async runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net", "io-util", "signal"] }
+
+# Exact decimal arithmetic for all monetary values — never f64.
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+
+# Client order IDs default to a UUID v4 (used as the idempotency key).
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Serialization for REST envelopes + WebSocket frames.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+
+# Derived string forms (`Display`/`AsRefStr`/`IntoStaticStr`) for public
+# unit-only enums; tests pin them to the serde/wire strings so they can't drift.
+strum = { version = "0.28", features = ["derive"] }
+
+# TOML config-file parsing (one of the supported config sources).
+toml = "1.0"
+
+# HTTP client for REST. `rustls` verifies against the platform trust store — a
+# deployment image without a CA bundle fails every request.
+# Transitive MSRV caps (Cargo.lock): `idna_adapter` 1.2.1 + `icu_*` 2.1.x —
+# 1.2.2 / 2.2+ need rustc ≥ 1.86. Re-pin with `cargo update -p … --precise`
+# after a floating `cargo update`.
+reqwest = { version = "0.13", features = ["json", "query", "rustls"], default-features = false }
+
+# WebSocket client for Spot WS v2.
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"   # Sink/Stream extensions for the WebSocket halves.
+
+# HMAC-SHA512 signing for Spot REST authentication.
+hmac = "0.13"
+sha2 = "0.11"
+base64 = "0.23"
+
+# CRC32 checksum validation for the WebSocket order-book channel.
+crc32fast = "1"
+
+# Bounded LRU backing the `cl_ord_id → (pair, sent_at)` trading-cost index.
+# The std-HashMap backend (default-features off) avoids a second hashbrown major.
+lru = { version = "0.18.2", default-features = false }
+
+# Volatile-write credential wiping; `ApiSecret`/`WsToken` buffers zero on drop.
+zeroize = { version = "1", features = ["derive"] }
+
+# Typed error hierarchy.
+thiserror = "2"
+
+# Async traits for the public API layer.
+async-trait = "0.1"
+
+# Structured logging / tracing.
+tracing = "0.1"
+# Exact pin: serde_with >= 3.18 needs rustc 1.88 (above rust-version 1.85).
+serde_with = { version = "=3.22.0", default-features = false, features = ["macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lib]
+name = "kraken_sdk"
+path = "src/lib.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+debug = "limited"

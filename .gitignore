@@ -1,0 +1,13 @@
+# Build artifacts (any language dir, e.g. rust/target/)
+**/target/
+
+# Local agent / tooling worktrees + state
+.claude/
+
+# Local credentials — NEVER commit (use env vars / a secrets manager)
+.env
+.env.*
+
+# OS / editor cruft
+.DS_Store
+*.swp

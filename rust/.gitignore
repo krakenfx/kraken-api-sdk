@@ -1,0 +1,9 @@
+target/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.claude/
+
+# Local soak-campaign artifacts (never commit)
+soak-logs/
