@@ -200,15 +200,15 @@ impl Drop for Client {
     fn drop(&mut self) {
         // begin_shutdown first so abort is an intended stop, not LoopFailedEvent.
         self.bus.begin_shutdown();
-        if let Ok(mut g) = self.io_reactor_handle.lock() {
-            if let Some(join) = g.take() {
-                join.abort();
-                // Abort before first poll never arms LoopDeathGuard — engage death path.
-                self.bus.on_loop_death(
-                    crate::dispatch::ReactorName::Io,
-                    crate::dispatch::LoopFailureCause::Cancelled,
-                );
-            }
+        if let Ok(mut g) = self.io_reactor_handle.lock()
+            && let Some(join) = g.take()
+        {
+            join.abort();
+            // Abort before first poll never arms LoopDeathGuard — engage death path.
+            self.bus.on_loop_death(
+                crate::dispatch::ReactorName::Io,
+                crate::dispatch::LoopFailureCause::Cancelled,
+            );
         }
     }
 }

@@ -174,10 +174,10 @@ pub(crate) fn add_order_exec(
                 snap_on_rest_rejection(&rest, codes, Some(&pair), sent_at);
             }
             // Populate the cl_ord_id→pair index on engine-accept (Ok branch only).
-            if result.is_ok() {
-                if let Some(c) = cl_ord_id.clone() {
-                    rest.cl_ord_id_index().insert(c, pair, sent_at);
-                }
+            if result.is_ok()
+                && let Some(c) = cl_ord_id.clone()
+            {
+                rest.cl_ord_id_index().insert(c, pair, sent_at);
             }
             if let Some(c) = cl_ord_id.clone() {
                 emit_rest_submit_outcome(
@@ -674,11 +674,12 @@ fn index_placed_batch_rows(
         "AddOrderBatch response MUST be 1:1 positional with the request"
     );
     for (entry, line) in entries.iter().zip(rows.iter()) {
-        if line.txid.is_some() && line.error.is_none() {
-            if let Some(cl_ord_id) = entry.cl_ord_id.clone() {
-                rest.cl_ord_id_index()
-                    .insert(cl_ord_id, pair.clone(), sent_at);
-            }
+        if line.txid.is_some()
+            && line.error.is_none()
+            && let Some(cl_ord_id) = entry.cl_ord_id.clone()
+        {
+            rest.cl_ord_id_index()
+                .insert(cl_ord_id, pair.clone(), sent_at);
         }
     }
 }

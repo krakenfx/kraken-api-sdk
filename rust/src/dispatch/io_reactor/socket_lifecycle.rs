@@ -40,8 +40,8 @@ pub(in crate::dispatch::io_reactor) fn wire_upgrade_bridge(
         crate::dispatch::EventType::WsUpgradeOk,
         connection_id,
         Box::new(move |env| {
-            if let crate::dispatch::EventPayload::WsUpgradeOk { connection_id, url } = env.payload {
-                if let Err(e) = tx_ok.try_send(UpgradeOutcome::Ok { url, connection_id }) {
+            if let crate::dispatch::EventPayload::WsUpgradeOk { connection_id, url } = env.payload
+                && let Err(e) = tx_ok.try_send(UpgradeOutcome::Ok { url, connection_id }) {
                     tracing::error!(
                         target: "kraken_sdk::io_reactor",
                         ?url, connection_id, error = ?e,
@@ -55,7 +55,6 @@ pub(in crate::dispatch::io_reactor) fn wire_upgrade_bridge(
                         transient: true,
                     });
                 }
-            }
             true
         }),
     );
@@ -104,10 +103,10 @@ pub(in crate::dispatch::io_reactor) fn project_socket_and_wire_bridge(
         Some(s) => {
             let cid = s.connection_id();
             sockets.insert(url, Arc::clone(s));
-            if Some(cid) != prev_cid {
-                if let Some(bus) = bus_back_ref.upgrade() {
-                    upgrade_guards.insert(url, wire_upgrade_bridge(cid, &bus, upgrade_tx));
-                }
+            if Some(cid) != prev_cid
+                && let Some(bus) = bus_back_ref.upgrade()
+            {
+                upgrade_guards.insert(url, wire_upgrade_bridge(cid, &bus, upgrade_tx));
             }
         }
         None => {

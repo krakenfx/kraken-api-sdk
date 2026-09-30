@@ -149,15 +149,14 @@ impl<Req: Send + 'static, Resp: Send + 'static> IntoFuture for PendingTrade<Req,
         // An explicit `.via(...)` with no dispatch entry for this op rejects
         // pre-wire. The knob default is a preference, not a selection — it
         // never rejects; a single-transport op serves its only leg.
-        if let Some(explicit) = self.transport_override {
-            if self
+        if let Some(explicit) = self.transport_override
+            && self
                 .dispatch
                 .resolve(self.op, Product::Spot, explicit)
                 .is_err()
-            {
-                let err = super::unsupported_transport(self.op, &self.dispatch, explicit);
-                return Box::pin(async move { Err(err) });
-            }
+        {
+            let err = super::unsupported_transport(self.op, &self.dispatch, explicit);
+            return Box::pin(async move { Err(err) });
         }
         let ctx = WsOrderCtx {
             ws: self.ws,

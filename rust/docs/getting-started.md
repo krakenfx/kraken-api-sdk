@@ -2,16 +2,16 @@
 
 ## Installation
 
-Add the crate to `Cargo.toml`:
+Depend on the tagged release:
 
 ```toml
 [dependencies]
-kraken-sdk = "0.1.0"
+kraken-sdk = { git = "https://github.com/krakenfx/kraken-api-sdk", tag = "v0.1.0" }
 tokio = { version = "1", features = ["full"] }
 rust_decimal = "1"
 ```
 
-Requires Rust 1.85 or later (edition 2024) and the tokio async runtime.
+Requires Rust 1.88 or later (edition 2024) and the tokio async runtime.
 
 ## Create a client
 

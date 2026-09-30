@@ -44,10 +44,10 @@ impl Drop for ArmedState {
         {
             return;
         }
-        if let Some(mut rx) = self.rx.take() {
-            if let Ok(env) = rx.try_recv() {
-                self.bus.relatch_correlated(&env);
-            }
+        if let Some(mut rx) = self.rx.take()
+            && let Ok(env) = rx.try_recv()
+        {
+            self.bus.relatch_correlated(&env);
         }
     }
 }

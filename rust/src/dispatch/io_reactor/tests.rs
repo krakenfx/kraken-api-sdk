@@ -3893,10 +3893,10 @@ mod auth_handshake_drive_tests {
         let poll = async {
             loop {
                 for body in sock.sent_text() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if v.get("req_id").and_then(serde_json::Value::as_u64) == Some(target) {
-                            return v;
-                        }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                        && v.get("req_id").and_then(serde_json::Value::as_u64) == Some(target)
+                    {
+                        return v;
                     }
                 }
                 tokio::task::yield_now().await;
@@ -4714,14 +4714,13 @@ mod order_autoconnect_tests {
         let poll = async {
             loop {
                 for body in sock.sent_text() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if v.get("method").and_then(serde_json::Value::as_str) == Some("add_order")
-                        {
-                            return v
-                                .get("req_id")
-                                .and_then(serde_json::Value::as_u64)
-                                .expect("req_id");
-                        }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                        && v.get("method").and_then(serde_json::Value::as_str) == Some("add_order")
+                    {
+                        return v
+                            .get("req_id")
+                            .and_then(serde_json::Value::as_u64)
+                            .expect("req_id");
                     }
                 }
                 tokio::task::yield_now().await;
@@ -5243,11 +5242,10 @@ mod order_autoconnect_tests {
         let poll = async {
             loop {
                 for body in sock.sent_text() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if v.get("method").and_then(serde_json::Value::as_str) == Some("add_order")
-                        {
-                            return v;
-                        }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                        && v.get("method").and_then(serde_json::Value::as_str) == Some("add_order")
+                    {
+                        return v;
                     }
                 }
                 tokio::task::yield_now().await;
@@ -5686,16 +5684,15 @@ mod order_autoconnect_tests {
                     for i in 0..factory.created_count() {
                         if let Some(h) = factory.handle(i) {
                             for body in h.sent_text() {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                                    if v.get("method").and_then(serde_json::Value::as_str)
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                                    && v.get("method").and_then(serde_json::Value::as_str)
                                         == Some("add_order")
-                                    {
-                                        let rid = v
-                                            .get("req_id")
-                                            .and_then(serde_json::Value::as_u64)
-                                            .expect("req_id");
-                                        return (h, rid);
-                                    }
+                                {
+                                    let rid = v
+                                        .get("req_id")
+                                        .and_then(serde_json::Value::as_u64)
+                                        .expect("req_id");
+                                    return (h, rid);
                                 }
                             }
                         }
@@ -5755,21 +5752,19 @@ mod order_autoconnect_tests {
                             if let Some(h) = factory.handle(i) {
                                 for body in h.sent_text() {
                                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
-                                    {
-                                        if v.get("method").and_then(serde_json::Value::as_str)
+                                        && v.get("method").and_then(serde_json::Value::as_str)
                                             == Some("add_order")
-                                        {
-                                            let rid = v
-                                                .get("req_id")
-                                                .and_then(serde_json::Value::as_u64)
-                                                .expect("req_id");
-                                            if acked.contains(&rid) {
-                                                continue;
-                                            }
-                                            match &best {
-                                                Some((_, b)) if *b <= rid => {}
-                                                _ => best = Some((h.clone(), rid)),
-                                            }
+                                    {
+                                        let rid = v
+                                            .get("req_id")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .expect("req_id");
+                                        if acked.contains(&rid) {
+                                            continue;
+                                        }
+                                        match &best {
+                                            Some((_, b)) if *b <= rid => {}
+                                            _ => best = Some((h.clone(), rid)),
                                         }
                                     }
                                 }
@@ -6202,11 +6197,10 @@ mod order_autoconnect_tests {
         let poll = async {
             loop {
                 for body in sock.sent_text() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if v.get("method").and_then(serde_json::Value::as_str) == Some("add_order")
-                        {
-                            return v["req_id"].as_u64().unwrap();
-                        }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                        && v.get("method").and_then(serde_json::Value::as_str) == Some("add_order")
+                    {
+                        return v["req_id"].as_u64().unwrap();
                     }
                 }
                 tokio::task::yield_now().await;
@@ -6345,13 +6339,13 @@ mod order_autoconnect_tests {
         let poll = async {
             loop {
                 for body in sock.sent_text() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if v.get("method").and_then(serde_json::Value::as_str) == Some(method) {
-                            return v
-                                .get("req_id")
-                                .and_then(serde_json::Value::as_u64)
-                                .expect("req_id");
-                        }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                        && v.get("method").and_then(serde_json::Value::as_str) == Some(method)
+                    {
+                        return v
+                            .get("req_id")
+                            .and_then(serde_json::Value::as_u64)
+                            .expect("req_id");
                     }
                 }
                 tokio::task::yield_now().await;
@@ -7216,8 +7210,8 @@ mod data_callback_isolation_tests {
                 loop {
                     let n = factory.created_count();
                     for i in 0..n {
-                        if let Some(h) = factory.handle(i) {
-                            if h.sent_text().iter().any(|b| {
+                        if let Some(h) = factory.handle(i)
+                            && h.sent_text().iter().any(|b| {
                                 serde_json::from_str::<serde_json::Value>(b)
                                     .ok()
                                     .and_then(|v| {
@@ -7227,9 +7221,9 @@ mod data_callback_isolation_tests {
                                         Some(m && c)
                                     })
                                     .unwrap_or(false)
-                            }) {
-                                return h;
-                            }
+                            })
+                        {
+                            return h;
                         }
                     }
                     tokio::task::yield_now().await;
@@ -8254,16 +8248,12 @@ mod data_callback_isolation_tests {
                 loop {
                     let mut ids = Vec::new();
                     for body in sock.sent_text() {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                            if v.get("method").and_then(serde_json::Value::as_str)
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                            && v.get("method").and_then(serde_json::Value::as_str)
                                 == Some("add_order")
-                            {
-                                if let Some(id) =
-                                    v.get("req_id").and_then(serde_json::Value::as_u64)
-                                {
-                                    ids.push(id);
-                                }
-                            }
+                            && let Some(id) = v.get("req_id").and_then(serde_json::Value::as_u64)
+                        {
+                            ids.push(id);
                         }
                     }
                     if ids.len() >= n {

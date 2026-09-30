@@ -31,9 +31,11 @@ exchange. One unified, domain-grouped interface over Kraken's **Spot REST** and
 
 ## Install
 
+Depend on the tagged release:
+
 ```toml
 [dependencies]
-kraken-sdk = "0.1.0"
+kraken-sdk = { git = "https://github.com/krakenfx/kraken-api-sdk", tag = "v0.1.0" }
 tokio = { version = "1", features = ["full"] }
 ```
 

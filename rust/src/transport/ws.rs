@@ -217,15 +217,15 @@ impl WsSocket for TokioTungsteniteWsSocket {
 
 impl Drop for TokioTungsteniteWsSocket {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.reader_task.lock() {
-            if let Some(h) = guard.take() {
-                h.abort();
-            }
+        if let Ok(mut guard) = self.reader_task.lock()
+            && let Some(h) = guard.take()
+        {
+            h.abort();
         }
-        if let Ok(mut guard) = self.writer_task.lock() {
-            if let Some(h) = guard.take() {
-                h.abort();
-            }
+        if let Ok(mut guard) = self.writer_task.lock()
+            && let Some(h) = guard.take()
+        {
+            h.abort();
         }
     }
 }

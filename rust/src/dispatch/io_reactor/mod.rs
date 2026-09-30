@@ -576,40 +576,39 @@ pub async fn run(init: IoReactorInit) {
 
         // Once the ClientClose marker is set AND every conn is == Closed
         // (Failed/Idle don't count), emit one ClientClosedEvent and self-exit.
-        if let Some((request_id, initiated_at)) = pending_client_close {
-            if conns
+        if let Some((request_id, initiated_at)) = pending_client_close
+            && conns
                 .values()
                 .all(|mc| mc.state() == ConnectionState::Closed)
-            {
-                if let Some(bus) = bus_back_ref.upgrade() {
-                    let env = crate::dispatch::EventEnvelope {
-                        event_type: crate::dispatch::EventType::ClientClosedEvent,
-                        event_version: 1,
-                        timestamp_monotonic: bus.clock().now(),
-                        request_id: Some(request_id),
-                        payload: crate::dispatch::EventPayload::ClientClosedEvent {
-                            reason: crate::dispatch::ClientCloseReason::UserClose,
-                            initiated_at_monotonic: initiated_at,
-                        },
-                    };
-                    // Resolve the close() waiter DIRECTLY so its completion never depends
-                    // on the ring drain.
-                    bus.deliver_correlated(&env);
-                    // The broadcast copy carries request_id: None — a Some would re-run
-                    // correlation and latch a dead miss-buffer entry.
-                    bus.publish(crate::dispatch::EventEnvelope {
-                        request_id: None,
-                        ..env
-                    });
-                    bus.close_dispatch_and_drain().await;
-                }
-                tracing::debug!(
-                    target: "kraken_sdk::io_reactor",
-                    request_id,
-                    "client close complete (all connections Closed); reactor self-exiting"
-                );
-                break;
+        {
+            if let Some(bus) = bus_back_ref.upgrade() {
+                let env = crate::dispatch::EventEnvelope {
+                    event_type: crate::dispatch::EventType::ClientClosedEvent,
+                    event_version: 1,
+                    timestamp_monotonic: bus.clock().now(),
+                    request_id: Some(request_id),
+                    payload: crate::dispatch::EventPayload::ClientClosedEvent {
+                        reason: crate::dispatch::ClientCloseReason::UserClose,
+                        initiated_at_monotonic: initiated_at,
+                    },
+                };
+                // Resolve the close() waiter DIRECTLY so its completion never depends
+                // on the ring drain.
+                bus.deliver_correlated(&env);
+                // The broadcast copy carries request_id: None — a Some would re-run
+                // correlation and latch a dead miss-buffer entry.
+                bus.publish(crate::dispatch::EventEnvelope {
+                    request_id: None,
+                    ..env
+                });
+                bus.close_dispatch_and_drain().await;
             }
+            tracing::debug!(
+                target: "kraken_sdk::io_reactor",
+                request_id,
+                "client close complete (all connections Closed); reactor self-exiting"
+            );
+            break;
         }
     }
 

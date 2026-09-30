@@ -866,10 +866,10 @@ impl DispatchEventBus {
             if self.loop_failed.swap(true, Ordering::AcqRel) {
                 return;
             }
-            if loop_name == ReactorName::Dispatch {
-                if let Ok(mut g) = self.dispatch_reactor_state.lock() {
-                    *g = ReactorState::Failed(cause);
-                }
+            if loop_name == ReactorName::Dispatch
+                && let Ok(mut g) = self.dispatch_reactor_state.lock()
+            {
+                *g = ReactorState::Failed(cause);
             }
             self.resolve_live_correlated_on_death(loop_name, cause);
             // Best-effort broadcast (undelivered if the dispatch loop is the dead one).
@@ -1074,10 +1074,10 @@ impl DispatchEventBus {
 
 impl Drop for DispatchEventBus {
     fn drop(&mut self) {
-        if let Ok(mut g) = self.dispatch_reactor_join.lock() {
-            if let Some(join) = g.take() {
-                join.abort();
-            }
+        if let Ok(mut g) = self.dispatch_reactor_join.lock()
+            && let Some(join) = g.take()
+        {
+            join.abort();
         }
     }
 }

@@ -131,18 +131,18 @@ rate_limit_api_warning_pct = 0.60
     }
     println!();
 
-    if let Some(env) = resolved_cell.lock().unwrap().as_ref() {
-        if let EventPayload::ConfigResolved { source_map } = &env.payload {
-            let non_default: Vec<_> = source_map
-                .iter()
-                .filter(|(_, s)| **s != ConfigSource::Default)
-                .map(|(k, s)| format!("{k}={s}"))
-                .collect();
-            println!(
-                "[5a] observed ConfigResolved at build — non-default sources: {:?}",
-                non_default
-            );
-        }
+    if let Some(env) = resolved_cell.lock().unwrap().as_ref()
+        && let EventPayload::ConfigResolved { source_map } = &env.payload
+    {
+        let non_default: Vec<_> = source_map
+            .iter()
+            .filter(|(_, s)| **s != ConfigSource::Default)
+            .map(|(k, s)| format!("{k}={s}"))
+            .collect();
+        println!(
+            "[5a] observed ConfigResolved at build — non-default sources: {:?}",
+            non_default
+        );
     }
     println!();
 

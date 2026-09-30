@@ -167,15 +167,13 @@ pub(crate) fn compose_add_order_params(view: AddOrderWsView<'_>) -> serde_json::
             }
             p.insert("triggers".to_string(), serde_json::Value::Object(trig));
 
-            if limit_leg {
-                if let Some(p2) = view.price2 {
-                    let (value, price_type) = p2.to_ws();
-                    p.insert("limit_price".to_string(), decimal_to_json(&value));
-                    p.insert(
-                        "limit_price_type".to_string(),
-                        serde_json::Value::String(price_type.to_string()),
-                    );
-                }
+            if limit_leg && let Some(p2) = view.price2 {
+                let (value, price_type) = p2.to_ws();
+                p.insert("limit_price".to_string(), decimal_to_json(&value));
+                p.insert(
+                    "limit_price_type".to_string(),
+                    serde_json::Value::String(price_type.to_string()),
+                );
             }
         }
     }

@@ -27,6 +27,11 @@ One SDK design, implemented per language under its own top-level directory.
 | Rust + tokio | [`rust/`](rust/) | Spot trading + portfolio. |
 | C++ · Python · Go · TypeScript/JS | _(coming)_ | Coming soon. |
 
+## Documentation
+
+API reference and guides for Kraken's APIs and SDKs:
+<https://docs.kraken.com/home/sdks>
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for general contribution guidelines.

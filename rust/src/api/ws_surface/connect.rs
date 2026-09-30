@@ -84,12 +84,11 @@ impl WsSurface {
         let open_sub = self.bus.subscribe(
             EventType::ConnectionOpenEvent,
             Arc::new(move |env: &EventEnvelope| {
-                if let EventPayload::ConnectionOpenEvent { url: u, .. } = &env.payload {
-                    if *u == url {
-                        if let Some(tx) = tx_open.lock().expect("ensure_open tx lock").take() {
-                            let _ = tx.send(Ok(()));
-                        }
-                    }
+                if let EventPayload::ConnectionOpenEvent { url: u, .. } = &env.payload
+                    && *u == url
+                    && let Some(tx) = tx_open.lock().expect("ensure_open tx lock").take()
+                {
+                    let _ = tx.send(Ok(()));
                 }
             }),
             1,
@@ -99,12 +98,11 @@ impl WsSurface {
         let fail_sub = self.bus.subscribe(
             EventType::ConnectionFailedEvent,
             Arc::new(move |env: &EventEnvelope| {
-                if let EventPayload::ConnectionFailedEvent { url: u, .. } = &env.payload {
-                    if *u == url {
-                        if let Some(tx) = tx_fail.lock().expect("ensure_open tx lock").take() {
-                            let _ = tx.send(Err(ConnectionError::not_open()));
-                        }
-                    }
+                if let EventPayload::ConnectionFailedEvent { url: u, .. } = &env.payload
+                    && *u == url
+                    && let Some(tx) = tx_fail.lock().expect("ensure_open tx lock").take()
+                {
+                    let _ = tx.send(Err(ConnectionError::not_open()));
                 }
             }),
             1,
@@ -116,12 +114,11 @@ impl WsSurface {
         let closed_sub = self.bus.subscribe(
             EventType::ConnectionClosedEvent,
             Arc::new(move |env: &EventEnvelope| {
-                if let EventPayload::ConnectionClosedEvent { url: u, .. } = &env.payload {
-                    if *u == url {
-                        if let Some(tx) = tx_closed.lock().expect("ensure_open tx lock").take() {
-                            let _ = tx.send(Err(ConnectionError::not_open()));
-                        }
-                    }
+                if let EventPayload::ConnectionClosedEvent { url: u, .. } = &env.payload
+                    && *u == url
+                    && let Some(tx) = tx_closed.lock().expect("ensure_open tx lock").take()
+                {
+                    let _ = tx.send(Err(ConnectionError::not_open()));
                 }
             }),
             1,
@@ -134,12 +131,11 @@ impl WsSurface {
             let send_ready_sub = self.bus.subscribe(
                 EventType::ConnectionSendReadyEvent,
                 Arc::new(move |env: &EventEnvelope| {
-                    if let EventPayload::ConnectionSendReadyEvent { url: u, .. } = &env.payload {
-                        if *u == url {
-                            if let Some(tx) = tx_ready.lock().expect("ensure_open tx lock").take() {
-                                let _ = tx.send(Ok(()));
-                            }
-                        }
+                    if let EventPayload::ConnectionSendReadyEvent { url: u, .. } = &env.payload
+                        && *u == url
+                        && let Some(tx) = tx_ready.lock().expect("ensure_open tx lock").take()
+                    {
+                        let _ = tx.send(Ok(()));
                     }
                 }),
                 1,

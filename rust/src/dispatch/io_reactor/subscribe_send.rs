@@ -571,71 +571,69 @@ pub(in crate::dispatch::io_reactor) fn register_one_and_emit(
         registry.record_guard_ref(id, channel, &pair);
     }
 
-    if let Some(mc) = conns.get_mut(&url) {
-        if mc.state() == ConnectionState::Idle {
-            let prev_cid = mc.socket().map(|s| s.connection_id());
-            let request_id = connect_id_allocator.fetch_add(1, Ordering::Relaxed);
-            mc.handle_event(
-                crate::conn::managed_connection::FsmEvent::CallStartConnect { request_id },
-            );
-            write_mirror(state_mirrors, url, mc.state());
-            project_socket_and_wire_bridge(
-                mc,
-                url,
-                prev_cid,
-                sockets,
-                upgrade_guards,
-                bus_back_ref,
-                upgrade_tx,
-            );
-        }
+    if let Some(mc) = conns.get_mut(&url)
+        && mc.state() == ConnectionState::Idle
+    {
+        let prev_cid = mc.socket().map(|s| s.connection_id());
+        let request_id = connect_id_allocator.fetch_add(1, Ordering::Relaxed);
+        mc.handle_event(crate::conn::managed_connection::FsmEvent::CallStartConnect { request_id });
+        write_mirror(state_mirrors, url, mc.state());
+        project_socket_and_wire_bridge(
+            mc,
+            url,
+            prev_cid,
+            sockets,
+            upgrade_guards,
+            bus_back_ref,
+            upgrade_tx,
+        );
     }
 
     // 0→1 edge gate: a duplicate subscriber emits NO wire frame. A tombstone
     // revival lands here too (termination zeroed the refcount).
-    if count == 1 {
-        if let Some(mc) = conns.get_mut(&url) {
-            match url {
-                WsUrl::Auth => {
-                    // Open|Resubscribing send at once; Authenticating with nothing
-                    // in flight sends too — the signed subscribe IS the auth probe.
-                    if matches!(
-                        mc.state(),
-                        ConnectionState::Open | ConnectionState::Resubscribing
-                    ) || mc.authenticating_nothing_in_flight()
-                    {
-                        send_single_signed_subscribe(
-                            url,
-                            channel,
-                            pair.clone(),
-                            params,
-                            mc,
-                            sockets,
-                            auth_stack,
-                            bus_back_ref,
-                        );
-                    }
-                }
-                _ => {
-                    send_single_subscribe(
+    if count == 1
+        && let Some(mc) = conns.get_mut(&url)
+    {
+        match url {
+            WsUrl::Auth => {
+                // Open|Resubscribing send at once; Authenticating with nothing
+                // in flight sends too — the signed subscribe IS the auth probe.
+                if matches!(
+                    mc.state(),
+                    ConnectionState::Open | ConnectionState::Resubscribing
+                ) || mc.authenticating_nothing_in_flight()
+                {
+                    send_single_signed_subscribe(
                         url,
                         channel,
                         pair.clone(),
                         params,
                         mc,
                         sockets,
+                        auth_stack,
                         bus_back_ref,
                     );
                 }
+            }
+            _ => {
+                send_single_subscribe(
+                    url,
+                    channel,
+                    pair.clone(),
+                    params,
+                    mc,
+                    sockets,
+                    bus_back_ref,
+                );
             }
         }
     }
 
     // A non-empty auth registry falsifies the bare-order predicate; recompute
     // to clear a stale true.
-    if url == WsUrl::Auth {
-        if let Some(mc) = conns.get(&url) {
-            refresh_send_ready(url, mc, registry, auth_stack, auth_send_ready, bus_back_ref);
-        }
+    if url == WsUrl::Auth
+        && let Some(mc) = conns.get(&url)
+    {
+        refresh_send_ready(url, mc, registry, auth_stack, auth_send_ready, bus_back_ref);
     }
 }

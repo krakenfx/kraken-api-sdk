@@ -2,7 +2,7 @@
 name = "kraken-sdk"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Async-native Rust SDK for the Kraken exchange — one unified interface across Kraken Spot REST and Spot WebSocket v2."
 repository = "https://github.com/krakenfx/kraken-api-sdk"
@@ -80,8 +80,7 @@ async-trait = "0.1"
 
 # Structured logging / tracing.
 tracing = "0.1"
-# Exact pin: serde_with >= 3.18 needs rustc 1.88 (above rust-version 1.85).
-serde_with = { version = "=3.22.0", default-features = false, features = ["macros"] }
+serde_with = { version = "3.21", default-features = false, features = ["macros"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

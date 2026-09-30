@@ -444,26 +444,23 @@ impl SubscriptionRegistry {
     ) -> u32 {
         // Credit arm FIRST: a dead-lifetime bare release is owed to the ledger
         // — else stragglers would count a NEW tombstone down before its own holders.
-        if allow_credit {
-            if let Some(e) = self.entry_mut(channel, &pair) {
-                if e.stale_release_credits > 0 {
-                    e.stale_release_credits -= 1;
-                    return e.count;
-                }
-            }
+        if allow_credit
+            && let Some(e) = self.entry_mut(channel, &pair)
+            && e.stale_release_credits > 0
+        {
+            e.stale_release_credits -= 1;
+            return e.count;
         }
         // A bare release may consume a slot only while an unmatched BARE slot
         // exists; remaining holders all guard-backed means the release is a stray.
-        if allow_credit {
-            if let Some(e) = self.entry(channel, &pair) {
-                let holders = if e.is_tombstone() {
-                    e.tombstone_holders
-                } else {
-                    e.count
-                };
-                if holders.saturating_sub(self.guard_refs_at(channel, &pair, e.generation)) == 0 {
-                    return e.count;
-                }
+        if allow_credit && let Some(e) = self.entry(channel, &pair) {
+            let holders = if e.is_tombstone() {
+                e.tombstone_holders
+            } else {
+                e.count
+            };
+            if holders.saturating_sub(self.guard_refs_at(channel, &pair, e.generation)) == 0 {
+                return e.count;
             }
         }
         // Countdown arm is a liveness no-op: no epoch bump; final removal bumps
@@ -768,10 +765,10 @@ impl SubscriptionRegistry {
     /// No-op if the entry is absent or builder-less. Called before the WS
     /// unsubscribe+resubscribe so interim deltas drop until the fresh snapshot.
     pub fn begin_book_resync(&mut self, channel: ChannelName, pair: &Symbol) {
-        if let Some(e) = self.entries.get_mut(&channel).and_then(|m| m.get_mut(pair)) {
-            if let Some(b) = e.builder.as_mut() {
-                b.begin_resync();
-            }
+        if let Some(e) = self.entries.get_mut(&channel).and_then(|m| m.get_mut(pair))
+            && let Some(b) = e.builder.as_mut()
+        {
+            b.begin_resync();
         }
     }
 
@@ -1057,18 +1054,18 @@ pub(crate) fn build_subscribe_frame(
         SubscribeParams::BookRaw { depth, snapshot } => {
             // Raw deltas send the caller's exact depth; snapshot omitted → Kraken default
             p.insert("depth".to_string(), serde_json::json!(depth.as_wire_u32()));
-            if method == "subscribe" {
-                if let Some(s) = snapshot {
-                    p.insert("snapshot".to_string(), Value::Bool(s));
-                }
+            if method == "subscribe"
+                && let Some(s) = snapshot
+            {
+                p.insert("snapshot".to_string(), Value::Bool(s));
             }
         }
         SubscribeParams::Trade { snapshot } => {
             // Trade snapshot omitted → Kraken default
-            if method == "subscribe" {
-                if let Some(s) = snapshot {
-                    p.insert("snapshot".to_string(), Value::Bool(s));
-                }
+            if method == "subscribe"
+                && let Some(s) = snapshot
+            {
+                p.insert("snapshot".to_string(), Value::Bool(s));
             }
         }
         SubscribeParams::Ohlc { interval, snapshot } => {
@@ -1079,10 +1076,10 @@ pub(crate) fn build_subscribe_frame(
                 serde_json::json!(u64::from(interval)),
             );
             // `snapshot` is subscribe-only; omitted when None → Kraken's default.
-            if method == "subscribe" {
-                if let Some(s) = snapshot {
-                    p.insert("snapshot".to_string(), Value::Bool(s));
-                }
+            if method == "subscribe"
+                && let Some(s) = snapshot
+            {
+                p.insert("snapshot".to_string(), Value::Bool(s));
             }
         }
         SubscribeParams::Status | SubscribeParams::Executions | SubscribeParams::Balances => {}

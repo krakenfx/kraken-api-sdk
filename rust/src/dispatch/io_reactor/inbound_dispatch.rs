@@ -163,11 +163,9 @@ pub(super) async fn handle_inbound(
                     // Emptying the pending-ack set mid-Resubscribing leaves no ack
                     // to drive → Open; short-circuit per touched URL.
                     for (touched, u) in [(any_public, WsUrl::Public), (any_auth, WsUrl::Auth)] {
-                        if touched {
-                            if let Some(mc) = conns.get_mut(&u) {
-                                mc.complete_resubscribe_if_empty();
-                                write_mirror(state_mirrors, u, mc.state());
-                            }
+                        if touched && let Some(mc) = conns.get_mut(&u) {
+                            mc.complete_resubscribe_if_empty();
+                            write_mirror(state_mirrors, u, mc.state());
                         }
                     }
                 }
@@ -227,11 +225,9 @@ pub(super) async fn handle_inbound(
             }
             // Releasing the LAST pending entries mid-Resubscribing leaves no ack
             // to drive → Open; short-circuit.
-            if any_terminated {
-                if let Some(mc) = conns.get_mut(&channel_ws_url(wire)) {
-                    mc.complete_resubscribe_if_empty();
-                    write_mirror(state_mirrors, channel_ws_url(wire), mc.state());
-                }
+            if any_terminated && let Some(mc) = conns.get_mut(&channel_ws_url(wire)) {
+                mc.complete_resubscribe_if_empty();
+                write_mirror(state_mirrors, channel_ws_url(wire), mc.state());
             }
         }
         CallerInbound::WsRequestFrame {

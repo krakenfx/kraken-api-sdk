@@ -86,10 +86,10 @@ impl AuthStack {
         all_fields.push(("nonce", &nonce_value));
         // Step 2b — 2FA: the otp rides inside the signed body so the HMAC covers it.
         // Fill-if-absent: a caller's own `otp` in `fields` wins and is never doubled.
-        if !all_fields.iter().any(|(key, _)| *key == "otp") {
-            if let Some(otp) = self.otp.as_ref() {
-                all_fields.push(("otp", otp.as_str()));
-            }
+        if !all_fields.iter().any(|(key, _)| *key == "otp")
+            && let Some(otp) = self.otp.as_ref()
+        {
+            all_fields.push(("otp", otp.as_str()));
         }
 
         let body = encode_form(&all_fields);

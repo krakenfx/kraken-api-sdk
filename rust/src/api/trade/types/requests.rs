@@ -1166,10 +1166,10 @@ impl AddOrderBatchRequest {
             if let Some(u) = &e.userref {
                 form.push((p("userref"), u.to_string()));
             }
-            if let Some(of) = &e.oflags {
-                if let Some(csv) = oflags_to_wire(of) {
-                    form.push((p("oflags"), csv));
-                }
+            if let Some(of) = &e.oflags
+                && let Some(csv) = oflags_to_wire(of)
+            {
+                form.push((p("oflags"), csv));
             }
             if let Some(tif) = &e.time_in_force {
                 form.push((p("timeinforce"), tif.to_string()));

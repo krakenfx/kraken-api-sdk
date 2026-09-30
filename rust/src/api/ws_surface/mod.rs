@@ -200,12 +200,12 @@ impl WsSurface {
         {
             // Register never enqueued — compensate the caller-side +1 so has_handlers
             // does not stay true for a channel with no live handler.
-            if let Ok(mut mirror) = self.presence_mirror.write() {
-                if let Some(count) = mirror.get_mut(&channel) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        mirror.remove(&channel);
-                    }
+            if let Ok(mut mirror) = self.presence_mirror.write()
+                && let Some(count) = mirror.get_mut(&channel)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    mirror.remove(&channel);
                 }
             }
             tracing::warn!(
@@ -302,30 +302,29 @@ impl WsSurface {
         let mut charged = None;
         if let (Some(tracker), Some(auth), Some(clock)) =
             (&self.trading_rate_limit, &self.auth, &self.clock)
+            && let Some(key) = auth.api_key()
         {
-            if let Some(key) = auth.api_key() {
-                let now = clock.now();
-                match &cost {
-                    RateLimitCost::Trading { cost, pair } => {
-                        let scope = Scope::Pair(key.clone(), pair.clone());
-                        tracker.consume(scope.clone(), *cost, now)?;
-                        charged = Some((scope, *cost, now));
-                    }
-                    RateLimitCost::TradingAccountWide { cost } => {
-                        // Account-wide charge (cancel_all); not refunded — saturating
-                        // per-pair bump self-heals via decay.
-                        tracker.charge_account_wide(Scope::ApiKey(key.clone()), *cost, now);
-                    }
-                    RateLimitCost::Api { .. } | RateLimitCost::None => {}
+            let now = clock.now();
+            match &cost {
+                RateLimitCost::Trading { cost, pair } => {
+                    let scope = Scope::Pair(key.clone(), pair.clone());
+                    tracker.consume(scope.clone(), *cost, now)?;
+                    charged = Some((scope, *cost, now));
                 }
+                RateLimitCost::TradingAccountWide { cost } => {
+                    // Account-wide charge (cancel_all); not refunded — saturating
+                    // per-pair bump self-heals via decay.
+                    tracker.charge_account_wide(Scope::ApiKey(key.clone()), *cost, now);
+                }
+                RateLimitCost::Api { .. } | RateLimitCost::None => {}
             }
         }
         let (handle, reject) = self.send_request_inner(method, req_id, params);
-        if reject.is_some() {
-            if let (Some(tracker), Some((scope, cost, now))) = (&self.trading_rate_limit, charged) {
-                // Frame never posted — reverse the pre-charge at the same instant.
-                tracker.credit(scope, cost, now);
-            }
+        if reject.is_some()
+            && let (Some(tracker), Some((scope, cost, now))) = (&self.trading_rate_limit, charged)
+        {
+            // Frame never posted — reverse the pre-charge at the same instant.
+            tracker.credit(scope, cost, now);
         }
         Ok(handle)
     }

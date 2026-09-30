@@ -267,15 +267,16 @@ fn handle_request_response(
     // Steady-state Open token-stale recovery (must NOT widen in_auth_probe): FSM
     // self-loop (no teardown), invalidate token, force_refresh for the NEXT order,
     // drain this one RETRYABLE (never resent).
-    if mc.state() == ConnectionState::Open && url == WsUrl::Auth {
-        if let OrderAckAuth::AuthFailed(AuthErrorKind::TokenStale) = order_ack_auth {
-            mc.handle_event(crate::conn::managed_connection::FsmEvent::WireOrderAckTokenStale);
-            auth_stack.invalidate_cached_token();
-            mc.set_awaiting_token_refresh(true);
-            let _handle = auth_stack.force_refresh(crate::auth::RefreshReason::AuthHandshakeFailed);
-            mc.drain_one_retryable(req_id);
-            write_mirror(state_mirrors, url, mc.state());
-        }
+    if mc.state() == ConnectionState::Open
+        && url == WsUrl::Auth
+        && let OrderAckAuth::AuthFailed(AuthErrorKind::TokenStale) = order_ack_auth
+    {
+        mc.handle_event(crate::conn::managed_connection::FsmEvent::WireOrderAckTokenStale);
+        auth_stack.invalidate_cached_token();
+        mc.set_awaiting_token_refresh(true);
+        let _handle = auth_stack.force_refresh(crate::auth::RefreshReason::AuthHandshakeFailed);
+        mc.drain_one_retryable(req_id);
+        write_mirror(state_mirrors, url, mc.state());
     }
 
     if mc.pending_requests_contains(req_id) {
@@ -645,16 +646,16 @@ fn route_text_frame(
 
     // Sequence-gap detection BEFORE per-entry decode: a frame whose rows fail
     // decode was still received.
-    if matches!(channel, ChannelName::Executions | ChannelName::Balances) {
-        if let Some(seq) = json.get("sequence").and_then(Value::as_u64) {
-            let is_snapshot = msg_type == Some("snapshot");
-            if let Some(dropped) = registry.note_sequence(channel, seq, is_snapshot) {
-                tracing::warn!(
-                    target: "kraken_sdk::io_reactor", channel = channel_str, seq, dropped,
-                    "sequence gap on account channel; frames lost mid-connection"
-                );
-                emit_channel_gap_event(channel, dropped, bus_back_ref);
-            }
+    if matches!(channel, ChannelName::Executions | ChannelName::Balances)
+        && let Some(seq) = json.get("sequence").and_then(Value::as_u64)
+    {
+        let is_snapshot = msg_type == Some("snapshot");
+        if let Some(dropped) = registry.note_sequence(channel, seq, is_snapshot) {
+            tracing::warn!(
+                target: "kraken_sdk::io_reactor", channel = channel_str, seq, dropped,
+                "sequence gap on account channel; frames lost mid-connection"
+            );
+            emit_channel_gap_event(channel, dropped, bus_back_ref);
         }
     }
 

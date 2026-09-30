@@ -184,12 +184,12 @@ impl HandlerRegistry {
         if !removed {
             return;
         }
-        if let Ok(mut mirror) = self.presence_mirror.write() {
-            if let Some(count) = mirror.get_mut(&channel) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    mirror.remove(&channel);
-                }
+        if let Ok(mut mirror) = self.presence_mirror.write()
+            && let Some(count) = mirror.get_mut(&channel)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                mirror.remove(&channel);
             }
         }
     }
