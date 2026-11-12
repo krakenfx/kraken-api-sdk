@@ -3,11 +3,12 @@
 //! overlapping lifetimes of the same key, using only scalars it can observe —
 
 use super::*;
+use crate::types::Symbol;
 
 const DEPTH: usize = 7;
 
-fn key_pair() -> Option<Symbol> {
-    Some(Symbol::new("BTC/USD").unwrap())
+fn key_pair() -> Option<StreamSymbol> {
+    Some(StreamSymbol::from(Symbol::new("BTC/USD").unwrap()))
 }
 
 fn entry() -> SubscriptionEntry {

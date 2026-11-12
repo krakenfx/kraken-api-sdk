@@ -1,5 +1,5 @@
-//! Connection layer: Public + Auth managed connections and a host-scoped
-//! connection-rate budget. Supervisor methods are sync; completions arrive on
+//! Connection layer: managed connections (Spot Public + Auth, Unified Public +
+//! Private) and a shared connection-rate budget. Supervisor methods are sync; completions arrive on
 //! the event bus.
 
 pub mod managed_connection;
@@ -14,3 +14,4 @@ pub use subscribe_error::SubscribeErrorKind;
 pub use subscription_registry::SubscriptionRegistry;
 pub use subscription_registry::{SubscribeParams, SubscriptionEntry};
 pub use supervisor::ConnectionSupervisor;
+pub(crate) use supervisor::OrderGate;

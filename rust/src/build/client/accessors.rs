@@ -8,6 +8,7 @@ use crate::build::knobs::{KnobName, KnobValue, Knobs};
 use crate::conn::ManagedConnection;
 use crate::conn::subscription_registry::SubscriptionRegistry;
 use crate::dispatch::DispatchEventBus;
+use crate::dispatch::dispatch_table::Product;
 use crate::dispatch::io_reactor::{IoReactorInit, run as run_io_reactor};
 use crate::types::{ExpectedCompletionEvent, RequestHandle, WsUrl};
 
@@ -19,6 +20,7 @@ fn classify_disarm_failure(e: &crate::TradeError) -> Option<crate::dispatch::Dea
     use crate::dispatch::DeadmanDisarmCause as C;
     match e {
         crate::TradeError::RateLimited { .. } => Some(C::RateLimitExceeded),
+        crate::TradeError::QueueFull { .. } => Some(C::NetworkError),
         crate::TradeError::Transport { kind, .. } => Some(match kind {
             crate::TransportErrorKind::TcpConnectTimeout
             | crate::TransportErrorKind::RequestSentNoResponse => C::Timeout,
@@ -26,6 +28,46 @@ fn classify_disarm_failure(e: &crate::TradeError) -> Option<crate::dispatch::Dea
         }),
         _ => None,
     }
+}
+
+/// Log a failed close-time dead-man disarm and, when its cause is known, publish
+/// `DeadmanDisarmFailedEvent`. The disarm can resolve after the ring closes, so the
+/// event may never dispatch.
+fn publish_disarm_failure(
+    bus: &Arc<crate::dispatch::DispatchEventBus>,
+    product: crate::dispatch::dispatch_table::Product,
+    e: &crate::TradeError,
+) {
+    tracing::warn!(?product, error = ?e, "dead-man disarm on close() failed");
+    if let Some(cause) = classify_disarm_failure(e) {
+        let now = bus.clock().now();
+        bus.publish(crate::dispatch::EventEnvelope {
+            event_type: crate::dispatch::EventType::DeadmanDisarmFailedEvent,
+            event_version: 1,
+            timestamp_monotonic: now,
+            request_id: None,
+            payload: crate::dispatch::EventPayload::DeadmanDisarmFailedEvent {
+                url: product.order_ws_url(),
+                cause,
+                // retry_at is wall-clock; no lossless monotonic conversion.
+                retry_at_monotonic: None,
+                monotonic_ts: now,
+            },
+        });
+    }
+}
+
+fn spawn_close_disarm(
+    bus: &Arc<DispatchEventBus>,
+    product: Product,
+    disarm: impl Future<Output = Option<crate::TradeError>> + Send + 'static,
+) {
+    let bus = Arc::clone(bus);
+    tokio::spawn(async move {
+        if let Some(e) = disarm.await {
+            publish_disarm_failure(&bus, product, &e);
+        }
+    });
 }
 
 impl Client {
@@ -169,30 +211,20 @@ impl Client {
             }
         };
 
-        // Two ManagedConnections (Public + Auth).
-        let mut conns = std::collections::HashMap::with_capacity(2);
-        conns.insert(
-            WsUrl::Public,
-            ManagedConnection::new(
-                WsUrl::Public,
-                Arc::clone(&self.bus),
-                Arc::clone(&self.ws_factory) as Arc<dyn crate::transport::WsSocketFactoryLike>,
-                self.supervisor.rate_budget_clone(),
-                Arc::clone(&self.clock),
-                Arc::clone(&self.jitter),
-            ),
-        );
-        conns.insert(
-            WsUrl::Auth,
-            ManagedConnection::new(
-                WsUrl::Auth,
-                Arc::clone(&self.bus),
-                Arc::clone(&self.ws_factory) as Arc<dyn crate::transport::WsSocketFactoryLike>,
-                self.supervisor.rate_budget_clone(),
-                Arc::clone(&self.clock),
-                Arc::clone(&self.jitter),
-            ),
-        );
+        let mut conns = std::collections::HashMap::with_capacity(WsUrl::ALL.len());
+        for url in WsUrl::ALL {
+            conns.insert(
+                url,
+                ManagedConnection::new(
+                    url,
+                    Arc::clone(&self.bus),
+                    Arc::clone(&self.ws_factory),
+                    self.supervisor.rate_budget_clone(),
+                    Arc::clone(&self.clock),
+                    Arc::clone(&self.jitter),
+                ),
+            );
+        }
 
         let handler_registry =
             crate::dispatch::HandlerRegistry::new(Arc::clone(&self.presence_mirror));
@@ -210,8 +242,7 @@ impl Client {
                 capability_snapshot: self.current_capability_snapshot(),
             },
             connect_id_allocator: self.supervisor.handle_id_allocator(),
-            auth_has_subscriptions: self.supervisor.auth_has_subscriptions_hint(),
-            auth_send_ready: self.supervisor.auth_send_ready_flag(),
+            order_gate: self.supervisor.order_gate(),
         };
 
         // Dispatch reactor before IoReactor — else correlated completions never fire.
@@ -226,9 +257,13 @@ impl Client {
         completion
     }
 
-    /// Gracefully shut the client down (consumes the client). Resolves once both
-    /// WS connections drain, or [`CloseError::Interrupted`] if a loop died or the
+    /// Gracefully shut the client down (consumes the client). Resolves once every
+    /// managed WS connection drains, or [`CloseError::Interrupted`] if a loop died or the
     /// close marker could not be posted.
+    ///
+    /// Disarms, best effort and without waiting, each dead-man's switch this client requested an arm
+    /// for, unless a disarm requested after that arm was confirmed; none if no arm or no credentials.
+    /// A Futures disarm with no caller slot beyond the close marker's is skipped: `DeadmanDisarmFailedEvent`.
     ///
     /// ```no_run
     /// # async fn ex(client: kraken_sdk::Client) -> Result<(), kraken_sdk::CloseError> {
@@ -263,35 +298,18 @@ impl Client {
         // Arm before the marker so the reactor's terminal resolves this waiter.
         let completion = close_completion(handle, Arc::clone(&self.bus));
 
-        // Best-effort dead-man disarm over REST; a detached task awaits it.
-        let deadman = self
-            .trade
-            .cancel_all_orders_after(0)
-            .via(crate::dispatch::Transport::Rest);
-        let bus = std::sync::Arc::clone(&self.bus);
-        tokio::spawn(async move {
-            if let Err(e) = deadman.await {
-                // Disarm can resolve after the ring closes — event may never dispatch.
-                tracing::warn!(error = ?e, "dead-man disarm on close() failed");
-                if let Some(cause) = classify_disarm_failure(&e) {
-                    let now = bus.clock().now();
-                    bus.publish(crate::dispatch::EventEnvelope {
-                        event_type: crate::dispatch::EventType::DeadmanDisarmFailedEvent,
-                        event_version: 1,
-                        timestamp_monotonic: now,
-                        request_id: None,
-                        payload: crate::dispatch::EventPayload::DeadmanDisarmFailedEvent {
-                            cause,
-                            // retry_at is wall-clock; no lossless monotonic conversion.
-                            retry_at_monotonic: None,
-                            monotonic_ts: now,
-                        },
-                    });
-                }
+        if self.auth.api_key().is_some() {
+            if let Some(disarm) = self.trade.futures().begin_close_disarm(&self.bus) {
+                spawn_close_disarm(&self.bus, Product::Futures, disarm);
             }
-        });
 
-        // One close marker; reactor fans CallClose to both connections and self-exits.
+            // Best-effort dead-man disarm over REST; a detached task awaits it.
+            if let Some(disarm) = self.trade.begin_close_disarm() {
+                spawn_close_disarm(&self.bus, Product::Spot, disarm);
+            }
+        }
+
+        // One close marker; reactor fans CallClose to every managed connection and self-exits.
         match self.bus.try_post_caller_inbound_recovering_kind(
             crate::dispatch::CallerInbound::ClientClose {
                 request_id,
@@ -331,14 +349,9 @@ impl Client {
         ns.insert(NamespaceName::Account);
         ns.insert(NamespaceName::Trade);
         ns.insert(NamespaceName::Ws);
-        // v1: 2-WS topology.
-        let mut urls: std::collections::HashSet<WsUrl> =
-            std::collections::HashSet::with_capacity(2);
-        urls.insert(WsUrl::Public);
-        urls.insert(WsUrl::Auth);
         crate::types::CapabilitySnapshot {
             declared_namespaces: ns,
-            declared_ws_urls: urls,
+            declared_ws_urls: WsUrl::ALL.into_iter().collect(),
             discovered_at_first_use: std::collections::HashSet::new(),
         }
     }
@@ -346,9 +359,33 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_disarm_failure;
+    use super::{Client, classify_disarm_failure, publish_disarm_failure};
     use crate::dispatch::DeadmanDisarmCause as C;
+    use crate::dispatch::dispatch_table::Product;
+    use crate::types::WsUrl;
     use crate::{TradeError, TransportErrorKind};
+
+    #[test]
+    fn a_disarm_failure_reports_the_connection_of_the_product_it_targeted() {
+        let client = Client::builder().build().expect("client builds");
+        let refused = TradeError::RateLimited {
+            request_id: None,
+            retry_after_ts: None,
+        };
+        for product in [Product::Spot, Product::Futures] {
+            publish_disarm_failure(&client.bus, product, &refused);
+        }
+        let urls: Vec<WsUrl> = client
+            .bus
+            .test_drain_published()
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                crate::dispatch::EventPayload::DeadmanDisarmFailedEvent { url, .. } => Some(url),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(urls, [WsUrl::Auth, WsUrl::UnifiedPrivate]);
+    }
 
     #[test]
     fn disarm_failure_classifies_meaningful_causes_and_drops_the_impossible_tail() {
@@ -386,6 +423,138 @@ mod tests {
         assert_eq!(
             classify_disarm_failure(&TradeError::InsufficientFunds { request_id: None }),
             None
+        );
+    }
+
+    use crate::ApiKey;
+    use crate::test_logs::capture_logs;
+    use crate::transport::{HttpTransport, TransportError};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingTransport(Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl HttpTransport for RecordingTransport {
+        async fn get_json(
+            &self,
+            _path: &str,
+            _query_params: &[(&str, &str)],
+        ) -> Result<serde_json::Value, TransportError> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn post_form_signed(
+            &self,
+            path: &str,
+            _body: &str,
+            _api_key_header: &str,
+            _api_sign_header: &str,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.0.lock().expect("posts lock").push(path.to_owned());
+            Err(TransportError {
+                kind: TransportErrorKind::TcpRefused,
+                transient: false,
+            })
+        }
+    }
+
+    fn close_and_capture(
+        credentials: Option<(ApiKey, String)>,
+        futures_arm: bool,
+    ) -> (String, Vec<String>) {
+        let transport = Arc::new(RecordingTransport::default());
+        let rig_transport = Arc::clone(&transport);
+        let logs = capture_logs(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let client = {
+                    let _g = crate::build::test_env::env_lock();
+                    let builder = Client::builder().with_transport(rig_transport);
+                    match credentials {
+                        Some((key, secret)) => builder.with_api_key(key, secret),
+                        None => builder,
+                    }
+                    .build()
+                    .expect("build")
+                };
+                client
+                    .trade()
+                    .cancel_all_orders_after(60)
+                    .via(crate::dispatch::Transport::Rest)
+                    .await
+                    .expect_err("the arm is refused");
+                if futures_arm {
+                    client
+                        .trade()
+                        .futures()
+                        .cancel_all_orders_after(60)
+                        .await
+                        .expect_err("a Futures arm cannot be sent without credentials");
+                }
+                client.close().await.expect("close resolves Ok");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            });
+        });
+        let posts = transport.0.lock().expect("posts lock").clone();
+        (logs, posts)
+    }
+
+    const DISARM_FAILED: &str = "dead-man disarm on close() failed";
+
+    #[test]
+    fn close_without_credentials_does_not_attempt_a_dead_man_disarm() {
+        let (logs, posts) = close_and_capture(None, true);
+        assert!(
+            !logs.contains(DISARM_FAILED),
+            "no disarm may be attempted without credentials; logs: {logs}"
+        );
+        assert!(posts.is_empty(), "unexpected signed posts: {posts:?}");
+    }
+
+    #[tokio::test]
+    async fn close_without_credentials_queues_nothing_ahead_of_the_close_marker() {
+        let client = {
+            let _g = crate::build::test_env::env_lock();
+            Client::builder()
+                .with_knob(
+                    "caller_to_io_capacity",
+                    crate::build::knobs::KnobValue::U32(1),
+                )
+                .build()
+                .expect("build")
+        };
+        client
+            .trade()
+            .futures()
+            .cancel_all_orders_after(60)
+            .await
+            .expect_err("a Futures arm cannot be sent without credentials");
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.close())
+            .await
+            .expect("close must not hang")
+            .expect("a disarm must not take the slot the close marker needs");
+    }
+
+    #[test]
+    fn close_with_credentials_disarms_after_a_refused_spot_arm_and_logs_the_failure() {
+        use base64::Engine;
+        let secret = base64::engine::general_purpose::STANDARD.encode([0x01u8; 32]);
+
+        let (logs, posts) = close_and_capture(Some((ApiKey::new("test-key"), secret)), false);
+        assert_eq!(
+            posts,
+            [
+                "/0/private/CancelAllOrdersAfter",
+                "/0/private/CancelAllOrdersAfter"
+            ],
+            "the refused arm, then close's disarm"
+        );
+        assert!(
+            logs.contains(DISARM_FAILED),
+            "the refused disarm must log: {logs}"
         );
     }
 }

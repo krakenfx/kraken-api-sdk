@@ -10,7 +10,7 @@ use crate::api::trade::Side;
 use crate::types::AssetCode;
 use serde_with::skip_serializing_none;
 
-use crate::api::ws_decode::extract_data;
+use crate::api::ws_decode::{decimal, extract_data, is_snapshot_frame};
 
 /// Per-entry `exec_type` discriminator for the `executions` channel.
 #[derive(
@@ -177,6 +177,8 @@ pub struct ExecutionUpdate {
     pub cost: Option<Decimal>,
     /// Per-fill fee(s), one entry per asset; `None` on non-fill entries.
     pub fees: Option<Vec<ExecutionFee>>,
+    /// `true` when the entry arrived in the opening snapshot, `false` for a live update.
+    pub is_snapshot: bool,
 }
 
 /// One per-fill fee: an amount charged in a specific asset.
@@ -198,10 +200,9 @@ impl ExecutionUpdate {
 }
 
 pub(super) fn decode_executions(v: Value) -> Option<ExecutionUpdate> {
+    let is_snapshot = is_snapshot_frame(&v);
     let data = extract_data(v)?;
     let raw: RawExecution = serde_json::from_value(data).ok()?;
-    let parse_dec =
-        |opt: Option<Value>| -> Option<Decimal> { opt.as_ref().and_then(parse_wire_decimal) };
     Some(ExecutionUpdate {
         exec_type: raw.exec_type,
         order_id: raw.order_id,
@@ -223,15 +224,15 @@ pub(super) fn decode_executions(v: Value) -> Option<ExecutionUpdate> {
         cancel_reason: raw.cancel_reason,
         reason: raw.reason,
         liquidity_ind: raw.liquidity_ind,
-        order_qty: parse_dec(raw.order_qty),
-        limit_price: parse_dec(raw.limit_price),
-        cum_qty: parse_dec(raw.cum_qty),
-        cum_cost: parse_dec(raw.cum_cost),
-        avg_price: parse_dec(raw.avg_price),
-        last_qty: parse_dec(raw.last_qty),
-        last_price: parse_dec(raw.last_price),
-        fee_usd_equiv: parse_dec(raw.fee_usd_equiv),
-        cost: parse_dec(raw.cost),
+        order_qty: decimal(raw.order_qty),
+        limit_price: decimal(raw.limit_price),
+        cum_qty: decimal(raw.cum_qty),
+        cum_cost: decimal(raw.cum_cost),
+        avg_price: decimal(raw.avg_price),
+        last_qty: decimal(raw.last_qty),
+        last_price: decimal(raw.last_price),
+        fee_usd_equiv: decimal(raw.fee_usd_equiv),
+        cost: decimal(raw.cost),
         // Non-array shape or zero parseable entries -> None; a partially-valid
         // array keeps the entries that parsed.
         fees: raw.fees.as_ref().and_then(Value::as_array).and_then(|arr| {
@@ -246,6 +247,7 @@ pub(super) fn decode_executions(v: Value) -> Option<ExecutionUpdate> {
                 .collect();
             (!parsed.is_empty()).then_some(parsed)
         }),
+        is_snapshot,
     })
 }
 
@@ -328,27 +330,27 @@ pub struct BalanceUpdate {
     pub wallet_id: Option<String>,
 }
 
+pub(super) fn wallet_from_raw(w: RawWallet) -> Wallet {
+    Wallet {
+        wallet_type: w.wallet_type,
+        id: w.id,
+        balance: decimal(w.balance),
+    }
+}
+
 pub(super) fn decode_balances(v: Value) -> Option<BalanceUpdate> {
     let data = extract_data(v)?;
     let raw: RawBalance = serde_json::from_value(data).ok()?;
-    let parse_dec =
-        |opt: Option<Value>| -> Option<Decimal> { opt.as_ref().and_then(parse_wire_decimal) };
-    let wallets = raw.wallets.map(|ws| {
-        ws.into_iter()
-            .map(|w| Wallet {
-                wallet_type: w.wallet_type,
-                id: w.id,
-                balance: parse_dec(w.balance),
-            })
-            .collect()
-    });
+    let wallets = raw
+        .wallets
+        .map(|ws| ws.into_iter().map(wallet_from_raw).collect());
     Some(BalanceUpdate {
         asset: raw.asset.as_deref().map(AssetCode::from_wire),
         asset_class: raw.asset_class,
-        balance: parse_dec(raw.balance),
+        balance: decimal(raw.balance),
         wallets,
-        amount: parse_dec(raw.amount),
-        fee: parse_dec(raw.fee),
+        amount: decimal(raw.amount),
+        fee: decimal(raw.fee),
         ledger_id: raw.ledger_id,
         ref_id: raw.ref_id,
         timestamp: raw.timestamp,
@@ -596,8 +598,13 @@ mod tests {
             !obj.values().any(serde_json::Value::is_null),
             "absent optionals must be omitted, not null: {v}"
         );
-        assert_eq!(obj.len(), 2, "only the present fields survive: {v}");
+        assert_eq!(
+            obj.len(),
+            3,
+            "the present fields and is_snapshot survive: {v}"
+        );
         assert_eq!(v["order_id"], json!("OABC123"));
+        assert_eq!(v["is_snapshot"], json!(false));
     }
 
     /// `rename_all` applies on the way out too, so these variant names are a wire

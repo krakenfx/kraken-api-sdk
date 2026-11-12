@@ -60,7 +60,8 @@ impl AuthStack {
         path: &str,
         fields: Vec<(String, String)>,
     ) -> Result<SignedForm, AuthError> {
-        // Creds are guaranteed by construction; a miss is an SDK invariant.
+        // Credentials are optional at build and nothing upstream checks them, so a private
+        // call without them fails here with the generic INTERNAL code, not a typed error.
         let api_key = self.api_key.as_ref().ok_or_else(|| AuthError::Unknown {
             kraken_code: "INTERNAL".into(),
             kraken_message: "sign attempted without configured credentials".into(),
@@ -86,10 +87,10 @@ impl AuthStack {
         all_fields.push(("nonce", &nonce_value));
         // Step 2b — 2FA: the otp rides inside the signed body so the HMAC covers it.
         // Fill-if-absent: a caller's own `otp` in `fields` wins and is never doubled.
-        if !all_fields.iter().any(|(key, _)| *key == "otp") {
-            if let Some(otp) = self.otp.as_ref() {
-                all_fields.push(("otp", otp.as_str()));
-            }
+        if !all_fields.iter().any(|(key, _)| *key == "otp")
+            && let Some(otp) = self.otp.as_ref()
+        {
+            all_fields.push(("otp", otp.as_str()));
         }
 
         let body = encode_form(&all_fields);

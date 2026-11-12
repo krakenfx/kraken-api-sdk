@@ -102,15 +102,36 @@ No auto-discovery. Env overrides the file.
 
 ### Endpoint URLs
 
-String knobs. TLS required: `https://` REST, `wss://` WS. Cleartext is `ConfigError` with code `INSECURE_ENDPOINT_SCHEME`. Injected `with_transport` skips the REST scheme check. WS URLs have no escape hatch. Malformed-but-TLS URLs fail on first use.
+String knobs. TLS required: `https://` REST, `wss://` WS. Cleartext is `ConfigError` with code `INSECURE_ENDPOINT_SCHEME`. The host must be `kraken.com`, `kraken.zone` or a subdomain of either; any other host, or one that does not parse, is `UNTRUSTED_ENDPOINT_HOST`. Injected `with_transport` skips both REST checks. WS URLs have no escape hatch.
 
 | Endpoint | Environment variable | Default |
 |----------|----------------------|---------|
 | REST base | `KRAKEN_REST_BASE_URL` | `https://api.kraken.com` |
 | Public WS | `KRAKEN_WS_PUBLIC_URL` | `wss://ws.kraken.com/v2` |
 | Auth WS | `KRAKEN_WS_AUTH_URL` | `wss://ws-auth.kraken.com/v2` |
+| Unified public WS | `KRAKEN_UNIFIED_WS_PUBLIC_URL` | `wss://uws.kraken.com/v2/public` |
+| Unified private WS | `KRAKEN_UNIFIED_WS_PRIVATE_URL` | `wss://uws.kraken.com/v2/private` |
 
 Also settable via file or `with_knob`. REST has `with_base_url`. Blank env leaves the production default.
+
+### TLS trust
+
+REST and WebSocket trust the bundled Mozilla roots of the CAs that the `kraken.com` CAA record authorises: Google Trust Services, DigiCert, Sectigo, Let's Encrypt, Amazon and SSL.com. The OS trust store is not read, so a CA added to the machine is not trusted.
+
+An endpoint signed by a private CA needs `tls_extra_root_certs_file` (env `KRAKEN_TLS_EXTRA_ROOT_CERTS_FILE`): a PEM file of root CAs added to that set for every connection of the client. An unreadable file, or one with no certificate, is `INVALID_CONFIG` at `.build()`. Production endpoints need no file.
+
+#### Containers
+
+The trusted roots are compiled into the SDK, so the image needs no `ca-certificates` package for Kraken connections, and installing or changing one has no effect on them. A minimal runtime image such as `gcr.io/distroless/cc` works as is. To trust a private CA, mount its PEM file read-only and point the knob at it:
+
+```sh
+docker run \
+  -v /path/on/host/private-ca.pem:/etc/kraken/private-ca.pem:ro \
+  -e KRAKEN_TLS_EXTRA_ROOT_CERTS_FILE=/etc/kraken/private-ca.pem \
+  your-image
+```
+
+A TLS-inspecting proxy in front of the container breaks Kraken connections: its CA is not trusted unless it is in that file, and adding it lets the proxy read the traffic, including the API key, WebSocket tokens and every order.
 
 ## Reading resolved values
 
@@ -215,11 +236,13 @@ Construction-only:
 | `backoff_max_ms` | 30000 | WS reconnect max delay |
 | `backoff_factor` | 2.0 | Exponential multiplier |
 | `backoff_jitter` | 1.0 | Jitter fraction (1.0 = full) |
-| `connection_rate_budget` | 120 | Connect attempts per host per window |
+| `connection_rate_budget` | 120 | Connect attempts per window, shared by all four connections |
 | `connection_rate_window_secs` | 600 | Window for that budget; `0` disables |
 | `rest_retry_max_attempts` | 3 | Cooperative REST retries (idempotent ops) |
 | `nonce_recovery` | false | Emit `NoncePoisonedEvent` on persistent `Invalid nonce` |
-| `prefer_rest_for_orders` | false | REST default for orders; `.via(...)` still overrides |
+| `prefer_rest_for_orders` | false | REST default for Spot orders; `.via(...)` still overrides. Futures orders always use the Unified private socket |
+| `ws_order_response_deadline_ms` | `None` (unbounded) | Longest an order `await` waits for the WebSocket reply, Spot and Futures. At the deadline the call fails as sent-ambiguous (`CONNECTION_ERROR`, not retryable) and `OrderPlacementAmbiguousEvent` fires; the order may still exist. `0` or `None` waits indefinitely |
+| `futures_max_in_flight` | `None` (unlimited) | Most Futures placements (`order`, `order_amend`, `order_batch`) awaiting a reply at once. A placement with no free slot fails unsent with `InFlightLimitReached` (retryable); cancels and the dead-man's switch take no slot. Requires `ws_order_response_deadline_ms` >= 1, because a reply the venue never sends holds its slot until the deadline; `.build()` rejects it otherwise. Dropping the awaiting future frees its slot at once, though the venue may still hold the order. `0` or `None` is unlimited |
 | `rate_limit_trading_scope_cap` | 256 | Trading-tracker LRU; `0` rejected at build |
 | `cl_ord_id_index_cap` | 1024 | `cl_ord_id` index LRU; `0` rejected at build |
 | `caller_to_io_capacity` | 2048 | Caller→I/O queue bound |

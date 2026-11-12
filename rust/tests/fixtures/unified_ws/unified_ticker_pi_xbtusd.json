@@ -1,0 +1,32 @@
+{
+  "channel": "ticker",
+  "type": "update",
+  "data": [{
+    "symbol": "PI_XBTUSD",
+    "timestamp": "2026-10-05T00:00:00Z",
+    "next_funding_rate_time": "2026-10-05T08:00:00Z",
+    "suspended": false,
+    "trades": 7,
+    "ask": "101.5",
+    "ask_qty": 2,
+    "bid": 101,
+    "bid_qty": "3",
+    "change": 1,
+    "change_pct": "0.1",
+    "funding_rate": 0,
+    "funding_rate_prediction": "0",
+    "high": 102,
+    "index": "100",
+    "last": 101,
+    "low": "99",
+    "mark": 100,
+    "open": "100",
+    "open_interest": 12,
+    "premium": "0",
+    "relative_funding_rate": 0,
+    "relative_funding_rate_prediction": "0",
+    "volume": 20,
+    "volume_quote": "2000",
+    "vwap": 100
+  }]
+}

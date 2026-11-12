@@ -35,7 +35,9 @@ Amend never below 1.0. Cancel can be 0.0 after 300 s.
 A cancel immediately after place inflates the trading counter.
 
 - `cancel_all`: +1 trading per affected pair (set unknown until the reply).
-- `cancel_all_orders_after`: +1 trading, no pair.
+- `cancel_all_orders_after`: not charged.
+
+Futures orders (`client.trade().futures()`) are not tracked: they cost nothing against these counters and the SDK emits no proactive warning. The venue's `Rate limit exceeded` reply is `RateLimited` (`RATE_LIMIT_EXCEEDED`), retryable; the SDK does not sleep. When the reply carries `retry_after_ms`, `retry_after_ts` is the local wall clock plus that wait, rounded up to a whole second, otherwise `None`. A refusal the venue sends without a `req_id` cannot be matched to an order: the SDK logs a throttled warning, and the pending orders end at their reply, their deadline or a connection teardown. `ws_order_response_deadline_ms` defaults to none, so set it to bound how long a Futures order can wait.
 
 Wire scope: `EOrder:Rate limit exceeded` is per-pair. `EOrder:Domain rate limit exceeded` is account-wide.
 

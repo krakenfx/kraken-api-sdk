@@ -125,10 +125,7 @@ async fn main() -> ExitCode {
     }
     println!();
 
-    if std::env::var("KRAKEN_PLACE_REAL")
-        .unwrap_or_default()
-        .is_empty()
-    {
+    if std::env::var("KRAKEN_PLACE_REAL").as_deref() != Ok("1") {
         println!(
             "Mode 3 SKIPPED — set KRAKEN_PLACE_REAL=1 for the live place-far/cancel round-trip."
         );

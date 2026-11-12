@@ -16,23 +16,41 @@ impl AccountNamespace {
     /// Register a streaming `executions` handler (all `exec_type` transitions);
     /// the returned `HandlerHandle` deregisters on `Drop`. Does not subscribe —
     /// call `client.subscription().subscribe_executions()`. Invoked once per entry.
-    pub fn on_executions<F>(&self, cb: F) -> HandlerHandle
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::QueueFull`], [`SubscriptionError::LoopDead`],
+    /// or [`SubscriptionError::ClientClosed`] when the handler cannot be posted.
+    pub fn on_executions<F>(&self, cb: F) -> Result<HandlerHandle, SubscriptionError>
     where
         F: Fn(&ExecutionUpdate) + Send + Sync + 'static,
     {
         let wrapped = wrap_typed(cb, decode_executions);
-        self.ws.register_handler(ChannelName::Executions, wrapped)
+        self.ws.register_handler_for_checked(
+            ChannelName::Executions.spot_url(),
+            ChannelName::Executions,
+            wrapped,
+        )
     }
 
     /// Register a streaming `balances` handler (snapshot on subscribe, then
     /// updates on change); the returned `HandlerHandle` deregisters on `Drop`.
     /// Does not subscribe — call `client.subscription().subscribe_balances()`.
-    pub fn on_balances<F>(&self, cb: F) -> HandlerHandle
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::QueueFull`], [`SubscriptionError::LoopDead`],
+    /// or [`SubscriptionError::ClientClosed`] when the handler cannot be posted.
+    pub fn on_balances<F>(&self, cb: F) -> Result<HandlerHandle, SubscriptionError>
     where
         F: Fn(&BalanceUpdate) + Send + Sync + 'static,
     {
         let wrapped = wrap_typed(cb, decode_balances);
-        self.ws.register_handler(ChannelName::Balances, wrapped)
+        self.ws.register_handler_for_checked(
+            ChannelName::Balances.spot_url(),
+            ChannelName::Balances,
+            wrapped,
+        )
     }
 
     /// Register an `executions` handler and subscribe the channel-wide `executions`
@@ -51,7 +69,10 @@ impl AccountNamespace {
         self.ws.register_and_subscribe_guarded(
             ChannelName::Executions,
             Vec::new(),
-            SubscribeParams::Executions,
+            SubscribeParams::Executions {
+                snap_orders: None,
+                snap_trades: None,
+            },
             wrapped,
         )
     }
@@ -72,7 +93,7 @@ impl AccountNamespace {
         self.ws.register_and_subscribe_guarded(
             ChannelName::Balances,
             Vec::new(),
-            SubscribeParams::Balances,
+            SubscribeParams::Balances { snapshot: None },
             wrapped,
         )
     }

@@ -91,7 +91,7 @@ A latched entry is consumed by the first late arm. It is not a broadcast log. Ge
 
 **Cycle-break.** The reactor holds `Weak` to the bus. `Drop` on the last bus handle aborts the dispatch task.
 
-**Handler store.** Caller handlers are keyed by channel; wire subscriptions by channel+symbol. Multiple handlers per channel, opaque ids. Authoritative map is reactor single-writer, mutated via drained messages; fan-out on that task is lock-free. `has_handlers(channel)` reads the count mirror, not the map.
+**Handler store.** Caller handlers are keyed by channel; wire subscriptions by channel+symbol. Multiple handlers per channel, opaque ids. Authoritative map is reactor single-writer, mutated via drained messages; fan-out on that task is lock-free. `has_handlers_for(url, channel)` reads the (url, channel) count mirror, not the map.
 
 **Collapsed EventTypes.** Several completions share one `EventType` (e.g. subscribe ack / fail / terminated). Correlation is `(EventType, request_id)` only. Those events currently use `request_id: None` or are unwired. Wiring a real `request_id` onto a collapsed group requires distinct `EventType`s (or a sub-discriminator), or one waiter can consume another's envelope.
 

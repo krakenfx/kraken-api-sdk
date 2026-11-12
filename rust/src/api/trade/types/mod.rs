@@ -1,13 +1,17 @@
 //! Request/response data types + enums for the trade namespace.
-//! Public enums, typed response structs, and private `Raw*` wire decoders.
 
 mod enums;
+mod futures;
 mod requests;
 
 #[cfg(test)]
 pub(crate) use enums::oflags_to_wire;
 pub(crate) use enums::stp_type_ws;
 pub use enums::{AmendId, OFlag, OrderType, Side, StpType, TimeInForce, TriggerKind};
+pub use futures::{
+    FuturesOrder, FuturesOrderAmendRequest, FuturesOrderBatchRequest, FuturesOrderRef,
+    FuturesOrderRequest,
+};
 pub use requests::{
     AddOrderBatchRequest, BatchOrderEntry, CancelAllRequest, CancelRequest, CloseOrderType,
     ConditionalClose, DeadlineSpec, DeadmanRequest, OrderAmendRequest, OrderRequest, Price,
@@ -17,8 +21,7 @@ pub use requests::{
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
-/// Per-line result of a batch operation. Each request line in a batch resolves
-/// independently to either a success payload or an error.
+/// Per-line result of a batch operation: a success payload or an error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -34,34 +37,28 @@ pub enum BatchResult<T, E> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct AddOrderDescr {
-    /// Kraken's human-readable order string. `Some` on REST; `None` on WS
-    /// (`add_order` carries no descr — not fabricated).
+    /// Kraken's order description; `None` on WS.
     pub order: Option<String>,
-    /// Human-readable conditional-close string when a `close[*]` clause was attached.
-    /// `None` on WS.
+    /// Conditional-close description when a `close[*]` clause was attached; `None` on WS.
     pub close: Option<String>,
 }
 
 /// Typed order-placement result, uniform across REST `AddOrder` and WS `add_order`.
-/// Placement and reconciliation: docs/guides/placing-orders.md.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct AddOrderResponse {
-    /// Kraken-assigned order id. `Some` for a real placement; `None` in
-    /// validate mode (`validate=true`), where Kraken returns a descr-only
-    /// result with no `txid`.
+    /// Kraken order id; `None` in validate mode.
     pub txid: Option<crate::types::TxId>,
-    /// Client order id for this placement. `None` when the SDK suppressed
-    /// auto-allocation (request carried `userref` or a conditional-close clause).
-    /// Reconciliation and suppression rules: docs/guides/placing-orders.md.
+    /// Client order id: the venue's echo, else the id sent. On Futures an uppercase UUID echoes
+    /// lowercased, so it can differ from the id you sent. `None` when the SDK suppressed
+    /// allocation (`userref` or a conditional-close clause).
     pub cl_ord_id: Option<crate::types::ClOrdId>,
     /// Human-readable order description; per-transport presence on [`AddOrderDescr`].
     pub descr: AddOrderDescr,
 }
 
-/// Typed `CancelOrder` result, uniform across the REST and WS cancel paths
-/// (the WS reply carries no counts; the SDK derives `count: 1, pending: false`).
+/// Typed `CancelOrder` result, uniform across REST and WS (WS derives `count: 1, pending: false`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct CancelOrderResponse {
@@ -71,7 +68,8 @@ pub struct CancelOrderResponse {
     pub pending: bool,
 }
 
-/// Typed `CancelAll` result — cancels every open order on the account.
+/// Typed result of `CancelAll` (every open order on the account) and of Futures
+/// `cancel_all` and `cancel_batch`: the number of orders the venue cancelled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct CancelAllResponse {
@@ -83,8 +81,7 @@ pub struct CancelAllResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct AmendOrderResponse {
-    /// Kraken-assigned amend reference. Opaque — see [`AmendId`].
-    /// Amends preserve the order's `txid` (no `new_txid`).
+    /// Opaque amend reference ([`AmendId`]); empty on Futures, where the venue assigns none.
     pub amend_id: AmendId,
 }
 
@@ -93,21 +90,16 @@ pub struct AmendOrderResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct DeadmanResponse {
-    /// ISO 8601 server time when the dead-man's-switch was armed
-    /// (`currentTime` in the wire response).
+    /// ISO 8601 server time the switch was armed (`currentTime`).
     pub current_time: String,
-    /// ISO 8601 server time when orders cancel if no further
-    /// `cancel_all_orders_after` lands (`triggerTime`). `None` when disarmed
-    /// (`timeout=0` sent; wire `triggerTime` is `"0"` or absent).
+    /// ISO 8601 time orders cancel absent a further call (`triggerTime`); `None` when disarmed.
     pub trigger_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct RawAddOrderResponse {
     pub(super) descr: RawAddOrderDescr,
-    /// Absent in validate mode (`validate=true`) — Kraken returns descr-only
-    /// with no `txid`. `#[serde(default)]` lets decode succeed; the typed
-    /// `AddOrderResponse.txid` is then `None`.
+    /// Absent in validate mode; `#[serde(default)]` keeps decode succeeding.
     #[serde(default)]
     pub(super) txid: Vec<String>,
 }
@@ -115,8 +107,7 @@ pub(super) struct RawAddOrderResponse {
 #[derive(Debug, Deserialize)]
 pub(super) struct RawAddOrderDescr {
     pub(super) order: String,
-    /// Conditional-close human-readable string; absent unless a `close[*]`
-    /// clause was attached to the request.
+    /// Conditional-close description; absent unless a `close[*]` clause was attached.
     pub(super) close: Option<String>,
 }
 
@@ -132,9 +123,7 @@ pub(super) struct RawCancelAllResponse {
     pub(super) count: u32,
 }
 
-/// Wire shape of `/0/private/AmendOrder`. The live reply carries `amend_id`
-/// only — amends are atomic and preserve the order's `txid`, so there is no
-/// `new_txid`/`original_txid` to decode.
+/// Wire shape of `/0/private/AmendOrder`; the reply carries `amend_id` only.
 #[derive(Debug, Deserialize)]
 pub(super) struct RawAmendOrderResponse {
     pub(super) amend_id: String,
@@ -144,8 +133,7 @@ pub(super) struct RawAmendOrderResponse {
 #[allow(non_snake_case)]
 pub(super) struct RawDeadmanResponse {
     pub(super) currentTime: String,
-    /// `"0"` (literal string) encodes disarmed; defaulted to empty when absent
-    /// so the Raw→typed map can normalise both to `None`.
+    /// `"0"` encodes disarmed; defaults to empty when absent.
     #[serde(default)]
     pub(super) triggerTime: String,
 }
@@ -157,14 +145,13 @@ pub(super) struct RawDeadmanResponse {
 pub struct BatchOrderResult {
     /// Human-readable order description for this line; same shape as single `AddOrder`.
     pub descr: AddOrderDescr,
-    /// The placed order's txid. A SCALAR — unlike single `/AddOrder` whose
-    /// top-level `txid` is an array. Absent under `validate=true` (descr-only).
+    /// The placed order's txid, a scalar (single `/AddOrder` returns an array); absent under `validate=true`.
     pub txid: Option<crate::types::TxId>,
     /// Per-line engine rejection message; `None` on success.
     pub error: Option<String>,
 }
 
-/// `POST /0/private/AddOrderBatch` response.
+/// Result of `AddOrderBatch` (Spot) or `batch_add` (Spot and Futures).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct AddOrderBatchResponse {
@@ -172,22 +159,27 @@ pub struct AddOrderBatchResponse {
     pub orders: Vec<BatchOrderResult>,
 }
 
-/// `POST /0/private/CancelBatch` request. No `asset_class` field.
+/// Cancel several orders by `cl_ord_id`: Spot sends one `CancelOrder` per id
+/// (`CancelOrderBatch` takes only txids), Futures one `batch_cancel` frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CancelBatchRequest {
-    /// Client order ids to cancel; each resolves independently, 1:1 with `results`.
+    /// Client order ids to cancel. Spot resolves each independently, 1:1 with `results`;
+    /// Futures sends one `batch_cancel` (2 to 50 ids) and reports only a count.
     pub cl_ord_ids: Vec<crate::types::ClOrdId>,
 }
 
 impl CancelBatchRequest {
+    /// Ids the venue accepts in one Futures `batch_cancel`; a larger one makes it drop the socket.
+    pub(crate) const FUTURES_SIZE: std::ops::RangeInclusive<usize> = 2..=50;
+
     /// Construct from the client order ids to cancel.
     pub fn new(cl_ord_ids: Vec<crate::types::ClOrdId>) -> Self {
         Self { cl_ord_ids }
     }
 }
 
-/// `POST /0/private/CancelBatch` response.
+/// Spot batch-cancel result; Futures returns a `CancelAllResponse` count instead.
 /// `results` is 1:1 with the input `cl_ord_ids` order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
@@ -267,8 +259,7 @@ mod types_tests {
         assert_eq!(Side::Sell.to_string(), "sell");
     }
 
-    /// WS v2 `stp_type` uses the UNDERSCORE spelling — distinct from the REST
-    /// kebab-case `Display` form.
+    /// WS v2 `stp_type` uses underscores, unlike the kebab-case REST `Display` form.
     #[test]
     fn stp_type_ws_spellings() {
         assert_eq!(stp_type_ws(StpType::CancelNewest), "cancel_newest");
@@ -276,9 +267,6 @@ mod types_tests {
         assert_eq!(stp_type_ws(StpType::CancelBoth), "cancel_both");
     }
 
-    /// The serde-backed enums must render exactly what serde emits — Display
-    /// and the wire form share one strum table; the `*_wire_strings` tests
-    /// above pin the literals.
     #[test]
     fn strum_display_matches_serde_emission() {
         for ot in [
@@ -419,8 +407,7 @@ mod types_tests {
 
     #[test]
     fn validate_reduce_only_with_margin_ok() {
-        // The WS-native `margin` toggle satisfies the reduce_only gate without a
-        // leverage ratio — this is the WS-placeable margin+reduce_only combo.
+        // The WS-native `margin` toggle satisfies the reduce_only gate without a leverage ratio.
         let mut req = OrderRequest::new(sym(), dec("1"), Side::Buy).order_type(OrderType::Limit);
         req.reduce_only = Some(true);
         req.margin = true;
@@ -429,8 +416,7 @@ mod types_tests {
 
     #[test]
     fn validate_rejects_margin_with_leverage() {
-        // margin (WS-native) ⊕ leverage (REST ratio): both set is un-placeable on
-        // either transport, so validate() rejects it client-side.
+        // margin (WS-only) plus leverage (REST-only) is un-placeable on either transport.
         let mut req = OrderRequest::new(sym(), dec("1"), Side::Buy).order_type(OrderType::Limit);
         req.price = Some(dec("50000").into());
         req.margin = true;
@@ -443,8 +429,7 @@ mod types_tests {
 
     #[test]
     fn validate_rejects_margin_with_relative_close() {
-        // margin (WS-only) + a relative-offset conditional-close price (REST-only):
-        // un-placeable on either transport → rejected client-side.
+        // margin (WS-only) plus a relative close price (REST-only) is un-placeable on either transport.
         let mut req = OrderRequest::new(sym(), dec("1"), Side::Buy).order_type(OrderType::Limit);
         req.price = Some(dec("50000").into());
         req.margin = true;
@@ -499,7 +484,7 @@ mod types_tests {
 
     #[test]
     fn validate_fok_on_stop_loss_rejected() {
-        // Plain stop-loss carries no limit price → FOK is invalid there.
+        // Plain stop-loss carries no limit price, so FOK is invalid there.
         let mut req = OrderRequest::new(sym(), dec("1"), Side::Buy).order_type(OrderType::StopLoss);
         req.price = Some(dec("50000").into());
         req.time_in_force = Some(TimeInForce::Fok);
@@ -636,15 +621,12 @@ mod types_tests {
 
     #[test]
     fn validate_rejects_set_deadline() {
-        // A set deadline is rejected loudly (server-clock render deferred) rather
-        // than silently dropped — transport-neutral (validate() runs on both).
         let mut req = OrderRequest::new(sym(), dec("1"), Side::Buy).order_type(OrderType::Market);
         req.deadline = Some(DeadlineSpec::after(std::time::Duration::from_secs(30)));
         assert!(matches!(
             req.validate(),
             Err(TradeError::InvalidOrder { .. })
         ));
-        // absent deadline validates fine.
         let ok = OrderRequest::new(sym(), dec("1"), Side::Buy).order_type(OrderType::Market);
         assert_eq!(ok.validate(), Ok(()));
     }
@@ -894,8 +876,7 @@ mod types_tests {
 
     #[test]
     fn validate_rejects_zero_offset_on_trailing_price() {
-        // A zero trail is degenerate; the offset must be strictly positive
-        // (direction is automatic from the side, so sign carries no info).
+        // Direction comes from the side, so the trail offset must be strictly positive.
         let mut req =
             OrderRequest::new(sym(), dec("0.001"), Side::Buy).order_type(OrderType::TrailingStop);
         req.price = Some(Price::Offset {
@@ -921,7 +902,6 @@ mod types_tests {
 
     #[test]
     fn validate_allows_both_signs_on_trailing_price2_limit_leg() {
-        // trailing-stop-limit price2 is not sign-guarded.
         for value in [dec("50"), dec("-50")] {
             let mut req = OrderRequest::new(sym(), dec("0.001"), Side::Buy)
                 .order_type(OrderType::TrailingStopLimit);
@@ -939,8 +919,6 @@ mod types_tests {
 
     #[test]
     fn validate_rejects_none_price_on_trailing_stop() {
-        // A trailing order REQUIRES a price offset — a missing trigger leg is
-        // rejected client-side (Kraken has nothing to trail).
         let req =
             OrderRequest::new(sym(), dec("0.001"), Side::Buy).order_type(OrderType::TrailingStop);
         assert!(matches!(
@@ -951,8 +929,6 @@ mod types_tests {
 
     #[test]
     fn validate_rejects_absolute_price2_on_trailing_stop_limit() {
-        // The limit leg (price2) allows either sign but must be RELATIVE — an
-        // absolute price2 is rejected.
         let mut req = OrderRequest::new(sym(), dec("0.001"), Side::Buy)
             .order_type(OrderType::TrailingStopLimit);
         req.price = Some(Price::Offset {
@@ -968,8 +944,7 @@ mod types_tests {
 
     #[test]
     fn validate_rejects_none_price2_on_trailing_stop_limit() {
-        // A trailing-stop-limit REQUIRES its limit leg (price2) — a valid trigger
-        // leg alone is not enough; Kraken rejects a missing limit leg server-side.
+        // Kraken rejects a trailing-stop-limit without its limit leg server-side.
         let mut req = OrderRequest::new(sym(), dec("0.001"), Side::Buy)
             .order_type(OrderType::TrailingStopLimit);
         req.price = Some(Price::Offset {
@@ -999,8 +974,6 @@ mod types_tests {
 
     #[test]
     fn validate_rejects_absolute_close_price_on_trailing_close_leg() {
-        // A single-order conditional close whose close order type is trailing is
-        // guarded on the CLOSE leg too (not only the primary leg).
         let mut req =
             OrderRequest::new(sym(), dec("0.001"), Side::Buy).order_type(OrderType::Limit);
         req.price = Some(Price::Absolute(dec("50000")));
@@ -1031,9 +1004,7 @@ mod types_tests {
 
     #[test]
     fn to_form_renders_relative_close_price_as_signed_bare_string() {
-        // REST CAN carry a relative close price (general REST grammar). It
-        // renders bare + signed — distinct from WS, which rejects it (no
-        // price_type slot on the WS conditional object).
+        // REST carries a relative close price; WS cannot (no price_type slot on its conditional object).
         let mut req =
             OrderRequest::new(sym(), dec("0.001"), Side::Buy).order_type(OrderType::Limit);
         req.price = Some(Price::Absolute(dec("50000")));

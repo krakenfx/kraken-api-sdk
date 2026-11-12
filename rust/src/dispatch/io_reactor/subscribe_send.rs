@@ -2,7 +2,6 @@
 //! register-and-emit, and the resend-timer handler.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::api::ws_surface::SubscriberGuard;
@@ -12,32 +11,22 @@ use crate::dispatch::event_bus::DispatchEventBus;
 use crate::transport::{
     SendFrameError, TransportError, TransportErrorKind, WsFrame, WsOpcode, WsSocket,
 };
-use crate::types::{ChannelName, ConnectionState, Symbol, WsUrl};
+use crate::types::{ChannelName, ConnectionState, StreamSymbol, WsUrl};
 
-use super::UpgradeOutcome;
+use super::SharedHandles;
 use super::send_ready::refresh_send_ready;
-use super::socket_lifecycle::{project_socket_and_wire_bridge, write_mirror};
+use super::socket_lifecycle::start_connect_if_idle;
 
 /// Arm the per-entry subscribe-ack timer and record the `req_id -> (channel,
 /// pair)` correlation so a `channel`-less reject resolves back to this entry.
 fn arm_subscribe_ack_timer_with_req_id(
     mc: &mut ManagedConnection,
     channel: ChannelName,
-    pair: Option<Symbol>,
+    pair: Option<StreamSymbol>,
     req_id: u64,
     bus_back_ref: &Weak<DispatchEventBus>,
 ) {
-    let timeout_ms = bus_back_ref
-        .upgrade()
-        .map(|bus| {
-            bus.knobs()
-                .subscribe_ack_timeout_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
-        })
-        .unwrap_or(5_000);
-    let due_at = crate::types::MonotonicInstant(
-        mc.clock_now().0 + std::time::Duration::from_millis(timeout_ms as u64),
-    );
+    let due_at = super::due_after_ms(mc, super::subscribe_ack_timeout_ms(bus_back_ref));
     mc.record_subscribe_req_id(req_id, channel, pair.clone());
     mc.arm_subscribe_ack(channel, pair, due_at);
 }
@@ -45,16 +34,24 @@ fn arm_subscribe_ack_timer_with_req_id(
 /// Synthesise a transient `WireAbnormalClose` and drive it through the FSM
 /// (→ BackingOff) when the outbound writer task is dead on a subscribe send.
 fn drive_writer_closed_abnormal(mc: &mut ManagedConnection, context: &'static str) {
-    mc.handle_event(
-        crate::conn::managed_connection::FsmEvent::WireAbnormalClose {
-            error: TransportError {
-                kind: TransportErrorKind::AbnormalClose {
-                    context: context.into(),
-                },
-                transient: true,
-            },
+    let error = TransportError {
+        kind: TransportErrorKind::AbnormalClose {
+            context: context.into(),
         },
-    );
+        transient: true,
+    };
+    let event = if mc.state() == ConnectionState::Connecting {
+        // Initial RegisterBatch can send before the asynchronous upgrade-ok
+        // reaches the reactor; Connecting handles this as a transient connect
+        // failure, whereas WireAbnormalClose is only meaningful post-upgrade.
+        crate::conn::managed_connection::FsmEvent::WireConnectError {
+            kind: error.kind,
+            transient: error.transient,
+        }
+    } else {
+        crate::conn::managed_connection::FsmEvent::WireAbnormalClose { error }
+    };
+    mc.handle_event(event);
 }
 
 /// Disposition of one subscribe-frame send; control flow stays caller-side.
@@ -152,25 +149,68 @@ pub(in crate::dispatch::io_reactor) fn send_subscribe_frame(
     frame: WsFrame,
     url: WsUrl,
     channel: ChannelName,
-    pair: &Option<Symbol>,
+    pair: &Option<StreamSymbol>,
+    mc: &mut ManagedConnection,
+    send: SubscribeSend,
+) -> SendOutcome {
+    send_subscribe_batch_frame(
+        socket,
+        frame,
+        url,
+        channel,
+        std::slice::from_ref(pair),
+        mc,
+        send,
+    )
+}
+
+/// Send one batched subscribe frame. A frame can represent independently-owned
+/// entries, so a transient send failure must schedule recovery for every key.
+pub(in crate::dispatch::io_reactor) fn send_subscribe_batch_frame(
+    socket: &Arc<dyn WsSocket>,
+    frame: WsFrame,
+    url: WsUrl,
+    channel: ChannelName,
+    pairs: &[Option<StreamSymbol>],
     mc: &mut ManagedConnection,
     send: SubscribeSend,
 ) -> SendOutcome {
     match socket.send_frame(frame) {
-        Ok(()) => SendOutcome::Sent,
+        Ok(()) => {
+            mc.note_snapshot_opt_out_written(channel, pairs);
+            SendOutcome::Sent
+        }
         Err(SendFrameError::Backpressure) => {
             tracing::warn!(
-                target: "kraken_sdk::io_reactor", ?url, ?channel, ?pair,
+                target: "kraken_sdk::io_reactor", ?url, ?channel, ?pairs,
                 "{}", send.backpressure_msg()
             );
-            mc.handle_subscribe_failure(channel, pair.clone(), true, None);
+            let state = mc.state();
+            for pair in pairs {
+                mc.handle_subscribe_failure(
+                    channel,
+                    pair.clone(),
+                    true,
+                    None,
+                    &crate::dispatch::FuturesSubscribeAck::default(),
+                );
+                // An exhausted budget tore the connection down; replay owns
+                // the remaining keys.
+                if mc.state() != state {
+                    break;
+                }
+            }
+            mc.mark_initial_subscribe_replay(channel, pairs);
             SendOutcome::Backpressured
         }
         Err(SendFrameError::WriterClosed) => {
             tracing::warn!(
-                target: "kraken_sdk::io_reactor", ?url, ?channel, ?pair,
+                target: "kraken_sdk::io_reactor", ?url, ?channel, ?pairs,
                 "{}", send.writer_closed_msg()
             );
+            // A writer-close tears the connection down once; retained registry
+            // entries are restored together by reconnect replay.
+            mc.mark_initial_subscribe_replay(channel, pairs);
             drive_writer_closed_abnormal(mc, send.writer_closed_context());
             SendOutcome::WriterDead
         }
@@ -179,11 +219,14 @@ pub(in crate::dispatch::io_reactor) fn send_subscribe_frame(
 
 /// `TimerSubscribeResendDue` fire: re-issue the subscribe. A direct reactor
 /// action — the FSM has no arm for this timer.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "takes only the shared handles it uses; mutable reactor state and per-call data are passed explicitly"
+)]
 pub(in crate::dispatch::io_reactor) fn handle_subscribe_resend(
     url: WsUrl,
     channel: ChannelName,
-    pair: Option<Symbol>,
+    pair: Option<StreamSymbol>,
     mc: &mut ManagedConnection,
     registry: &SubscriptionRegistry,
     sockets: &HashMap<WsUrl, Arc<dyn WsSocket>>,
@@ -192,7 +235,7 @@ pub(in crate::dispatch::io_reactor) fn handle_subscribe_resend(
 ) {
     // The entry may have been deregistered while the timer was in flight; drop
     // silently.
-    let Some(params) = registry.params_for(channel, &pair) else {
+    let Some(params) = registry.params_for_url(url, channel, &pair) else {
         tracing::debug!(
             target: "kraken_sdk::io_reactor", ?url, ?channel, ?pair,
             "resend: entry deregistered before timer fired; no-op"
@@ -200,7 +243,7 @@ pub(in crate::dispatch::io_reactor) fn handle_subscribe_resend(
         return;
     };
 
-    let is_auth = url == WsUrl::Auth;
+    let is_auth = url.requires_ws_token();
 
     let token_val: Option<String> = if is_auth {
         let now = mc.clock_now();
@@ -215,11 +258,7 @@ pub(in crate::dispatch::io_reactor) fn handle_subscribe_resend(
                 // The consumed timer may have been Resubscribing's last outstanding
                 // work: complete to Open.
                 mc.complete_resubscribe_if_empty();
-                if !mc.awaiting_token_refresh() {
-                    mc.set_awaiting_token_refresh(true);
-                    let _h =
-                        auth_stack.force_refresh(crate::auth::RefreshReason::AuthHandshakeFailed);
-                }
+                mc.force_reactive_token_refresh(auth_stack);
                 return;
             }
         }
@@ -235,12 +274,10 @@ pub(in crate::dispatch::io_reactor) fn handle_subscribe_resend(
         return;
     };
 
-    let pairs: &[Symbol] = match &pair {
-        Some(s) => std::slice::from_ref(s),
-        None => &[],
-    };
+    let pairs = pair.as_slice();
     let req_id = mc.next_subscribe_req_id();
     let mut payload = crate::conn::subscription_registry::build_subscribe_frame(
+        url,
         "subscribe",
         channel,
         pairs,
@@ -265,6 +302,7 @@ pub(in crate::dispatch::io_reactor) fn handle_subscribe_resend(
         SubscribeSend::Resend,
     ) {
         SendOutcome::Sent => {
+            mc.clear_initial_subscribe_replay(channel, std::slice::from_ref(&pair));
             arm_subscribe_ack_timer_with_req_id(mc, channel, pair.clone(), req_id, bus_back_ref);
             tracing::debug!(
                 target: "kraken_sdk::io_reactor", ?url, ?channel, ?pair,
@@ -283,19 +321,18 @@ pub(in crate::dispatch::io_reactor) fn send_first_signed_subscribe(
     registry: &SubscriptionRegistry,
     sockets: &HashMap<WsUrl, Arc<dyn WsSocket>>,
     auth_stack: &Arc<crate::auth::AuthStack>,
-    auth_send_ready: &Arc<std::sync::atomic::AtomicBool>,
+    order_gate: &Arc<crate::conn::OrderGate>,
     bus_back_ref: &Weak<DispatchEventBus>,
 ) {
     let now = mc.clock_now();
     let token = match auth_stack.cached_token() {
         Some(t) if !t.is_expired(now) => t,
         _ => {
-            // No valid token: mark awaiting-refresh and kick force_refresh; the
-            // RefreshOutcome bridge re-invokes this path.
-            mc.set_awaiting_token_refresh(true);
+            // No valid token: start a connection-owned refresh; the outcome bridge
+            // re-invokes this path.
             // One of two mutually-exclusive force_refresh sites per handshake:
             // this fires only when NO frame was sent.
-            let _handle = auth_stack.force_refresh(crate::auth::RefreshReason::AuthHandshakeFailed);
+            mc.force_reactive_token_refresh(auth_stack);
             tracing::debug!(
                 target: "kraken_sdk::io_reactor", ?url,
                 "Authenticating: no valid cached token; force_refresh in flight (lazy first fetch)"
@@ -322,7 +359,9 @@ pub(in crate::dispatch::io_reactor) fn send_first_signed_subscribe(
         );
         // Bare-order send-ready: token cached + empty auth registry —
         // refresh_send_ready stores + emits so an awaiting order send unblocks.
-        refresh_send_ready(url, mc, registry, auth_stack, auth_send_ready, bus_back_ref);
+        if url.requires_ws_token() {
+            refresh_send_ready(url, mc, registry, auth_stack, order_gate, bus_back_ref);
+        }
         return;
     };
     let req_id = mc.next_subscribe_req_id();
@@ -355,7 +394,7 @@ pub(in crate::dispatch::io_reactor) fn send_remaining_signed_subscribes(
     sockets: &HashMap<WsUrl, Arc<dyn WsSocket>>,
     auth_stack: &Arc<crate::auth::AuthStack>,
     bus_back_ref: &Weak<DispatchEventBus>,
-    already_sent: Option<(ChannelName, Option<Symbol>)>,
+    already_sent: Option<(ChannelName, Option<StreamSymbol>)>,
 ) {
     let now = mc.clock_now();
     let token = match auth_stack.cached_token() {
@@ -368,11 +407,7 @@ pub(in crate::dispatch::io_reactor) fn send_remaining_signed_subscribes(
             {
                 mc.defer_open_auth_subscribe(channel, pair, params);
             }
-            if !mc.awaiting_token_refresh() {
-                mc.set_awaiting_token_refresh(true);
-                let _handle =
-                    auth_stack.force_refresh(crate::auth::RefreshReason::AuthHandshakeFailed);
-            }
+            mc.force_reactive_token_refresh(auth_stack);
             return;
         }
     };
@@ -420,28 +455,45 @@ pub(in crate::dispatch::io_reactor) fn send_remaining_signed_subscribes(
 pub(in crate::dispatch::io_reactor) fn send_single_subscribe(
     url: WsUrl,
     channel: ChannelName,
-    pair: Option<Symbol>,
+    pair: Option<StreamSymbol>,
+    params: crate::conn::subscription_registry::SubscribeParams,
+    mc: &mut ManagedConnection,
+    sockets: &HashMap<WsUrl, Arc<dyn WsSocket>>,
+    bus_back_ref: &Weak<DispatchEventBus>,
+) {
+    send_subscribe_batch(url, channel, vec![pair], params, mc, sockets, bus_back_ref);
+}
+
+/// Emit one public subscribe frame for independently-owned registry entries.
+/// Spot callers continue to pass exactly one key; Unified Public callers may
+/// pass a whole RegisterBatch and share the resulting request id.
+pub(in crate::dispatch::io_reactor) fn send_subscribe_batch(
+    url: WsUrl,
+    channel: ChannelName,
+    pairs: Vec<Option<StreamSymbol>>,
     params: crate::conn::subscription_registry::SubscribeParams,
     mc: &mut ManagedConnection,
     sockets: &HashMap<WsUrl, Arc<dyn WsSocket>>,
     bus_back_ref: &Weak<DispatchEventBus>,
 ) {
     let Some(socket) = sockets.get(&url) else {
+        // A tokenless socket may register while its very first connection is
+        // backing off, before a socket exists. Flag that the upgrade path must
+        // replay these pending registry entries.
+        mc.mark_initial_subscribe_replay(channel, &pairs);
         tracing::warn!(
-            target: "kraken_sdk::io_reactor", ?url, ?channel, ?pair,
+            target: "kraken_sdk::io_reactor", ?url, ?channel, ?pairs,
             "Register: socket not open; wire subscribe dropped (reconnect-replay will recover from registry)"
         );
         return;
     };
-    let pairs: &[Symbol] = match &pair {
-        Some(s) => std::slice::from_ref(s),
-        None => &[],
-    };
+    let symbols: Vec<StreamSymbol> = pairs.iter().flatten().cloned().collect();
     let req_id = mc.next_subscribe_req_id();
     let payload = crate::conn::subscription_registry::build_subscribe_frame(
+        url,
         "subscribe",
         channel,
-        pairs,
+        &symbols,
         params,
         req_id,
     );
@@ -449,28 +501,35 @@ pub(in crate::dispatch::io_reactor) fn send_single_subscribe(
         opcode: WsOpcode::Text,
         payload: payload.to_string().into_bytes(),
     };
-    match send_subscribe_frame(
+    match send_subscribe_batch_frame(
         socket,
         frame,
         url,
         channel,
-        &pair,
+        &pairs,
         mc,
         SubscribeSend::RegisterPublic,
     ) {
-        SendOutcome::Sent => {}
+        SendOutcome::Sent => {
+            mc.clear_initial_subscribe_replay(channel, &pairs);
+        }
         SendOutcome::Backpressured | SendOutcome::WriterDead => return,
     }
-    arm_subscribe_ack_timer_with_req_id(mc, channel, pair, req_id, bus_back_ref);
+    for pair in pairs {
+        arm_subscribe_ack_timer_with_req_id(mc, channel, pair, req_id, bus_back_ref);
+    }
 }
 
 /// Emit the tokenized auth wire SUBSCRIBE for a `(channel, pair)` registered
 /// while already `Open`. No valid token defers + kicks `force_refresh`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "takes only the shared handles it uses; mutable reactor state and per-call data are passed explicitly"
+)]
 pub(in crate::dispatch::io_reactor) fn send_single_signed_subscribe(
     url: WsUrl,
     channel: ChannelName,
-    pair: Option<Symbol>,
+    pair: Option<StreamSymbol>,
     params: crate::conn::subscription_registry::SubscribeParams,
     mc: &mut ManagedConnection,
     sockets: &HashMap<WsUrl, Arc<dyn WsSocket>>,
@@ -484,10 +543,7 @@ pub(in crate::dispatch::io_reactor) fn send_single_signed_subscribe(
             // Record the deferral BEFORE the single-flight guard (EVERY entry must
             // re-issue when the refresh lands); spawn only on the first occurrence.
             mc.defer_open_auth_subscribe(channel, pair.clone(), params);
-            if !mc.awaiting_token_refresh() {
-                mc.set_awaiting_token_refresh(true);
-                let _handle =
-                    auth_stack.force_refresh(crate::auth::RefreshReason::AuthHandshakeFailed);
+            if mc.force_reactive_token_refresh(auth_stack) {
                 tracing::debug!(
                     target: "kraken_sdk::io_reactor", ?url, ?channel, ?pair,
                     "Register-while-Open: no valid cached token; force_refresh in flight, tokenized subscribe deferred to BusTokenRefreshed re-issue"
@@ -508,12 +564,10 @@ pub(in crate::dispatch::io_reactor) fn send_single_signed_subscribe(
         );
         return;
     };
-    let pairs: &[Symbol] = match &pair {
-        Some(s) => std::slice::from_ref(s),
-        None => &[],
-    };
+    let pairs = pair.as_slice();
     let req_id = mc.next_subscribe_req_id();
     let mut payload = crate::conn::subscription_registry::build_subscribe_frame(
+        url,
         "subscribe",
         channel,
         pairs,
@@ -541,7 +595,10 @@ pub(in crate::dispatch::io_reactor) fn send_single_signed_subscribe(
 }
 
 /// Register one entry and, on the 0→1 refcount edge, emit the wire SUBSCRIBE.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared handles travel in SharedHandles; `&mut` reactor state is passed explicitly"
+)]
 pub(in crate::dispatch::io_reactor) fn register_one_and_emit(
     url: WsUrl,
     entry: crate::conn::subscription_registry::SubscriptionEntry,
@@ -549,93 +606,73 @@ pub(in crate::dispatch::io_reactor) fn register_one_and_emit(
     conns: &mut HashMap<WsUrl, ManagedConnection>,
     registry: &mut SubscriptionRegistry,
     sockets: &mut HashMap<WsUrl, Arc<dyn WsSocket>>,
-    state_mirrors: &HashMap<WsUrl, std::sync::Arc<std::sync::atomic::AtomicU8>>,
-    bus_back_ref: &Weak<DispatchEventBus>,
-    upgrade_tx: &tokio::sync::mpsc::Sender<UpgradeOutcome>,
-    connect_id_allocator: &Arc<AtomicU64>,
-    auth_stack: &Arc<crate::auth::AuthStack>,
-    auth_send_ready: &Arc<std::sync::atomic::AtomicBool>,
+    handles: SharedHandles<'_>,
     upgrade_guards: &mut HashMap<WsUrl, SubscriberGuard>,
 ) {
+    let SharedHandles {
+        auth_stack,
+        order_gate,
+        bus_back_ref,
+        ..
+    } = handles;
     let channel = entry.channel;
     let pair = entry.pair.clone();
     let params = entry.params;
-    let now = bus_back_ref
-        .upgrade()
-        .map(|b| b.clock().now())
-        .unwrap_or_else(crate::types::MonotonicInstant::now);
+    let now = super::bus_clock_now(bus_back_ref);
     let count = registry.register(entry, now, ref_id.is_some());
     // Record the guard ref against the entry's live generation so the guard's
     // later drop releases exactly this lifetime.
     if let Some(id) = ref_id {
-        registry.record_guard_ref(id, channel, &pair);
+        registry.record_guard_ref_for(id, url, channel, &pair);
     }
 
     if let Some(mc) = conns.get_mut(&url) {
-        if mc.state() == ConnectionState::Idle {
-            let prev_cid = mc.socket().map(|s| s.connection_id());
-            let request_id = connect_id_allocator.fetch_add(1, Ordering::Relaxed);
-            mc.handle_event(
-                crate::conn::managed_connection::FsmEvent::CallStartConnect { request_id },
-            );
-            write_mirror(state_mirrors, url, mc.state());
-            project_socket_and_wire_bridge(
-                mc,
-                url,
-                prev_cid,
-                sockets,
-                upgrade_guards,
-                bus_back_ref,
-                upgrade_tx,
-            );
-        }
+        start_connect_if_idle(mc, url, handles, sockets, upgrade_guards);
     }
 
     // 0→1 edge gate: a duplicate subscriber emits NO wire frame. A tombstone
     // revival lands here too (termination zeroed the refcount).
-    if count == 1 {
-        if let Some(mc) = conns.get_mut(&url) {
-            match url {
-                WsUrl::Auth => {
-                    // Open|Resubscribing send at once; Authenticating with nothing
-                    // in flight sends too — the signed subscribe IS the auth probe.
-                    if matches!(
-                        mc.state(),
-                        ConnectionState::Open | ConnectionState::Resubscribing
-                    ) || mc.authenticating_nothing_in_flight()
-                    {
-                        send_single_signed_subscribe(
-                            url,
-                            channel,
-                            pair.clone(),
-                            params,
-                            mc,
-                            sockets,
-                            auth_stack,
-                            bus_back_ref,
-                        );
-                    }
-                }
-                _ => {
-                    send_single_subscribe(
-                        url,
-                        channel,
-                        pair.clone(),
-                        params,
-                        mc,
-                        sockets,
-                        bus_back_ref,
-                    );
-                }
+    if count == 1
+        && let Some(mc) = conns.get_mut(&url)
+    {
+        mc.forget_snapshot_opt_out_written(channel, &pair);
+        if url.requires_ws_token() {
+            // Open|Resubscribing send at once; Authenticating with nothing
+            // in flight sends too — the signed subscribe IS the auth probe.
+            if matches!(
+                mc.state(),
+                ConnectionState::Open | ConnectionState::Resubscribing
+            ) || mc.authenticating_nothing_in_flight()
+            {
+                send_single_signed_subscribe(
+                    url,
+                    channel,
+                    pair.clone(),
+                    params,
+                    mc,
+                    sockets,
+                    auth_stack,
+                    bus_back_ref,
+                );
             }
+        } else {
+            send_single_subscribe(
+                url,
+                channel,
+                pair.clone(),
+                params,
+                mc,
+                sockets,
+                bus_back_ref,
+            );
         }
     }
 
     // A non-empty auth registry falsifies the bare-order predicate; recompute
     // to clear a stale true.
-    if url == WsUrl::Auth {
-        if let Some(mc) = conns.get(&url) {
-            refresh_send_ready(url, mc, registry, auth_stack, auth_send_ready, bus_back_ref);
-        }
+    if url.requires_ws_token()
+        && let Some(mc) = conns.get(&url)
+    {
+        refresh_send_ready(url, mc, registry, auth_stack, order_gate, bus_back_ref);
     }
 }

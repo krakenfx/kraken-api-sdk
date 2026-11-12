@@ -225,7 +225,7 @@ println!("cancelled {} orders", resp.count);
 
 ### Dead-man
 
-Reset by calling again. Disarm with `0`.
+Reset by calling again. Disarm with `0`. The timer covers every Spot order on the account; `Client::close()` sends the disarm only if this client requested an arm; as the timer is account-wide, that disarm also clears one set by another client.
 
 ```rust
 client.trade().cancel_all_orders_after(60).await?;
@@ -240,7 +240,7 @@ Armed reply: RFC 3339 `trigger_time`. Disarmed: `"0"` or omitted → `trigger_ti
 
 Default WS (`batch_add`). `.via(Transport::Rest)` → `POST /0/private/AddOrderBatch`. WS leaves each row's `descr` empty. `leverage` or relative close: whole call `WsUnsupportedOrderField` unless REST. `margin: true`: `RestUnsupportedOrderField` on REST. Mix: `InvalidOrder`.
 
-WS await timeout mid-batch is send-ambiguous. Reconcile, or use REST. Per-entry `cl_ord_id` auto-allocates unless `userref` or `conditional_close`. `AddOrderBatchRequest::validate()` does not check identifier conflicts per entry; that suppression is the only guard.
+A WS batch dropped in flight or past its deadline is send-ambiguous (`retryable()` is false). Reconcile, or use REST. Per-entry `cl_ord_id` auto-allocates unless `userref` or `conditional_close`. `AddOrderBatchRequest::validate()` does not check identifier conflicts per entry; that suppression is the only guard.
 
 ```rust
 use kraken_sdk::{AddOrderBatchRequest, BatchOrderEntry, ClOrdId, OrderType, Side, Symbol};
@@ -268,6 +268,67 @@ for (i, o) in resp.orders.iter().enumerate() {
 
 [`examples/batch_orders.rs`](../../examples/batch_orders.rs).
 
+## Futures orders
+
+`client.trade().futures()` places Futures orders over the Unified private WebSocket (`wss://uws.kraken.com/v2/private`, same API key). There is no REST path. Methods: [Features → Futures methods](../features.md#futures-methods-clienttradefutures). Each returns a `PendingTrade`; `cl_ord_id` allocates as for Spot.
+
+Symbols are venue wire strings (`PF_XBTUSD`). A Spot pair is `InvalidOrder` before anything is sent.
+
+```rust
+use kraken_sdk::{FuturesOrder, FuturesOrderRequest, OrderType, Side};
+use rust_decimal::Decimal;
+use std::str::FromStr;
+
+let order = FuturesOrder::new(Side::Buy, Decimal::from_str("0.01")?)
+    .order_type(OrderType::Limit)
+    .price(Decimal::from_str("1500")?);
+let resp = client
+    .trade()
+    .futures()
+    .order(FuturesOrderRequest::new("PF_ETHUSD", order))
+    .await?;
+```
+
+`FuturesOrder::new` is a market order. Set `.order_type(..)` for anything else.
+
+Runnable: [`examples/futures_orders.rs`](../../examples/futures_orders.rs).
+
+### Differences from Spot
+
+A violation is `InvalidOrder` before anything is sent.
+
+- Price fields are absolute. Only trailing stops take a relative offset.
+- Each order type takes exactly the prices it uses:
+
+  | Type | Prices |
+  |------|--------|
+  | Market | none (a price is refused, whatever the setter order; validation runs at `.await`) |
+  | Limit | `price` |
+  | Stop-loss, take-profit, trailing stop | `price` (the trigger; `.trigger(..)` picks last or index) |
+  | `-limit` variants | `price` plus `price2` (the limit price) |
+
+- `time_in_force` is `gtc` or `ioc`. Self-trade prevention is `cancel_newest` only.
+- `FuturesOrder` has no leverage, margin, order-flag or display-quantity fields.
+- `.broker(iiban)` sets the Broker IIBAN (the partner's Kraken IIBAN), per order and per batch row. The venue validates it. A malformed value is `InvalidOrder`; on a batch it rejects the whole batch.
+
+### Amend, cancel and batches
+
+- `order_amend` takes a `FuturesOrderAmendRequest`, naming the order by `cl_ord_id` (`by_cl_ord_id`) or the venue order id (`by_order_id`). The reply `amend_id` is empty. A quantity of `0` is refused locally.
+- `cancel` takes a `ClOrdId` or the venue order id (`TxId`). `cancel_batch` takes `ClOrdId`s only.
+- An amend or cancel by order id emits no order lifecycle event.
+- `cancel` of a gone order is `UnknownOrder`.
+- `order_batch`: 2–15 rows on one symbol. `cancel_batch`: 2–50 ids; the reply is a count only, and a count below the number sent means some were gone.
+
+### Deadlines and dead-man
+
+- `deadline` is an absolute `TimeSpec` on `FuturesOrder` and `FuturesOrderAmendRequest`, sent as an RFC 3339 `deadline`. The SDK never reads the local clock; derive the instant from `server_time()`. A batch row cannot carry one.
+- `cancel_all` and the dead-man's switch cover Futures orders only. Spot's are independent.
+- `Client::close()` sends a disarm for a Futures dead-man's switch this client armed, ahead of the close. It does not wait for the venue's reply. If the disarm cannot be sent, `DeadmanDisarmFailedEvent` fires; a quiet close does not prove the switch is disarmed.
+
+### Limits
+
+Futures orders are not rate-tracked by the SDK. A venue throttle is `RateLimited` (retryable); the SDK does not sleep. `futures_max_in_flight` bounds concurrent placements: [Configuration](configuration.md).
+
 ## Client order id (cl_ord_id)
 
 `order(req)` and each `order_batch` entry allocate a UUID v4 `cl_ord_id` unless one is supplied. Read it on `PendingTrade` before `.await`.
@@ -279,11 +340,11 @@ let resp = pending.await?;
 assert_eq!(resp.cl_ord_id, Some(id));
 ```
 
-Suppressed when `userref` or a conditional-close is present. WS `add_order` echoes the sent `cl_ord_id`; none if suppressed.
+Suppressed when `userref` or a conditional-close is present. WS `add_order` echoes the sent `cl_ord_id` (Futures returns an uppercase UUID lowercased); none if suppressed.
 
 ## Idempotency and reconciliation
 
-An order is not idempotent. The SDK does not resend. A transient send failure (e.g. token expired at compose) refreshes state and returns a retryable `Network` error; the caller decides whether to resubmit. Subscribe frames replay after reconnect; orders do not.
+An order is not idempotent. The SDK does not resend. A request refused before it is sent because no valid session token is available (e.g. the cached token expired at compose) refreshes the token and returns `SessionExpired` (nothing was placed); the caller decides whether to resubmit. Subscribe frames replay after reconnect; orders do not.
 
 Dropping an in-flight order `await` after first poll does not guarantee the order was not sent. The bus emits `OrderCancellationAttempted` with `cl_ord_id` (single-`cl_ord_id` ops only; never `cancel_all` / `cancel_all_orders_after`).
 
@@ -295,7 +356,7 @@ let _guard = client.events().on(EventType::OrderCancellationAttempted, |env| {
 })?;
 ```
 
-Reconcile with `client.account().find_order_by_cl_ord_id(cl_ord_id)`.
+Reconcile a Spot order with `client.account().find_order_by_cl_ord_id(cl_ord_id)`. That helper reads Spot order history only and answers `NotPlaced` for a Futures order. For a Futures order, subscribe to Futures executions (`client.account().futures().on_executions_for(..)`): the opening snapshot lists the open orders with their `cl_ord_id` as the venue reports it. Only a lowercase UUID, the SDK default, comes back as sent; other forms are normalised ([Wire quirks](wire-quirks.md#futures-executions)), so keep the default ids if you reconcile this way. Once you hold the `order_id` (the placement reply's `txid`), match later records by it: `amended` and `canceled` records carry no `cl_ord_id`, and with custom ids two orders can report the same one. An order missing from the snapshot is not open (filled, cancelled or never placed); fills arrive on the stream.
 
 ### Walk
 

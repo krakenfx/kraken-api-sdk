@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use crate::api::futures_subscription::FuturesSubscriptionNamespace;
 use crate::api::market::OhlcInterval;
 use crate::api::subscription_types::{
     SubscriptionError, SubscriptionInfo, SubscriptionRef, SubscriptionsSummary,
@@ -30,6 +31,7 @@ use crate::types::{BookDepth, ChannelName, Symbol, TickerTrigger};
 /// Spot WS v2 subscription-lifecycle namespace. Accessed via `client.subscription()`.
 pub struct SubscriptionNamespace {
     ws: Arc<WsSurface>,
+    futures: FuturesSubscriptionNamespace,
 }
 
 impl std::fmt::Debug for SubscriptionNamespace {
@@ -42,20 +44,20 @@ impl std::fmt::Debug for SubscriptionNamespace {
 impl SubscriptionNamespace {
     /// Construct over the shared internal [`WsSurface`]. Crate-internal.
     pub(crate) fn new(ws: Arc<WsSurface>) -> Self {
-        Self { ws }
+        Self {
+            futures: FuturesSubscriptionNamespace::new(Arc::clone(&ws)),
+            ws,
+        }
+    }
+
+    /// Access the Futures WebSocket subscription-lifecycle namespace.
+    pub fn futures(&self) -> &FuturesSubscriptionNamespace {
+        &self.futures
     }
 
     /// Reject with `NoHandlerRegistered` when `channel` has no handler at call time.
     fn gate(&self, channel: ChannelName) -> Result<(), SubscriptionError> {
-        // Subscriptions are WS-only: a dead reactor means no streaming — reject
-        // with `LoopDead` rather than an opaque closed-channel error.
-        if self.ws.is_loop_failed() {
-            return Err(SubscriptionError::LoopDead);
-        }
-        if !self.ws.has_handlers(channel) {
-            return Err(SubscriptionError::NoHandlerRegistered { channel });
-        }
-        Ok(())
+        self.ws.require_handler(channel.spot_url(), channel)
     }
 
     /// Subscribe to the `ticker` channel for `pairs`. `snapshot: Some(false)`
@@ -166,7 +168,11 @@ impl SubscriptionNamespace {
         self.ws.subscribe(
             ChannelName::Ohlc,
             pairs,
-            SubscribeParams::Ohlc { interval, snapshot },
+            SubscribeParams::Ohlc {
+                interval,
+                snapshot,
+                tick_type: None,
+            },
         )
     }
 
@@ -199,7 +205,10 @@ impl SubscriptionNamespace {
         self.ws.subscribe(
             ChannelName::Executions,
             Vec::new(),
-            SubscribeParams::Executions,
+            SubscribeParams::Executions {
+                snap_orders: None,
+                snap_trades: None,
+            },
         )
     }
 
@@ -212,8 +221,11 @@ impl SubscriptionNamespace {
     /// - [`SubscriptionError::ClientClosed`] — called after a clean `close()`.
     pub fn subscribe_balances(&self) -> Result<(), SubscriptionError> {
         self.gate(ChannelName::Balances)?;
-        self.ws
-            .subscribe(ChannelName::Balances, Vec::new(), SubscribeParams::Balances)
+        self.ws.subscribe(
+            ChannelName::Balances,
+            Vec::new(),
+            SubscribeParams::Balances { snapshot: None },
+        )
     }
 
     /// Unsubscribe `pairs` from the `ticker` channel.
@@ -332,8 +344,9 @@ impl SubscriptionNamespace {
         self.ws.unsubscribe(ChannelName::Balances, Vec::new())
     }
 
-    /// Force-unsubscribe everything, ignoring subscriber refcounts; `Failed`
-    /// entries are removed silently.
+    /// Force-unsubscribe every Spot subscription (Public and Auth), ignoring subscriber
+    /// refcounts; `Failed` entries are removed silently. Futures subscriptions are untouched:
+    /// use `subscription().futures().unsubscribe_all()`.
     ///
     /// # Errors
     /// - [`SubscriptionError::LoopDead`] — a reactor loop has died; streaming is unavailable, rebuild the client.
@@ -343,7 +356,7 @@ impl SubscriptionNamespace {
         self.ws.unsubscribe_all()
     }
 
-    /// Force-unsubscribe every subscription on `channel` — semantics as
+    /// Force-unsubscribe every Spot subscription on `channel` — semantics as
     /// [`Self::unsubscribe_all`]. `BookRaw` tears down the shared `Book` entries.
     ///
     /// # Errors
@@ -392,20 +405,10 @@ impl SubscriptionNamespace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::SystemClock;
-    use crate::dispatch::{DispatchEventBus, DispatchEventBusConfig, PresenceMirror};
-    use std::sync::atomic::AtomicU64;
+    use crate::dispatch::DispatchEventBus;
 
     fn make_namespace_with_bus() -> (SubscriptionNamespace, Arc<WsSurface>, Arc<DispatchEventBus>) {
-        let clock: Arc<dyn crate::clock::Clock> = Arc::new(SystemClock);
-        let bus = Arc::new(DispatchEventBus::new(
-            DispatchEventBusConfig::defaults(),
-            clock,
-        ));
-        let mirror: PresenceMirror =
-            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-        let alloc = Arc::new(AtomicU64::new(1));
-        let ws = Arc::new(WsSurface::new(Arc::clone(&bus), mirror, alloc));
+        let (bus, ws) = WsSurface::on_default_bus();
         (SubscriptionNamespace::new(Arc::clone(&ws)), ws, bus)
     }
 
@@ -507,21 +510,31 @@ mod tests {
         {
             let mut m = mirror.write().unwrap();
             m.insert(
-                (ChannelName::Ticker, Some(Symbol::new("ETH/USD").unwrap())),
+                (
+                    crate::types::WsUrl::Public,
+                    ChannelName::Ticker,
+                    Some(Symbol::new("ETH/USD").unwrap().into()),
+                ),
                 MirrorRow {
                     state: EntrySubState::Acked,
                     registered_at: now,
+                    subscribed_at: None,
                 },
             );
             m.insert(
-                (ChannelName::Book, Some(Symbol::new("BTC/USD").unwrap())),
+                (
+                    crate::types::WsUrl::Public,
+                    ChannelName::Book,
+                    Some(Symbol::new("BTC/USD").unwrap().into()),
+                ),
                 MirrorRow {
                     state: EntrySubState::Pending,
                     registered_at: now,
+                    subscribed_at: None,
                 },
             );
             m.insert(
-                (ChannelName::Executions, None),
+                (crate::types::WsUrl::Auth, ChannelName::Executions, None),
                 MirrorRow {
                     state: EntrySubState::Terminated {
                         cause:
@@ -529,6 +542,7 @@ mod tests {
                         last_error: Some("EGeneral:Permission denied".to_string()),
                     },
                     registered_at: now,
+                    subscribed_at: None,
                 },
             );
         }
@@ -627,11 +641,13 @@ mod tests {
         let (ns, ws, bus) = make_namespace_with_bus();
         drop(bus.take_caller_to_io_rx().expect("rx present"));
         assert!(matches!(
-            ws.subscribe_with_ref(
+            ws.subscribe(
                 ChannelName::Executions,
                 Vec::new(),
-                crate::conn::SubscribeParams::Executions,
-                None,
+                crate::conn::SubscribeParams::Executions {
+                    snap_orders: None,
+                    snap_trades: None
+                },
             ),
             Err(SubscriptionError::ClientClosed)
         ));

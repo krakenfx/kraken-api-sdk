@@ -1,6 +1,8 @@
 # Documentation
 
-Async Rust client for Kraken Spot REST and Spot WebSocket v2.
+Async Rust client for Kraken Spot REST and Spot WebSocket v2, plus Unified Futures
+WebSocket streams and order entry: public market data (status, instrument, ticker, trade, OHLC, order
+book) and private account channels (executions, positions, margin, balances, preferences).
 
 | Page | Description |
 |------|-------------|
@@ -24,9 +26,13 @@ Async Rust client for Kraken Spot REST and Spot WebSocket v2.
 | [Rate Limits](guides/rate-limits.md) | Counters, tiers, costs, snap-to-cap |
 | [Wire Quirks](guides/wire-quirks.md) | REST/WS edges the SDK absorbs |
 
-## Scope (v1)
+## Scope
 
-Spot trading and portfolio: REST and WebSocket v2, four namespaces (market, account, trade, subscription). Futures and a unified API are v2.
+Spot trading and portfolio over REST and WebSocket v2 (market, account, trade,
+subscription namespaces), plus Unified Futures streams (public market data and
+private account channels) and Futures order entry; see
+[Features](features.md#futures-streams) and the
+[Market Data guide](guides/market-data.md#unified-futures-order-books).
 
 ## Working on the SDK
 

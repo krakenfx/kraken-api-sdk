@@ -58,13 +58,13 @@ Payload (`event_version` 1):
 
 ### `ClientClosedEvent`
 
-Emitted at most once when `client.close()` completes: both connections have drained in-flight WebSocket requests and closed, then the reactor exits.
+Emitted at most once when `client.close()` completes: all four connections (Spot Public/Auth, Unified Public/Private) have drained in-flight WebSocket requests and closed, then the reactor exits.
 
 Two copies: awaited completion (`request_id: Some`) and broadcast (`request_id: None`). The broadcast is published just before the dispatch loop is drained and is best-effort.
 
 If the caller-command queue is full, or the I/O loop is already gone, there is no `ClientClosedEvent` and `close().await` is `Err(CloseError::Interrupted)`. A loop death recorded before a close terminal still resolves the await; a terminal produced after a recorded death is dropped.
 
-Dead-man disarm is not awaited. This event can resolve before that REST call finishes.
+A dead-man disarm is not awaited. This event can resolve before it finishes.
 
 Await `client.close()` for a graceful shutdown. A loop death mid-close is `Err(CloseError::Interrupted)`. Shutdown duration is `timestamp_monotonic − initiated_at_monotonic`.
 
@@ -77,16 +77,17 @@ Payload (`event_version` 1):
 
 ### `DeadmanDisarmFailedEvent`
 
-During `close()` the SDK sends one best-effort `cancel_all_orders_after(0)` over REST in a detached task. This event fires if that call fails with a classified cause (`RateLimitExceeded`, `Timeout`, `NetworkError`). Auth and other unmapped exchange errors are logged only.
+During `close()` the SDK sends a best-effort `cancel_all_orders_after(0)` in a detached task for each product on which this client requested a dead-man arm: over REST for Spot, over the Unified private socket for Futures. A client that never requested an arm sends no disarm, and a client without credentials sends no Spot disarm. This event fires if a call fails with a classified cause (`RateLimitExceeded`, `Timeout`, `NetworkError`). Auth and other unmapped exchange errors are logged only. `url` says which product's timer may still be armed.
 
-At most once per `close()`. The call has already spent the REST retry budget. Broadcast (`request_id: None`). If the dispatch loop has already drained, subscribers may miss it; the log line still exists.
+At most once per product per `close()`. The Spot call has already spent the REST retry budget. The Futures disarm is queued ahead of the close marker. The event reports a disarm that could not be sent (`NetworkError`). A venue refusal may also be reported, but is not always observed, and an unanswered disarm is silent. A silent close is therefore not proof that the dead-man is disarmed. Broadcast (`request_id: None`). If the dispatch loop has already drained, subscribers may miss it; the log line still exists.
 
-An armed dead-man timer may still be running. To confirm disarm, await `client.trade().cancel_all_orders_after(0)` before `close()`.
+An armed dead-man timer may still be running. To confirm disarm, await `client.trade().cancel_all_orders_after(0)` (Spot) or `client.trade().futures().cancel_all_orders_after(0)` (Futures) before `close()`.
 
 Payload (`event_version` 1):
 
 | Field | Type | Meaning |
 |---|---|---|
+| `url` | `WsUrl` | `Auth` for the Spot REST disarm, `UnifiedPrivate` for the Futures disarm. |
 | `cause` | `DeadmanDisarmCause` | `RateLimitExceeded`, `Timeout`, or `NetworkError`. `AuthConnectionFailed` is never emitted. |
 | `retry_at_monotonic` | `Option<MonotonicInstant>` | Always `None`. |
 | `monotonic_ts` | `MonotonicInstant` | When the failure was observed. |
@@ -125,7 +126,7 @@ Connection events are the state-machine decision. `WsUpgradeOk` / `WsUpgradeFail
 
 ### `ConnectionConnectingEvent`
 
-Emitted when a connection opens a socket and enters connecting. In v1 that is the automatic connect on first subscribe for that endpoint, or first WebSocket order on auth. Also emitted on reconnect backoff and when the connect-rate window advances.
+Emitted when a connection opens a socket and enters connecting. In v1 that is the automatic connect on first subscribe for that endpoint, or the first WebSocket order on a private connection (Spot auth or Unified private). Also emitted on reconnect backoff and when the connect-rate window advances.
 
 Does not fire when the connect-rate budget refuses the attempt (`ConnectionRateThrottledEvent`). Forced reconnect has no public producer in v1.
 
@@ -135,7 +136,7 @@ Payload (`event_version` 1):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `url` | `WsUrl` | `WsUrl::Public` or `WsUrl::Auth`. |
+| `url` | `WsUrl` | The connection that is connecting: `Public`, `Auth`, `UnifiedPublic` or `UnifiedPrivate`. |
 | `attempt_count` | `u32` | Attempt tally for this connect cycle at dial start. `0` on a forced-reconnect path. |
 
 ### `ConnectionOpenEvent`
@@ -156,7 +157,7 @@ Payload (`event_version` 1):
 
 ### `ConnectionSendReadyEvent`
 
-Auth endpoint only, while authenticating: a one-off (bare) order is the authentication probe. Conditions: auth URL, authenticating, no auth subscription registered, non-expired token cached.
+A token-requiring private endpoint (Spot auth or Unified private), while authenticating: a one-off (bare) order is the authentication probe. Conditions: that URL, authenticating, no subscription registered on it, non-expired token cached.
 
 Broadcast (`request_id: None`). Consecutive true re-evaluations emit more than once. Once open, use `ConnectionOpenEvent` / `ConnectionReopenedEvent`.
 
@@ -166,7 +167,7 @@ Payload (`event_version` 1):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `url` | `WsUrl` | Always `WsUrl::Auth`. |
+| `url` | `WsUrl` | `WsUrl::Auth` or `WsUrl::UnifiedPrivate`. |
 | `ready_at_monotonic` | `MonotonicInstant` | Instant send-readiness was reached. |
 
 ### `ConnectionClosedEvent`
@@ -177,7 +178,7 @@ Idle → `ack: NeverOpened`. Backing-off or failed → `ack: SocketDropped`. Oth
 
 In-flight WebSocket requests fail first (`WsRequestFailedEvent`), then this event, then a reconnect if one was latched. A forced reconnect with no close pending does not emit this event.
 
-`Client::close()` itself completes on `ClientClosedEvent` after both endpoints close.
+`Client::close()` itself completes on `ClientClosedEvent` after all four connections close.
 
 Payload (`event_version` 1):
 
@@ -240,7 +241,7 @@ Payload (`event_version` 1):
 
 ### `ConnectionRateThrottledEvent`
 
-Connect attempt refused by the connect-rate window shared by both sockets to the host (`connection_rate_budget` default 120, `connection_rate_window_secs` default 600; both construction-only). No socket is opened. One event per refused attempt.
+Connect attempt refused by the connect-rate window shared by all four managed connections (`connection_rate_budget` default 120, `connection_rate_window_secs` default 600; both construction-only). No socket is opened. One event per refused attempt.
 
 `request_id` is `Some` when the attempt was caller-driven and `None` for timer-driven retries.
 
@@ -251,7 +252,7 @@ Payload (`event_version` 1):
 | Field | Type | Meaning |
 |---|---|---|
 | `url` | `WsUrl` | Refused endpoint. |
-| `attempts_used` | `u32` | Attempts in the current window, both endpoints. |
+| `attempts_used` | `u32` | Attempts in the current window, across all four connections. |
 | `window_seconds` | `u32` | `connection_rate_window_secs`. |
 | `window_remaining_attempts` | `u32` | Remaining attempts in the window. |
 | `throttle_until_monotonic` | `MonotonicInstant` | When dialling may resume. |
@@ -335,7 +336,7 @@ Payloads never contain credentials. Keys appear only as SHA-256 fingerprints.
 
 Private WebSocket authentication moved to terminal failed. Always paired with `ConnectionFailedEvent`. In-flight requests on that connection have already been failed.
 
-Paths: credential or permission rejection (signed subscribe ack or bare-order probe); consecutive token-stale rejections reaching `max_auth_handshake_failures` (default 3); non-retryable token-refresh failure during authenticating.
+Paths: credential or permission rejection (signed subscribe ack, or a Spot bare-order probe); consecutive token-stale rejections reaching `max_auth_handshake_failures` (default 3); non-retryable token-refresh failure during authenticating.
 
 Does not fire for transient handshake, token-stale below the cap, or retryable refresh (`ConnectionAttemptFailedEvent`). Exhausting `reconnect_attempts` on a transient handshake emits only `ConnectionFailedEvent`.
 
@@ -345,13 +346,13 @@ Payload (`event_version` 1):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `url` | `WsUrl` | Always the auth endpoint in v1. |
+| `url` | `WsUrl` | The private connection that failed: `Auth` or `UnifiedPrivate`. |
 | `non_transient_class` | `NonTransientClass` | Bad credentials, permission denied, non-retryable token refresh, or handshake retry-cap. |
 | `kraken_response` | `Option<String>` | Set only on the non-retryable token-refresh path. Otherwise `None`. Use `ConnectionFailedEvent.last_error` for a diagnostic string. |
 
 ### `AuthHandshakeFailedEvent`
 
-One event per rejected signed-subscribe handshake (transient, token-stale, and terminal). Does not fire for the bare-order probe or for a token-refresh transport failure.
+One event per rejected signed-subscribe handshake (transient, token-stale, and terminal). Does not fire for the bare-order probe or for a token-refresh transport failure. On Unified private, a rejected first subscribe that names no auth failure is an entry reject, not a handshake failure: the connection opens and only that entry ends.
 
 `AuthenticationFailedEvent` is the terminal signal.
 
@@ -359,7 +360,7 @@ Payload (`event_version` 1):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `url` | `WsUrl` | Always the auth endpoint in v1. |
+| `url` | `WsUrl` | `WsUrl::Auth` or `WsUrl::UnifiedPrivate`. |
 | `attempt` | `u32` | Connection attempt tally, not the consecutive-auth-failure counter. |
 | `transient` | `bool` | SDK classification. `false` for credential, permission, and token-stale (the SDK still retries token-stale). `true` only for unrecognised strings. |
 | `kraken_error` | `Option<String>` | Exchange rejection text. A placeholder is substituted if the reply had none. |
@@ -368,7 +369,7 @@ Payload (`event_version` 1):
 
 Spot WebSocket token fetch succeeded and the cache was swapped. Broadcast. Cannot be awaited.
 
-Proactive: timer at half the 15-minute lifetime, armed once a token is cached, dropped if the auth connection is closed or failed. Reactive: stale/invalid token on handshake or order, or a signed call with no valid cached token.
+Proactive: timer at half the 15-minute lifetime, armed once a token is cached, dropped if the owning connection is closed or failed. The Spot auth connection owns it; while auth is inactive the Unified private connection does, so a Futures-only client keeps its token fresh. Exactly one connection refreshes per period. Reactive: stale/invalid token on handshake or order, or a signed call with no valid cached token.
 
 `Manual` is never emitted. Compare `token_expires_at_monotonic` only to other SDK timestamps. A proactive refresh does not re-authenticate the live socket; later frames use the new cached token.
 
@@ -514,7 +515,7 @@ Payload (`event_version` 2):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `callback_event_type` | `CallbackSource` | `Event(EventType)` or `DataChannel(ChannelName)`. |
+| `callback_event_type` | `CallbackSource` | `Event(EventType)`, Spot `DataChannel(ChannelName)`, or Futures `FuturesDataChannel { url, channel }`. |
 | `handler_id` | `Option<HandlerId>` | `Some` for `client.events().on(...)` at the latest version. `None` for an explicit version-1 subscriber. |
 | `latency_us` | `u64` | Execution time in whole microseconds (truncated). |
 
@@ -528,7 +529,7 @@ Payload (`event_version` 1):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `slow_event_type` | `CallbackSource` | `Event(EventType)` or `DataChannel(ChannelName)`. |
+| `slow_event_type` | `CallbackSource` | `Event(EventType)`, Spot `DataChannel(ChannelName)`, or Futures `FuturesDataChannel { url, channel }`. |
 | `latency_us` | `u64` | Observed execution time, microseconds (truncated). |
 | `threshold_ms` | `u32` | Threshold in force at that invocation. |
 
@@ -550,7 +551,7 @@ Payload (`event_version` 1):
 
 ### `MessageDroppedNoHandler`
 
-Inbound `update` or `snapshot` row for a channel with zero handlers (typically a dropped `HandlerHandle` without `unsubscribe_*`). At most one emission per channel per 1 second. `count` accumulates inside the window. Tail drops may never flush.
+Inbound `update` or `snapshot` row for a channel with zero handlers (typically a dropped `HandlerHandle` without `unsubscribe_*`). At most one emission per URL-and-channel stream per 1 second. `count` accumulates inside the window. Tail drops may never flush.
 
 Exempt: `status`; `book` until both maintained and raw handler sets are empty; malformed non-array `data`.
 
@@ -560,6 +561,7 @@ Payload (`event_version` 1):
 
 | Field | Type | Meaning |
 |---|---|---|
+| `url` | `WsUrl` | Connection that delivered the row. Spot and Futures share channel names. |
 | `channel` | `ChannelName` | Channel with no handler. |
 | `count` | `u32` | Unhandled rows since the previous emission. First emission is `1`. |
 | `period` | `Duration` | Always 1 second in this release. |
@@ -584,18 +586,19 @@ Payload (`event_version` 1):
 
 ### `WsRequestFailedEvent`
 
-In-flight request abandoned on the authenticated WebSocket (drop, staleness, forced reconnect, terminal failure, or client close). Also the in-flight order drained on a stale-token rejection. Public connection never emits this.
+In-flight request abandoned on a private WebSocket (drop, staleness, forced reconnect, terminal failure, or client close). Public connections never emit this.
 
 The awaited future is resolved with its error before this event. The drain finishes before the matching connection event. Within one drain, events are in ascending `req_id`. Caller-side deadline and compose/send failure after record resolve the future with no event.
 
-The frame may have reached the exchange. Reconcile with `client.account().find_order_by_cl_ord_id(...)` before resending.
+The frame may have reached the exchange. Reconcile before resending: `client.account().find_order_by_cl_ord_id(...)` for a Spot order; for a Futures order (`url: UnifiedPrivate`) the Futures executions snapshot, because the Spot helper does not see Futures orders ([Placing orders → Idempotency](guides/placing-orders.md#idempotency-and-reconciliation)).
 
 Payload (`event_version` 1):
 
 | Field | Type | Meaning |
 |---|---|---|
 | `req_id` | `u64` | WebSocket v2 `req_id`. |
-| `op` | `WsOp` | `AddOrder`, `AmendOrder`, `CancelOrder`, `CancelAll`, `CancelAllOrdersAfter`, or `BatchAdd`. |
+| `op` | `WsOp` | `AddOrder`, `AmendOrder`, `CancelOrder`, `CancelAll`, `CancelAllOrdersAfter`, `BatchAdd`, or `BatchCancel`. |
+| `url` | `WsUrl` | Connection the request was sent on: `Auth` for Spot, `UnifiedPrivate` for Futures. |
 | `reason` | `WsFailReason` | `ClientClosed` or `ConnectionLost`. |
 
 ## Subscription and data integrity
@@ -620,6 +623,88 @@ Payload (`event_version` 2):
 | `terminated_at_monotonic` | `MonotonicInstant` | Instant observed. |
 
 Broadcast (`request_id: None`).
+
+### Futures subscription lifecycle
+
+Unified Futures subscriptions are per native wire symbol (for example `PI_XBTUSD`), even when several symbols share one outbound request.
+
+- Register the matching `client.market().futures().on_*` or `client.account().futures().on_*` handler first. Registration is fallible.
+- Then call `client.subscription().futures().subscribe_*`. A successful call means the request was queued.
+- Each symbol's venue acknowledgement or failure arrives independently through the events below.
+- Covered channels: `instrument`, `ticker`, `trade`, `ohlc`, `book`, `book_raw`, and the private `executions`, `positions`, `margin`, `balances` and `preferences`.
+
+`client.subscription().futures()` inspection:
+
+- `list_active()`, `find_by_channel(channel)` and `status_summary()` project Unified Public and Private entries only.
+- Symbols stay native (`Option<String>`). Channel-wide streams (`instrument` and the private account channels) have no symbol.
+- `ohlc` rows also carry `interval` and `tick_type`; both are `None` on every other channel.
+- Each `list_active` row carries `subscribed_at`, the monotonic acknowledgement time, or `None` until the ack.
+- `unsubscribe_channel` and `unsubscribe_all` affect Unified Public and Private entries only, never Spot Public or Auth subscriptions.
+
+#### `FuturesSubscribedEvent`
+
+Emitted when a Unified connection acknowledges one Futures entry. `symbol` is
+the verbatim Futures wire string, or `None` for a channel-wide stream
+(`instrument` and the private account channels).
+
+Payload (`event_version` 1):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `channel` | `ChannelName` | Acknowledged Futures stream channel. |
+| `symbol` | `Option<String>` | Native Futures wire symbol, or `None` for channel-wide streams. |
+| `interval` | `Option<OhlcInterval>` | OHLC candle interval, or `None` for every other channel. |
+| `tick_type` | `Option<FuturesOhlcTickType>` | OHLC candle tick type, or `None` for every other channel. |
+| `subscribed_at_monotonic` | `MonotonicInstant` | Acknowledgement time. |
+| `ack` | `FuturesSubscribeAck` | What the venue's subscribe reply echoed. Empty for a raw book that joins a stream already live for its symbol (it sends no subscribe of its own), or a late maintained book whose reseed reply never arrived. |
+
+`FuturesSubscribeAck` copies only these reply keys; any other key is dropped.
+An absent key is `None` (or an empty `warnings`).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `snapshot` | `Option<bool>` | Snapshot setting the venue applied. |
+| `snap_orders` / `snap_trades` | `Option<bool>` | Executions snapshot options, `None` unless the venue echoes them; current Unified executions replies do not. |
+| `depth` | `Option<u32>` | Book depth the venue applied. |
+| `warnings` | `Vec<String>` | Venue warnings, such as deprecated fields. |
+| `req_id` | `Option<u64>` | Request id; one batched request shares it across symbols. |
+| `time_in` / `time_out` | `Option<String>` | Venue receive and reply times (RFC 3339). |
+
+#### `FuturesSubscribeFailedEvent`
+
+Emitted for each failed Futures subscribe attempt. A transient failure may be
+retried, so `attempt` starts at `1` and increases for the same symbol.
+
+Payload (`event_version` 1):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `channel` | `ChannelName` | Failed Futures stream channel. |
+| `symbol` | `Option<String>` | Native Futures wire symbol, or `None` for channel-wide streams. |
+| `interval` | `Option<OhlcInterval>` | OHLC candle interval, or `None` for every other channel. |
+| `tick_type` | `Option<FuturesOhlcTickType>` | OHLC candle tick type, or `None` for every other channel. |
+| `attempt` | `u32` | One-based attempt ordinal for that symbol. |
+| `error_class` | `FuturesSubscribeFailureClass` | Closed enum: exactly `Transient` or `NonTransient`. |
+| `error` | `Option<String>` | Venue error text, the same string a following `FuturesSubscriptionTerminatedEvent` carries in `last_error`. `None` on an ack timeout or outbound backpressure. |
+| `ack` | `FuturesSubscribeAck` | What the failure reply echoed (see above); empty when no reply arrived. |
+
+#### `FuturesSubscriptionTerminatedEvent`
+
+Emitted when one Futures entry reaches a terminal state after caller teardown
+or a non-transient subscribe rejection. Other symbols from the same batch
+remain independent.
+
+Payload (`event_version` 1):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `channel` | `ChannelName` | Terminated Futures stream channel. |
+| `symbol` | `Option<String>` | Native Futures wire symbol, or `None` for channel-wide streams. |
+| `interval` | `Option<OhlcInterval>` | OHLC candle interval, or `None` for every other channel. |
+| `tick_type` | `Option<FuturesOhlcTickType>` | OHLC candle tick type, or `None` for every other channel. |
+| `cause` | `TerminationCause` | `ClientClosed` on unsubscribe / guard drop, or `NonTransientWireRejection`. |
+| `last_error` | `Option<String>` | Verbatim exchange rejection, when supplied. |
+| `terminated_at_monotonic` | `MonotonicInstant` | Terminal-state time. |
 
 ### `SubscriptionGapEvent`
 
@@ -657,16 +742,53 @@ Payload (`event_version` 2):
 
 Broadcast (`request_id: None`). No `dropped_count`; the parallel `SubscriptionGapEvent` carries `0`.
 
-### `ChannelGapEvent`
+### `FuturesSubscriptionGapEvent`
 
-`executions` or `balances` frame `sequence` more than one ahead of the last seen value. Requires a registered channel-wide subscription and a parseable numeric `sequence`. Snapshots reseed the epoch and never gap. Duplicate or regressed sequence resets tracking without an event.
+Emitted in two cases:
 
-The SDK does not auto-resubscribe. Re-sync over REST (`open_orders`, `trades_history`, `balance`).
+1. A Unified public frame that a registered Futures `on_*` handler cannot decode (`cause: MalformedFrame`).
+2. A maintained Futures book CRC mismatch (`cause: OrderBookCrcMismatch`), in parallel with `FuturesOrderBookGapEvent`.
+
+For `ohlc`, one event per malformed row carries the row's `interval` and `tick_type` when each parses. A field the row lacks or mangles is `None`, and the event then names the symbol only. Both fields are `None` on every other channel and on book checksum gaps.
 
 Payload (`event_version` 1):
 
 | Field | Type | Meaning |
 |---|---|---|
+| `channel` | `ChannelName` | Channel the gap occurred on; always `Book` on a CRC gap. |
+| `symbol` | `String` | Native Futures wire symbol. |
+| `interval` | `Option<OhlcInterval>` | OHLC interval read from the malformed row. |
+| `tick_type` | `Option<FuturesOhlcTickType>` | OHLC tick type read from the malformed row. |
+| `dropped_count` | `u32` | `0`. |
+| `cause` | `GapCause` | `MalformedFrame` or `OrderBookCrcMismatch`. |
+
+Broadcast (`request_id: None`).
+
+### `FuturesOrderBookGapEvent`
+
+Maintained Futures book only (`on_book` / `on_book_for`). On a CRC mismatch the update is withheld and the SDK requests a new snapshot for that symbol. Paired with `FuturesSubscriptionGapEvent`. Raw handlers (`on_book_raw`) never emit it: they keep no book state and validate no CRC32.
+
+Payload (`event_version` 1):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `channel` | `ChannelName` | Always `Book`. |
+| `symbol` | `String` | Native Futures wire symbol. |
+| `cause` | `GapCause` | Always `OrderBookCrcMismatch`. |
+
+Broadcast (`request_id: None`). No `dropped_count`; the parallel `FuturesSubscriptionGapEvent` carries `0`.
+
+### `ChannelGapEvent`
+
+`executions` or `balances` frame `sequence` more than one ahead of the last seen value. Requires a registered channel-wide subscription and a parseable numeric `sequence`. Snapshots reseed the epoch and never gap. Duplicate or regressed sequence resets tracking without an event.
+
+The SDK does not auto-resubscribe. On Spot, re-sync over REST (`open_orders`, `trades_history`, `balance`). On Unified Private there is no REST re-sync: drop the `on_balances_for` guard, or call `unsubscribe_balances` then `subscribe_balances(None)`, for a fresh snapshot. The same resubscribe on `executions` returns the open-orders snapshot, which reconciles Futures orders after a gap. Only `balances` is sequence-tracked there; its `executions`, `positions`, `margin` and `preferences` frames carry no `sequence`.
+
+Payload (`event_version` 1):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `url` | `WsUrl` | Connection whose sequence jumped. Spot and Futures share channel names. |
 | `channel` | `ChannelName` | `Executions` or `Balances`. |
 | `dropped_count` | `u32` | Observed delta minus one, saturating at `u32::MAX`. |
 | `cause` | `GapCause` | Always `SequenceGapDetected`. |
@@ -679,11 +801,11 @@ The awaited method `Result` is authoritative. Drive control flow from it.
 
 ### `OrderSubmittedEvent`
 
-Definitive wire response for `add` / `amend` / `cancel_order` (REST or WS auth). `cancel_batch` emits one event per leg.
+Definitive wire response for `add` / `amend` / `cancel_order` (Spot REST or auth WS, or Futures on the Unified private socket). Spot `cancel_batch` emits one event per leg; Futures `cancel_batch` and `order_batch` emit none.
 
 - Placement accepted with an order id → `WireSent { txid }`.
 - Amend or cancel accepted → `WireAccepted`. Amend may carry `amend_id`; cancel never does.
-- Definitive rejection → `WireError { code }`.
+- Definitive rejection → `WireError { code }`. An amend or cancel of a Futures order named by `order_id` emits none of the order events.
 
 Does not fire for: `cancel_all`, `cancel_all_orders_after`, `order_batch`; ops with no `cl_ord_id` (auto-allocation suppressed when `userref` or conditional-close is set); successful validate-mode placement; pre-wire failures; send with no answer (`OrderPlacementAmbiguousEvent`).
 
@@ -696,6 +818,7 @@ Payload (`event_version` 1):
 | `cl_ord_id` | `ClOrdId` | Client order id. |
 | `amend_id` | `Option<AmendId>` | Set only when an amend reply included one. |
 | `op` | `OrderOp` | `AddOrder`, `AmendOrder`, or `CancelOrder`. `#[non_exhaustive]`. |
+| `url` | `WsUrl` | Product connection the order belongs to: `Auth` for every Spot order, REST included; `UnifiedPrivate` for Futures. |
 | `status` | `OrderSubmitStatus` | `WireSent { txid }`, `WireAccepted`, or `WireError { code }`. `#[non_exhaustive]`. |
 | `request_id` | `Option<String>` | REST UUID or WS `req_id`. Populated on every shipped path. |
 
@@ -703,11 +826,11 @@ Payload (`event_version` 1):
 
 `add` or `amend` reached the wire with no definitive answer.
 
-REST: sent-but-unanswered transport (including timeout after send), socket reset, abnormal close, close frame mid-request. WS: deadline, in-flight drop, client closing, or loop death after the frame was recorded.
+REST: sent-but-unanswered transport (including timeout after send), socket reset, abnormal close, close frame mid-request. WS: deadline, in-flight drop, client closing, loop death after the frame was recorded.
 
 Does not fire for cancels, `order_batch`, pre-send failures, or ops with no `cl_ord_id`. Never alongside `OrderSubmittedEvent` for the same send.
 
-Do not resend. Reconcile with `client.account().find_order_by_cl_ord_id(cl_ord_id)`. `last_known_status` is the literal `"sent_no_response"` (`EventPayload::PLACEMENT_AMBIGUOUS_LAST_KNOWN_STATUS`). Envelope `request_id` is `None`.
+Do not resend. Reconcile with `client.account().find_order_by_cl_ord_id(cl_ord_id)` for a Spot order, or the Futures executions snapshot for a Futures order (`url: UnifiedPrivate`) ([Placing orders → Idempotency](guides/placing-orders.md#idempotency-and-reconciliation)). `last_known_status` is the literal `"sent_no_response"` (`EventPayload::PLACEMENT_AMBIGUOUS_LAST_KNOWN_STATUS`). Envelope `request_id` is `None`.
 
 Payload (`event_version` 1):
 
@@ -716,6 +839,7 @@ Payload (`event_version` 1):
 | `cl_ord_id` | `ClOrdId` | Client order id. |
 | `amend_id` | `Option<AmendId>` | Amend id if already minted. |
 | `op` | `OrderOp` | `AddOrder` or `AmendOrder`. |
+| `url` | `WsUrl` | Product connection the order belongs to: `Auth` for every Spot order, REST included; `UnifiedPrivate` for Futures. |
 | `sent_at_monotonic` | `MonotonicInstant` | Sampled immediately before send. Not comparable to exchange timestamps. |
 | `request_id` | `Option<String>` | REST UUID or WS `req_id`. |
 
@@ -723,9 +847,9 @@ Payload (`event_version` 1):
 
 The in-flight order future was dropped (cancelled task, `select!`, timeout) after the send guard was armed and before the send resolved. Retryable cancel paths include backoff sleep.
 
-Does not fire for a completed call, a drop before send, `cancel_all` / `cancel_all_orders_after` / `order_batch`, or ops with no `cl_ord_id`. A dropped `cancel_batch` await emits one event per in-flight leg.
+Does not fire for a completed call, a drop before send, `cancel_all` / `cancel_all_orders_after` / `order_batch`, or ops with no `cl_ord_id`. A dropped Spot `cancel_batch` await emits one event per in-flight leg; a Futures `cancel_batch` emits none.
 
-Dropping the `await` does not cancel the order. Reconcile with `find_order_by_cl_ord_id`. `cancellation_source` is `"caller_initiated"` (`EventPayload::CANCELLATION_SOURCE_CALLER_INITIATED`). Envelope `request_id` is `None`.
+Dropping the `await` does not cancel the order. Reconcile with `find_order_by_cl_ord_id` for a Spot order, or the Futures executions snapshot for a Futures order ([Placing orders → Idempotency](guides/placing-orders.md#idempotency-and-reconciliation)). `cancellation_source` is `"caller_initiated"` (`EventPayload::CANCELLATION_SOURCE_CALLER_INITIATED`). Envelope `request_id` is `None`.
 
 Payload (`event_version` 1):
 
@@ -733,6 +857,7 @@ Payload (`event_version` 1):
 |---|---|---|
 | `cl_ord_id` | `ClOrdId` | Client order id. |
 | `op` | `OrderOp` | `AddOrder`, `AmendOrder`, or `CancelOrder`. |
+| `url` | `WsUrl` | Product connection the order belongs to: `Auth` for every Spot order, REST included; `UnifiedPrivate` for Futures. |
 | `request_id` | `Option<String>` | REST UUID or WS `req_id`. |
 
 ### `OrderReconciliationEvent`

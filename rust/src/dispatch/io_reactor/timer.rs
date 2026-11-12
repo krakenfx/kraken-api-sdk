@@ -108,16 +108,10 @@ mod tests {
     use super::*;
     use crate::clock::Clock;
     use crate::conn::managed_connection::FsmEvent;
-    use crate::types::MonotonicInstant;
     use std::sync::Arc;
     use std::time::Duration;
 
-    struct FixedClock(Duration);
-    impl Clock for FixedClock {
-        fn now(&self) -> MonotonicInstant {
-            MonotonicInstant(self.0)
-        }
-    }
+    use crate::clock::FixedClock;
 
     #[test]
     fn earliest_timer_delay_uses_owning_mc_injected_clock() {

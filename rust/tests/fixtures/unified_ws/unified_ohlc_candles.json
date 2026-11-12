@@ -1,0 +1,65 @@
+[
+  {
+    "channel": "ohlc",
+    "type": "snapshot",
+    "timestamp": "2026-10-29T10:59:34.900284683Z",
+    "data": [
+      {
+        "symbol": "PF_XBTUSD",
+        "tick_type": "trade",
+        "open": 80157,
+        "high": 80183,
+        "low": 80156,
+        "close": 80183,
+        "trades": 108,
+        "volume": 0.0109,
+        "vwap": 80169.165137614,
+        "interval_begin": "2026-10-29T10:59:00.000000000Z",
+        "interval": 1,
+        "timestamp": "2026-10-29T11:00:00.000000Z"
+      }
+    ]
+  },
+  {
+    "channel": "ohlc",
+    "type": "update",
+    "timestamp": "2026-10-29T10:59:35.673145729Z",
+    "data": [
+      {
+        "symbol": "PF_ETHUSD",
+        "tick_type": "trade",
+        "open": 2323.6,
+        "high": 2326.6,
+        "low": 2323.5,
+        "close": 2323.5,
+        "trades": 95,
+        "volume": 0.095,
+        "vwap": 2324.949473684,
+        "interval_begin": "2026-10-29T10:59:00.000000000Z",
+        "interval": 1,
+        "timestamp": "2026-10-29T11:00:00.000000Z"
+      }
+    ]
+  },
+  {
+    "channel": "ohlc",
+    "type": "update",
+    "timestamp": "2026-10-29T10:59:35.673247874Z",
+    "data": [
+      {
+        "symbol": "PF_ETHUSD",
+        "tick_type": "trade",
+        "open": 2323.6,
+        "high": 2326.6,
+        "low": 2323.5,
+        "close": 2326.6,
+        "trades": 96,
+        "volume": 0.096,
+        "vwap": 2324.966666666,
+        "interval_begin": "2026-10-29T10:59:00.000000000Z",
+        "interval": 1,
+        "timestamp": "2026-10-29T11:00:00.000000Z"
+      }
+    ]
+  }
+]

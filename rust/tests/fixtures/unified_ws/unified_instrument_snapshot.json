@@ -1,0 +1,30 @@
+{
+  "channel": "instrument",
+  "type": "snapshot",
+  "data": {
+    "assets": [
+      {
+        "id": "USD",
+        "status": "enabled",
+        "precision": 4,
+        "precision_display": 2,
+        "borrowable": true,
+        "collateral_value": "1.0",
+        "margin_rate": 0.028
+      }
+    ],
+    "pairs": [
+      {
+        "symbol": "PI_XBTUSD",
+        "base": "XBT",
+        "quote": "USD",
+        "status": "online",
+        "price_precision": 1,
+        "qty_precision": 0,
+        "qty_min": 1,
+        "qty_increment": "1",
+        "price_increment": 0.1
+      }
+    ]
+  }
+}

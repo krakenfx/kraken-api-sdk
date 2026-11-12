@@ -18,33 +18,39 @@ async fn main() {
     let client = ClientBuilder::new().build().expect("build");
     client.ready();
 
-    let _h = client.market().on_book(|b: &OrderBookUpdate| {
-        let top_bid = b.bids.first().map(|l| (l.price, l.qty));
-        let top_ask = b.asks.first().map(|l| (l.price, l.qty));
-        println!(
-            "[book] {} bids={} asks={} top_bid={:?} top_ask={:?} crc={} exch_ts={}",
-            b.symbol.as_str(),
-            b.bids.len(),
-            b.asks.len(),
-            top_bid,
-            top_ask,
-            b.checksum,
-            b.exchange_timestamp
-        );
-    });
+    let _h = client
+        .market()
+        .on_book(|b: &OrderBookUpdate| {
+            let top_bid = b.bids.first().map(|l| (l.price, l.qty));
+            let top_ask = b.asks.first().map(|l| (l.price, l.qty));
+            println!(
+                "[book] {} bids={} asks={} top_bid={:?} top_ask={:?} crc={} exch_ts={}",
+                b.symbol.as_str(),
+                b.bids.len(),
+                b.asks.len(),
+                top_bid,
+                top_ask,
+                b.checksum,
+                b.exchange_timestamp
+            );
+        })
+        .expect("register book handler");
 
     // Raw-delta variant on the same `book` subscription; `is_snapshot` marks the first frame.
-    let _hr = client.market().on_book_raw(|d: &BookDelta| {
-        println!(
-            "[book_raw] {} snapshot={} bids={} asks={} crc={} exch_ts={}",
-            d.symbol.as_str(),
-            d.is_snapshot,
-            d.bids.len(),
-            d.asks.len(),
-            d.checksum,
-            d.exchange_timestamp
-        );
-    });
+    let _hr = client
+        .market()
+        .on_book_raw(|d: &BookDelta| {
+            println!(
+                "[book_raw] {} snapshot={} bids={} asks={} crc={} exch_ts={}",
+                d.symbol.as_str(),
+                d.is_snapshot,
+                d.bids.len(),
+                d.asks.len(),
+                d.checksum,
+                d.exchange_timestamp
+            );
+        })
+        .expect("register book raw handler");
 
     match client
         .subscription()

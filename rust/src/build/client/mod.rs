@@ -12,7 +12,7 @@ use crate::clock::Clock;
 use crate::conn::ConnectionSupervisor;
 use crate::dispatch::DispatchEventBus;
 use crate::jitter::JitterSource;
-use crate::transport::{HttpTransport, WsSocketFactory};
+use crate::transport::{HttpTransport, WsSocketFactoryLike};
 use crate::types::{ApiKey, ApiSecret, Otp};
 
 mod accessors;
@@ -99,10 +99,18 @@ pub enum ConfigError {
         "`{knob}` must use the `{scheme}` (TLS) scheme; cleartext or non-TLS endpoint URLs are refused at build time."
     )]
     InsecureEndpointScheme {
-        /// Endpoint knob: `rest_base_url`, `ws_public_url`, or `ws_auth_url`.
+        /// Endpoint knob: `rest_base_url`, `ws_public_url`, `ws_auth_url`, `unified_ws_public_url`, or `unified_ws_private_url`.
         knob: String,
         /// Required scheme: `https://` for REST, `wss://` for WS.
         scheme: String,
+    },
+    /// An endpoint URL knob named a host outside `kraken.com` and `kraken.zone`.
+    #[error(
+        "`{knob}` must name a host under `kraken.com` or `kraken.zone`; other endpoint hosts are refused at build time."
+    )]
+    UntrustedEndpointHost {
+        /// Endpoint knob: `rest_base_url`, `ws_public_url`, `ws_auth_url`, `unified_ws_public_url`, or `unified_ws_private_url`.
+        knob: String,
     },
     /// `.with_headers` combined with an injected transport.
     #[error(
@@ -149,6 +157,7 @@ impl crate::error::ApiError for ConfigError {
             FeatureDisabled { .. } => "FEATURE_DISABLED",
             ClientClosed => "CLIENT_CLOSED",
             InsecureEndpointScheme { .. } => "INSECURE_ENDPOINT_SCHEME",
+            UntrustedEndpointHost { .. } => "UNTRUSTED_ENDPOINT_HOST",
             InvalidConfig { .. } => "INVALID_CONFIG",
             Unknown { .. } => "UNKNOWN",
         }
@@ -185,7 +194,7 @@ pub struct Client {
     subscription_mirror: crate::conn::subscription_registry::SubscriptionMirror,
     bus: Arc<DispatchEventBus>,
     supervisor: Arc<ConnectionSupervisor>,
-    ws_factory: Arc<WsSocketFactory>,
+    ws_factory: Arc<dyn WsSocketFactoryLike>,
     clock: Arc<dyn Clock>,
     /// Reconnect-backoff jitter; override via [`ClientBuilder::with_jitter_source`].
     jitter: Arc<dyn JitterSource>,
@@ -200,15 +209,15 @@ impl Drop for Client {
     fn drop(&mut self) {
         // begin_shutdown first so abort is an intended stop, not LoopFailedEvent.
         self.bus.begin_shutdown();
-        if let Ok(mut g) = self.io_reactor_handle.lock() {
-            if let Some(join) = g.take() {
-                join.abort();
-                // Abort before first poll never arms LoopDeathGuard — engage death path.
-                self.bus.on_loop_death(
-                    crate::dispatch::ReactorName::Io,
-                    crate::dispatch::LoopFailureCause::Cancelled,
-                );
-            }
+        if let Ok(mut g) = self.io_reactor_handle.lock()
+            && let Some(join) = g.take()
+        {
+            join.abort();
+            // Abort before first poll never arms LoopDeathGuard — engage death path.
+            self.bus.on_loop_death(
+                crate::dispatch::ReactorName::Io,
+                crate::dispatch::LoopFailureCause::Cancelled,
+            );
         }
     }
 }
@@ -220,6 +229,9 @@ impl std::fmt::Debug for Client {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod close_wiring_tests;
 
 #[cfg(test)]
 mod tests {
@@ -882,6 +894,49 @@ mod tests {
             observed, None,
             "broadcast ClientReady must carry request_id: None (two-copy terminal shape)"
         );
+    }
+
+    #[tokio::test]
+    async fn client_ready_event_declares_every_ws_url_and_nothing_discovered() {
+        let client = {
+            let _g = crate::build::test_env::env_lock();
+            Client::builder().build().unwrap()
+        };
+        let snapshot = Arc::new(std::sync::Mutex::new(None));
+        let snapshot_cb = Arc::clone(&snapshot);
+        let _watch = client
+            .events()
+            .on(crate::dispatch::EventType::ClientReady, move |env| {
+                if let crate::dispatch::EventPayload::ClientReady {
+                    capability_snapshot,
+                } = &env.payload
+                {
+                    *snapshot_cb.lock().expect("snapshot lock") = Some(capability_snapshot.clone());
+                }
+            })
+            .expect("register ClientReady handler");
+
+        client.ready().await.expect("ready resolves Ok");
+        let observed = tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                if let Some(snapshot) = snapshot.lock().expect("snapshot lock").clone() {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ClientReady event was delivered");
+
+        for url in [
+            crate::types::WsUrl::Public,
+            crate::types::WsUrl::Auth,
+            crate::types::WsUrl::UnifiedPublic,
+            crate::types::WsUrl::UnifiedPrivate,
+        ] {
+            assert!(observed.declared_ws_urls.contains(&url), "{url:?}");
+        }
+        assert!(observed.discovered_at_first_use.is_empty());
     }
 
     #[tokio::test]

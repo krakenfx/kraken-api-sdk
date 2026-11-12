@@ -17,9 +17,11 @@ please open an issue to discuss substantial changes before sending a large PR.
 
 ## Prerequisites
 
-Rust **1.85** or later (the `rust-version` in [`Cargo.toml`](Cargo.toml)).
-Developers pin a newer toolchain via [`rust-toolchain.toml`](rust-toolchain.toml)
-for consistent `rustfmt` / `clippy`.
+Rust **1.88** or later (the `rust-version` in [`Cargo.toml`](Cargo.toml)). That
+floor tracks the highest MSRV our dependencies require and is never raised for
+convenience. Developers pin a newer toolchain via
+[`rust-toolchain.toml`](rust-toolchain.toml) for consistent `rustfmt` /
+`clippy`.
 
 **Run every command below from the `rust/` directory.** The `ci-*` aliases are
 defined in [`.cargo/config.toml`](.cargo/config.toml) and only resolve when that

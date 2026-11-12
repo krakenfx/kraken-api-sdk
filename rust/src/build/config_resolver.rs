@@ -166,6 +166,16 @@ impl ConfigResolver {
             }
         }
 
+        if knobs.futures_max_in_flight.is_some_and(|n| n > 0)
+            && knobs.ws_order_response_deadline_ms.is_none_or(|ms| ms == 0)
+        {
+            return Err(ConfigError::InvalidConfig {
+                detail:
+                    "knob `futures_max_in_flight` requires `ws_order_response_deadline_ms` >= 1"
+                        .to_string(),
+            });
+        }
+
         Ok((knobs, source_map))
     }
 }
@@ -220,6 +230,7 @@ fn apply_value(knobs: &mut Knobs, knob: KnobName, value: &KnobValue) -> Result<(
         (KnobName::WsOrderResponseDeadlineMs, KnobValue::OptU32(v)) => {
             knobs.ws_order_response_deadline_ms = *v
         }
+        (KnobName::FuturesMaxInFlight, KnobValue::OptU32(v)) => knobs.futures_max_in_flight = *v,
         (KnobName::RestRetryMaxAttempts, KnobValue::U32(v)) => knobs.rest_retry_max_attempts = *v,
         (KnobName::RestRetryBaseMs, KnobValue::U32(v)) => knobs.rest_retry_base_ms = *v,
         (KnobName::RestRetryMaxMs, KnobValue::U32(v)) => knobs.rest_retry_max_ms = *v,
@@ -235,29 +246,49 @@ fn apply_value(knobs: &mut Knobs, knob: KnobName, value: &KnobValue) -> Result<(
         (KnobName::RestBaseUrl, KnobValue::Str(v)) => knobs.rest_base_url = v.clone(),
         (KnobName::WsPublicUrl, KnobValue::Str(v)) => knobs.ws_public_url = v.clone(),
         (KnobName::WsAuthUrl, KnobValue::Str(v)) => knobs.ws_auth_url = v.clone(),
+        (KnobName::UnifiedWsPublicUrl, KnobValue::Str(v)) => {
+            knobs.unified_ws_public_url = v.clone()
+        }
+        (KnobName::UnifiedWsPrivateUrl, KnobValue::Str(v)) => {
+            knobs.unified_ws_private_url = v.clone()
+        }
+        (KnobName::TlsExtraRootCertsFile, KnobValue::Str(v)) => {
+            knobs.tls_extra_root_certs_file = v.clone()
+        }
         _ => return Err(()),
     }
     Ok(())
 }
 
-/// Reject non-TLS endpoint URLs at `.build()`. `check_rest` is false when a
-/// transport is injected. The error never echoes the URL.
-pub(crate) fn validate_endpoint_schemes(
-    knobs: &Knobs,
-    check_rest: bool,
-) -> Result<(), ConfigError> {
+/// Reject endpoint URLs that are not TLS or do not name a `kraken.com` or
+/// `kraken.zone` host, at `.build()`. `check_rest` is false when a transport is
+/// injected. The error never echoes the URL.
+pub(crate) fn validate_endpoint_urls(knobs: &Knobs, check_rest: bool) -> Result<(), ConfigError> {
     fn require_scheme(knob: &str, url: &str, scheme: &str) -> Result<(), ConfigError> {
         // No trim (connector uses verbatim). Byte-wise prefix avoids multi-byte panic.
         let has_scheme = url
             .as_bytes()
             .get(..scheme.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme.as_bytes()));
-        if has_scheme {
-            Ok(())
-        } else {
-            Err(ConfigError::InsecureEndpointScheme {
+        if !has_scheme {
+            return Err(ConfigError::InsecureEndpointScheme {
                 knob: knob.to_string(),
                 scheme: scheme.to_string(),
+            });
+        }
+        let trusted_host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|parsed| {
+                parsed
+                    .host_str()
+                    .map(crate::transport::tls::is_trusted_host)
+            })
+            .unwrap_or(false);
+        if trusted_host {
+            Ok(())
+        } else {
+            Err(ConfigError::UntrustedEndpointHost {
+                knob: knob.to_string(),
             })
         }
     }
@@ -275,6 +306,16 @@ pub(crate) fn validate_endpoint_schemes(
         "wss://",
     )?;
     require_scheme(KnobName::WsAuthUrl.as_str(), &knobs.ws_auth_url, "wss://")?;
+    require_scheme(
+        KnobName::UnifiedWsPublicUrl.as_str(),
+        &knobs.unified_ws_public_url,
+        "wss://",
+    )?;
+    require_scheme(
+        KnobName::UnifiedWsPrivateUrl.as_str(),
+        &knobs.unified_ws_private_url,
+        "wss://",
+    )?;
     Ok(())
 }
 
@@ -290,7 +331,9 @@ pub(crate) fn parse_env_value(knob: KnobName, raw: &str) -> Option<KnobValue> {
         KnobName::RateLimitTradingScopeCap | KnobName::ClOrdIdIndexCap => {
             raw.parse::<usize>().ok().map(KnobValue::Usize)
         }
-        KnobName::ReconnectAttempts | KnobName::WsOrderResponseDeadlineMs => {
+        KnobName::ReconnectAttempts
+        | KnobName::WsOrderResponseDeadlineMs
+        | KnobName::FuturesMaxInFlight => {
             if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
                 Some(KnobValue::OptU32(None))
             } else {
@@ -300,7 +343,7 @@ pub(crate) fn parse_env_value(knob: KnobName, raw: &str) -> Option<KnobValue> {
         KnobName::NonceRecovery | KnobName::PreferRestForOrders => {
             raw.parse::<bool>().ok().map(KnobValue::Bool)
         }
-        KnobName::RestBaseUrl | KnobName::WsPublicUrl | KnobName::WsAuthUrl => {
+        k if k.is_string_knob() => {
             if raw.is_empty() {
                 None
             } else {
@@ -323,7 +366,9 @@ fn toml_to_knob_value(knob: KnobName, tv: &toml::Value) -> Option<KnobValue> {
             .as_integer()
             .and_then(|i| usize::try_from(i).ok())
             .map(KnobValue::Usize),
-        KnobName::ReconnectAttempts | KnobName::WsOrderResponseDeadlineMs => {
+        KnobName::ReconnectAttempts
+        | KnobName::WsOrderResponseDeadlineMs
+        | KnobName::FuturesMaxInFlight => {
             if let Some(i) = tv.as_integer() {
                 u32::try_from(i).ok().map(|v| KnobValue::OptU32(Some(v)))
             } else if let Some(s) = tv.as_str() {
@@ -335,7 +380,7 @@ fn toml_to_knob_value(knob: KnobName, tv: &toml::Value) -> Option<KnobValue> {
         KnobName::NonceRecovery | KnobName::PreferRestForOrders => {
             tv.as_bool().map(KnobValue::Bool)
         }
-        KnobName::RestBaseUrl | KnobName::WsPublicUrl | KnobName::WsAuthUrl => tv
+        k if k.is_string_knob() => tv
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -528,22 +573,80 @@ mod tests {
         let _r = EnvVarGuard::unset("KRAKEN_REST_BASE_URL");
         let _p = EnvVarGuard::unset("KRAKEN_WS_PUBLIC_URL");
         let _a = EnvVarGuard::unset("KRAKEN_WS_AUTH_URL");
+        let _up = EnvVarGuard::unset("KRAKEN_UNIFIED_WS_PUBLIC_URL");
+        let _ur = EnvVarGuard::unset("KRAKEN_UNIFIED_WS_PRIVATE_URL");
         let (k, _m) = ConfigResolver::new().resolve().unwrap();
         assert_eq!(k.rest_base_url, "https://api.kraken.com");
         assert_eq!(k.ws_public_url, "wss://ws.kraken.com/v2");
         assert_eq!(k.ws_auth_url, "wss://ws-auth.kraken.com/v2");
+        assert_eq!(k.unified_ws_public_url, "wss://uws.kraken.com/v2/public");
+        assert_eq!(k.unified_ws_private_url, "wss://uws.kraken.com/v2/private");
     }
 
     #[test]
     fn endpoint_urls_resolve_from_env() {
         let _g = env_lock();
-        let _r = EnvVarGuard::set("KRAKEN_REST_BASE_URL", "https://uat-api.example.test");
-        let _p = EnvVarGuard::set("KRAKEN_WS_PUBLIC_URL", "wss://uat-ws.example.test/v2");
-        let _a = EnvVarGuard::set("KRAKEN_WS_AUTH_URL", "wss://uat-ws-auth.example.test/v2");
+        let _r = EnvVarGuard::set("KRAKEN_REST_BASE_URL", "https://alt-api.example.test");
+        let _p = EnvVarGuard::set("KRAKEN_WS_PUBLIC_URL", "wss://alt-ws.example.test/v2");
+        let _a = EnvVarGuard::set("KRAKEN_WS_AUTH_URL", "wss://alt-ws-auth.example.test/v2");
+        let _up = EnvVarGuard::set(
+            "KRAKEN_UNIFIED_WS_PUBLIC_URL",
+            "wss://alt-uws.example.test/v2/public",
+        );
+        let _ur = EnvVarGuard::set(
+            "KRAKEN_UNIFIED_WS_PRIVATE_URL",
+            "wss://alt-uws.example.test/v2/private",
+        );
         let (k, _m) = ConfigResolver::new().resolve().unwrap();
-        assert_eq!(k.rest_base_url, "https://uat-api.example.test");
-        assert_eq!(k.ws_public_url, "wss://uat-ws.example.test/v2");
-        assert_eq!(k.ws_auth_url, "wss://uat-ws-auth.example.test/v2");
+        assert_eq!(k.rest_base_url, "https://alt-api.example.test");
+        assert_eq!(k.ws_public_url, "wss://alt-ws.example.test/v2");
+        assert_eq!(k.ws_auth_url, "wss://alt-ws-auth.example.test/v2");
+        assert_eq!(
+            k.unified_ws_public_url,
+            "wss://alt-uws.example.test/v2/public"
+        );
+        assert_eq!(
+            k.unified_ws_private_url,
+            "wss://alt-uws.example.test/v2/private"
+        );
+    }
+
+    #[test]
+    fn unified_ws_urls_follow_builder_env_file_default_precedence() {
+        let _g = env_lock();
+        let _up = EnvVarGuard::unset("KRAKEN_UNIFIED_WS_PUBLIC_URL");
+        let _ur = EnvVarGuard::unset("KRAKEN_UNIFIED_WS_PRIVATE_URL");
+        let f = tempfile_with(
+            "unified_ws_public_url = \"wss://file.example.test/public\"\nunified_ws_private_url = \"wss://file.example.test/private\"\n",
+        );
+
+        let mut r = ConfigResolver::new();
+        r.with_config_file(&f.path_buf);
+        let (k, map) = r.resolve().unwrap();
+        assert_eq!(k.unified_ws_public_url, "wss://file.example.test/public");
+        assert_eq!(map["unified_ws_public_url"], ConfigSource::File);
+        assert_eq!(map["unified_ws_private_url"], ConfigSource::File);
+
+        let _e = EnvVarGuard::set(
+            "KRAKEN_UNIFIED_WS_PRIVATE_URL",
+            "wss://env.example.test/private",
+        );
+        let mut r2 = ConfigResolver::new();
+        r2.with_config_file(&f.path_buf);
+        r2.with_builder_knob(
+            "unified_ws_public_url",
+            KnobValue::Str("wss://builder.example.test/public".to_string()),
+        );
+        let (k2, map2) = r2.resolve().unwrap();
+        assert_eq!(
+            k2.unified_ws_public_url,
+            "wss://builder.example.test/public"
+        );
+        assert_eq!(map2["unified_ws_public_url"], ConfigSource::Builder);
+        assert_eq!(k2.unified_ws_private_url, "wss://env.example.test/private");
+        assert_eq!(map2["unified_ws_private_url"], ConfigSource::Env);
+
+        drop(f);
     }
 
     #[test]
@@ -572,7 +675,7 @@ mod tests {
         assert_eq!(map.get("rest_base_url"), Some(&ConfigSource::Builder));
     }
 
-    // TLS endpoint-scheme validation: these call validate_endpoint_schemes
+    // TLS endpoint-scheme validation: these call validate_endpoint_urls
     // directly with hand-set URL knobs, so they touch no env and need no
     // env_lock.
     fn assert_insecure_scheme(err: &ConfigError, knob: &str) {
@@ -587,14 +690,14 @@ mod tests {
     #[test]
     fn tls_schemes_accept_production_defaults() {
         let k = Knobs::defaults();
-        assert!(validate_endpoint_schemes(&k, true).is_ok());
+        assert!(validate_endpoint_urls(&k, true).is_ok());
     }
 
     #[test]
     fn tls_schemes_reject_cleartext_rest() {
         let mut k = Knobs::defaults();
         k.rest_base_url = "http://api.kraken.com".to_string();
-        let err = validate_endpoint_schemes(&k, true).unwrap_err();
+        let err = validate_endpoint_urls(&k, true).unwrap_err();
         assert_insecure_scheme(&err, "rest_base_url");
     }
 
@@ -602,7 +705,7 @@ mod tests {
     fn tls_schemes_reject_cleartext_ws_public() {
         let mut k = Knobs::defaults();
         k.ws_public_url = "ws://ws.kraken.com/v2".to_string();
-        let err = validate_endpoint_schemes(&k, true).unwrap_err();
+        let err = validate_endpoint_urls(&k, true).unwrap_err();
         assert_insecure_scheme(&err, "ws_public_url");
     }
 
@@ -610,17 +713,30 @@ mod tests {
     fn tls_schemes_reject_cleartext_ws_auth() {
         let mut k = Knobs::defaults();
         k.ws_auth_url = "ws://ws-auth.kraken.com/v2".to_string();
-        let err = validate_endpoint_schemes(&k, true).unwrap_err();
+        let err = validate_endpoint_urls(&k, true).unwrap_err();
         assert_insecure_scheme(&err, "ws_auth_url");
+    }
+
+    #[test]
+    fn tls_schemes_reject_cleartext_unified_ws() {
+        let mut k = Knobs::defaults();
+        k.unified_ws_public_url = "ws://uws.kraken.com/v2/public".to_string();
+        let err = validate_endpoint_urls(&k, true).unwrap_err();
+        assert_insecure_scheme(&err, "unified_ws_public_url");
+
+        let mut k = Knobs::defaults();
+        k.unified_ws_private_url = "ws://uws.kraken.com/v2/private".to_string();
+        let err = validate_endpoint_urls(&k, false).unwrap_err();
+        assert_insecure_scheme(&err, "unified_ws_private_url");
     }
 
     #[test]
     fn tls_schemes_skip_rest_when_transport_injected_but_still_check_ws() {
         let mut k = Knobs::defaults();
         k.rest_base_url = "http://api.kraken.com".to_string();
-        assert!(validate_endpoint_schemes(&k, false).is_ok());
+        assert!(validate_endpoint_urls(&k, false).is_ok());
         k.ws_public_url = "ws://ws.kraken.com/v2".to_string();
-        assert!(validate_endpoint_schemes(&k, false).is_err());
+        assert!(validate_endpoint_urls(&k, false).is_err());
     }
 
     #[test]
@@ -629,24 +745,24 @@ mod tests {
         k.rest_base_url = "HTTPS://api.kraken.com".to_string();
         k.ws_public_url = "WSS://ws.kraken.com/v2".to_string();
         k.ws_auth_url = "Wss://ws-auth.kraken.com/v2".to_string();
-        assert!(validate_endpoint_schemes(&k, true).is_ok());
+        assert!(validate_endpoint_urls(&k, true).is_ok());
     }
 
     #[test]
     fn tls_schemes_reject_bare_host_empty_and_lookalike_scheme() {
         let mut k = Knobs::defaults();
         k.rest_base_url = "api.kraken.com".to_string();
-        assert!(validate_endpoint_schemes(&k, true).is_err());
+        assert!(validate_endpoint_urls(&k, true).is_err());
         let mut k_empty = Knobs::defaults();
         k_empty.ws_public_url = String::new();
-        assert!(validate_endpoint_schemes(&k_empty, true).is_err());
+        assert!(validate_endpoint_urls(&k_empty, true).is_err());
         let mut k_look = Knobs::defaults();
         k_look.ws_public_url = "wssx://ws.kraken.com/v2".to_string();
-        assert!(validate_endpoint_schemes(&k_look, true).is_err());
+        assert!(validate_endpoint_urls(&k_look, true).is_err());
         // Leading whitespace is rejected — connector uses the un-trimmed value.
         let mut k_ws = Knobs::defaults();
         k_ws.rest_base_url = "  https://api.kraken.com".to_string();
-        assert!(validate_endpoint_schemes(&k_ws, true).is_err());
+        assert!(validate_endpoint_urls(&k_ws, true).is_err());
     }
 
     #[test]
@@ -654,7 +770,7 @@ mod tests {
         use crate::error::ApiError;
         let mut k = Knobs::defaults();
         k.ws_auth_url = "ws://user:s3cr3t@ws-auth.kraken.com/v2".to_string();
-        let err = validate_endpoint_schemes(&k, true).unwrap_err();
+        let err = validate_endpoint_urls(&k, true).unwrap_err();
         let ConfigError::InsecureEndpointScheme { knob, scheme } = &err else {
             panic!("expected ConfigError::InsecureEndpointScheme, got {err:?}");
         };
@@ -674,22 +790,46 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_hosts_outside_kraken_domains_are_refused_without_echoing_the_url() {
+        let mut k = Knobs::defaults();
+        k.unified_ws_private_url = "wss://kraken.com@evil.example/v2/private".to_string();
+        let err = validate_endpoint_urls(&k, true).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::UntrustedEndpointHost {
+                knob: "unified_ws_private_url".to_string()
+            }
+        );
+        assert!(!err.to_string().contains("evil"), "{err}");
+
+        let mut subdomains = Knobs::defaults();
+        subdomains.rest_base_url = "https://api.test.kraken.zone".to_string();
+        subdomains.unified_ws_public_url = "wss://uws.test.kraken.com/v2/public".to_string();
+        assert!(validate_endpoint_urls(&subdomains, true).is_ok());
+
+        let mut injected = Knobs::defaults();
+        injected.rest_base_url = "https://example.test".to_string();
+        assert!(validate_endpoint_urls(&injected, false).is_ok());
+        assert!(validate_endpoint_urls(&injected, true).is_err());
+    }
+
+    #[test]
     fn tls_schemes_reject_non_ascii_url_without_panicking() {
         // Byte-wise scheme check must reject non-ASCII URLs cleanly, never
         // panic: a naive url[..scheme.len()] slice panics when the length lands
         // inside a multi-byte char.
         let mut k = Knobs::defaults();
         k.rest_base_url = "日日日日".to_string();
-        assert!(validate_endpoint_schemes(&k, true).is_err());
+        assert!(validate_endpoint_urls(&k, true).is_err());
 
         let mut k2 = Knobs::defaults();
         k2.ws_public_url = "café://ws".to_string();
-        assert!(validate_endpoint_schemes(&k2, true).is_err());
+        assert!(validate_endpoint_urls(&k2, true).is_err());
 
         // Value shorter (in bytes) than the scheme must not panic either.
         let mut k3 = Knobs::defaults();
         k3.ws_auth_url = "ws".to_string();
-        assert!(validate_endpoint_schemes(&k3, true).is_err());
+        assert!(validate_endpoint_urls(&k3, true).is_err());
     }
 
     #[test]
@@ -916,6 +1056,28 @@ mod tests {
     }
 
     #[test]
+    fn an_in_flight_limit_needs_a_response_deadline() {
+        // (limit, deadline, accepted)
+        let cases = [
+            (None, None, true),
+            (Some(0), None, true),
+            (Some(4), None, false),
+            (Some(4), Some(0), false),
+            (Some(4), Some(5_000), true),
+        ];
+        for (limit, deadline, accepted) in cases {
+            let mut builder = ConfigResolver::new();
+            builder.with_builder_knob("futures_max_in_flight", KnobValue::OptU32(limit));
+            builder.with_builder_knob("ws_order_response_deadline_ms", KnobValue::OptU32(deadline));
+            assert_eq!(
+                builder.resolve().is_ok(),
+                accepted,
+                "limit {limit:?}, deadline {deadline:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_env_value_typed() {
         assert_eq!(
             parse_env_value(KnobName::ReconnectAttempts, "5"),
@@ -923,6 +1085,14 @@ mod tests {
         );
         assert_eq!(
             parse_env_value(KnobName::ReconnectAttempts, "none"),
+            Some(KnobValue::OptU32(None))
+        );
+        assert_eq!(
+            parse_env_value(KnobName::FuturesMaxInFlight, "8"),
+            Some(KnobValue::OptU32(Some(8)))
+        );
+        assert_eq!(
+            parse_env_value(KnobName::FuturesMaxInFlight, "none"),
             Some(KnobValue::OptU32(None))
         );
         assert_eq!(

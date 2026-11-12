@@ -1,6 +1,7 @@
 //! Driveable mock `WsSocket` for I/O Reactor tests: script inbound, capture
 //! outbound, fresh socket per `open_socket` (reconnect gets a new one).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +31,8 @@ pub enum SendFailMode {
     Ok,
     /// Return `Backpressure`.
     Backpressure,
+    /// Return `Backpressure` for the next send, then behave as `Ok`.
+    BackpressureOnce,
     /// Return `WriterClosed`.
     WriterClosed,
 }
@@ -112,13 +115,22 @@ impl WsSocket for DriveableWsSocket {
 
     fn send_frame(&self, frame: WsFrame) -> Result<(), SendFrameError> {
         self.send_attempts.fetch_add(1, Ordering::Relaxed);
-        let mode = *self
-            .send_fail_mode
-            .lock()
-            .expect("send_fail_mode lock poisoned");
+        let mode = {
+            let mut guard = self
+                .send_fail_mode
+                .lock()
+                .expect("send_fail_mode lock poisoned");
+            let mode = *guard;
+            if mode == SendFailMode::BackpressureOnce {
+                *guard = SendFailMode::Ok;
+            }
+            mode
+        };
         match mode {
             SendFailMode::Ok => {}
-            SendFailMode::Backpressure => return Err(SendFrameError::Backpressure),
+            SendFailMode::Backpressure | SendFailMode::BackpressureOnce => {
+                return Err(SendFrameError::Backpressure);
+            }
             SendFailMode::WriterClosed => return Err(SendFrameError::WriterClosed),
         }
         self.sent
@@ -149,7 +161,9 @@ pub struct DriveableWsSocketFactory {
     bus: Arc<DispatchEventBus>,
     next_connection_id: AtomicU64,
     handles: Mutex<Vec<DriveableSocketHandle>>,
+    latest_handle_by_url: Mutex<HashMap<WsUrl, DriveableSocketHandle>>,
     next_send_fail_mode: Mutex<SendFailMode>,
+    next_upgrade_failure: Mutex<Option<TransportError>>,
 }
 
 impl DriveableWsSocketFactory {
@@ -159,7 +173,9 @@ impl DriveableWsSocketFactory {
             bus,
             next_connection_id: AtomicU64::new(1),
             handles: Mutex::new(Vec::new()),
+            latest_handle_by_url: Mutex::new(HashMap::new()),
             next_send_fail_mode: Mutex::new(SendFailMode::Ok),
+            next_upgrade_failure: Mutex::new(None),
         }
     }
 
@@ -169,6 +185,15 @@ impl DriveableWsSocketFactory {
             .next_send_fail_mode
             .lock()
             .expect("next_send_fail_mode lock poisoned") = mode;
+    }
+
+    /// Make the next opened socket publish this handshake failure instead of
+    /// `WsUpgradeOk`.
+    pub fn set_next_upgrade_failure(&self, error: TransportError) {
+        *self
+            .next_upgrade_failure
+            .lock()
+            .expect("next_upgrade_failure lock poisoned") = Some(error);
     }
 
     /// Number of sockets created so far.
@@ -182,6 +207,18 @@ impl DriveableWsSocketFactory {
             .lock()
             .expect("handles lock poisoned")
             .get(index)
+            .cloned()
+    }
+
+    /// Handle for the most recently opened socket at `url`.
+    ///
+    /// A reconnect replaces the previous handle for that URL. `handle(index)`
+    /// remains available for tests that intentionally assert creation order.
+    pub fn handle_for(&self, url: WsUrl) -> Option<DriveableSocketHandle> {
+        self.latest_handle_by_url
+            .lock()
+            .expect("latest-handle map lock poisoned")
+            .get(&url)
             .cloned()
     }
 }
@@ -208,14 +245,37 @@ impl WsSocketFactoryLike for DriveableWsSocketFactory {
         self.handles
             .lock()
             .expect("handles lock poisoned")
-            .push(handle);
+            .push(handle.clone());
+        self.latest_handle_by_url
+            .lock()
+            .expect("latest-handle map lock poisoned")
+            .insert(url, handle);
 
+        let upgrade_failure = self
+            .next_upgrade_failure
+            .lock()
+            .expect("next_upgrade_failure lock poisoned")
+            .take();
+        let (event_type, payload) = match upgrade_failure {
+            Some(error) => (
+                crate::dispatch::EventType::WsUpgradeFailed,
+                crate::dispatch::EventPayload::WsUpgradeFailed {
+                    connection_id,
+                    url,
+                    error,
+                },
+            ),
+            None => (
+                crate::dispatch::EventType::WsUpgradeOk,
+                crate::dispatch::EventPayload::WsUpgradeOk { connection_id, url },
+            ),
+        };
         self.bus.publish(crate::dispatch::EventEnvelope {
-            event_type: crate::dispatch::EventType::WsUpgradeOk,
+            event_type,
             event_version: 1,
             timestamp_monotonic: self.bus.clock().now(),
             request_id: Some(connection_id),
-            payload: crate::dispatch::EventPayload::WsUpgradeOk { connection_id, url },
+            payload,
         });
 
         Arc::new(DriveableWsSocket {
@@ -225,5 +285,51 @@ impl WsSocketFactoryLike for DriveableWsSocketFactory {
             send_fail_mode,
             send_attempts,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::clock::{Clock, SystemClock};
+    use crate::dispatch::DispatchEventBusConfig;
+    use crate::transport::WsSocketFactoryLike;
+
+    use super::DriveableWsSocketFactory;
+
+    fn factory() -> DriveableWsSocketFactory {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let bus = Arc::new(crate::dispatch::DispatchEventBus::new(
+            DispatchEventBusConfig::defaults(),
+            clock,
+        ));
+        DriveableWsSocketFactory::new(bus)
+    }
+
+    #[test]
+    fn handle_for_returns_none_before_the_url_is_opened() {
+        let factory = factory();
+
+        assert!(factory.handle_for(crate::types::WsUrl::Public).is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_for_returns_the_latest_socket_after_a_reconnect() {
+        let factory = factory();
+        let _first = factory.open_socket(crate::types::WsUrl::Public);
+        let latest = factory.open_socket(crate::types::WsUrl::Public);
+
+        factory
+            .handle_for(crate::types::WsUrl::Public)
+            .expect("latest public handle")
+            .emit_text("latest public socket");
+
+        let frame = latest
+            .recv_frame()
+            .await
+            .expect("frame sent to latest socket");
+
+        assert_eq!(frame.payload, b"latest public socket");
     }
 }

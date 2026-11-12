@@ -2,6 +2,7 @@
 //! production impls, and `WsSocketFactory` for opening sockets per `WsUrl`.
 
 pub mod http;
+pub(crate) mod tls;
 pub mod ws;
 
 /// Driveable mock socket + factory for I/O Reactor integration tests
@@ -29,6 +30,9 @@ pub struct WsSocketFactory {
     public_url: String,
     /// Auth WS URL from the `ws_auth_url` knob.
     auth_url: String,
+    unified_public_url: String,
+    unified_private_url: String,
+    tls: Arc<rustls::ClientConfig>,
 }
 
 impl WsSocketFactoryLike for WsSocketFactory {
@@ -96,12 +100,27 @@ impl WsSocketFactory {
         bus: Arc<crate::dispatch::DispatchEventBus>,
         public_url: String,
         auth_url: String,
+        unified_public_url: String,
+        unified_private_url: String,
+        tls: Arc<rustls::ClientConfig>,
     ) -> Self {
         Self {
             bus,
             next_connection_id: std::sync::atomic::AtomicU64::new(1),
             public_url,
             auth_url,
+            unified_public_url,
+            unified_private_url,
+            tls,
+        }
+    }
+
+    pub(crate) fn endpoint_for(&self, url: WsUrl) -> &str {
+        match url {
+            WsUrl::Public => &self.public_url,
+            WsUrl::Auth => &self.auth_url,
+            WsUrl::UnifiedPublic => &self.unified_public_url,
+            WsUrl::UnifiedPrivate => &self.unified_private_url,
         }
     }
 
@@ -111,15 +130,13 @@ impl WsSocketFactory {
         let connection_id = self
             .next_connection_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let url_str = match url {
-            WsUrl::Public => self.public_url.clone(),
-            WsUrl::Auth => self.auth_url.clone(),
-        };
+        let url_str = self.endpoint_for(url).to_owned();
         Arc::new(TokioTungsteniteWsSocket::open_and_spawn(
             url,
             url_str,
             connection_id,
             Arc::clone(&self.bus),
+            Arc::clone(&self.tls),
         ))
     }
 }

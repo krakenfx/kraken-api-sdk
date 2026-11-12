@@ -1,5 +1,4 @@
-//! `DispatchEventBus` — the async Reactor boundary and pub-sub event bus.
-//! Channel discipline, correlation, cycle-break: docs/guides/streaming.md.
+//! `DispatchEventBus`: the async Reactor boundary and pub-sub event bus.
 
 mod events;
 mod inbound;
@@ -20,16 +19,13 @@ use tokio::sync::mpsc;
 
 use crate::clock::Clock;
 use crate::dispatch::handler_registry::{DataDelivery, HandlerId};
-use crate::types::{ChannelName, MonotonicInstant, QueueFullError, SubscriberHandle};
+use crate::types::{ChannelName, MonotonicInstant, QueueFullError, SubscriberHandle, WsUrl};
 
 /// Long-lived subscriber callback; runs synchronously on the dispatch reactor.
 pub type EventCallback = Arc<dyn Fn(&EventEnvelope) + Send + Sync + 'static>;
 
-/// One-shot subscriber callback for `subscribe_correlated`; removed after the
-/// first match.
-/// Returns whether it ACCEPTED the envelope. A waiter cancelled between being
-/// removed for delivery and being fired declines, and the caller must then not
-/// drop the envelope on the floor.
+/// One-shot subscriber callback for `subscribe_correlated`, removed after the first match.
+/// Returns whether it accepted the envelope; a waiter cancelled mid-delivery declines.
 pub type CorrelatedCallback = Box<dyn FnOnce(&EventEnvelope) -> bool + Send + Sync + 'static>;
 
 enum SubscriberHandlerKind {
@@ -43,21 +39,16 @@ struct SubscriberRecord {
     handler: SubscriberHandlerKind,
 }
 
-/// Correlated miss-buffer cap (drop-oldest FIFO); the low-volume,
-/// consumed-promptly property is a load-bearing invariant — docs/guides/streaming.md.
+/// Correlated miss-buffer cap (drop-oldest FIFO); assumes low volume and prompt consumption.
 const CORRELATED_MISS_BUFFER_CAP: usize = 256;
 
-/// Bound on the close-path dispatch-ring drain.
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Live one-shot waiters PLUS a bounded miss-buffer of completions dispatched
-/// before their waiter registered. ONE `Mutex` so take-or-insert stays atomic.
+/// Live one-shot waiters plus a bounded miss-buffer; one `Mutex` keeps take-or-insert atomic.
 struct CorrelatedRegistry {
-    /// All waiters on a key resolve together on the first match — observing one
-    /// operation two ways must not strand either observer.
+    /// All waiters on a key resolve together on the first match.
     live: HashMap<(EventType, u64), Vec<SubscriberRecord>>,
-    /// Dispatched-but-unwaited completions; a later `subscribe_correlated`
-    /// for a matching key consumes its entry.
+    /// Completions dispatched before their waiter registered.
     missed: VecDeque<((EventType, u64), EventEnvelope)>,
     missed_cap: usize,
     /// Set when a loop death commits, intended teardown included: past it only
@@ -80,11 +71,9 @@ impl CorrelatedRegistry {
         }
     }
 
-    /// Latch a completion that found no live waiter; drop-oldest on overflow.
     fn latch_missed(&mut self, key: (EventType, u64), event: EventEnvelope) {
         if self.missed.len() >= self.missed_cap {
-            // Overflow breaks the consumed-promptly invariant: name the evicted
-            // completion so a lost correlated await is diagnosable.
+            // Overflow breaks the consumed-promptly invariant: the evicted completion is named.
             if let Some(((evicted, corr), _)) = self.missed.front() {
                 tracing::warn!(
                     target: "kraken_sdk::dispatch_reactor",
@@ -99,7 +88,6 @@ impl CorrelatedRegistry {
         self.missed.push_back((key, event));
     }
 
-    /// Consume a latched completion for `key`, if present.
     fn take_missed(&mut self, key: (EventType, u64)) -> Option<EventEnvelope> {
         let idx = self.missed.iter().position(|(k, _)| *k == key)?;
         self.missed.remove(idx).map(|(_, env)| env)
@@ -115,15 +103,14 @@ pub enum ReactorState {
     Failed(LoopFailureCause),
 }
 
-/// One item on the `io_to_dispatch` ring. ONE FIFO, so data ordering is
-/// preserved and the drop-oldest cap is shared across events and data.
+/// One item on the `io_to_dispatch` ring; one FIFO preserves data ordering.
 pub(crate) enum DispatchItem {
     Event(EventEnvelope),
     Data(DataDelivery, DataRouting),
 }
 
-/// Routing + instrumentation metadata for a [`DispatchItem::Data`].
 pub(crate) struct DataRouting {
+    pub url: WsUrl,
     pub channel: ChannelName,
     pub handler_id: HandlerId,
 }
@@ -155,11 +142,9 @@ impl<T> DropOldestRing<T> {
         self.notify.notify_one();
     }
 
-    /// Push an item; drop oldest if full. Returns `true` if an item was dropped —
-    /// caller emits the (debounced) `QueueFullWarning`.
+    /// Push an item, dropping the oldest if full; returns `true` if one was dropped.
     pub(crate) fn push(&self, item: T) -> bool {
-        // Poison-tolerant: reachable from CancelEmitGuard::Drop — recover,
-        // never panic in Drop.
+        // Poison-tolerant: reachable from `Drop`, which must not panic.
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let dropped = if guard.len() >= self.capacity {
             guard.pop_front();
@@ -173,7 +158,6 @@ impl<T> DropOldestRing<T> {
         dropped
     }
 
-    /// Current queued depth, for the `QueueDepthSample` emit.
     pub(crate) fn depth(&self) -> usize {
         self.inner
             .lock()
@@ -211,7 +195,7 @@ pub struct DispatchEventBusConfig {
     pub io_to_dispatch_capacity: usize,
     /// Caller→I/O queue capacity (messages). Default 2_048.
     pub caller_to_io_capacity: usize,
-    /// `QueueDepthSample` emission interval (ms). Default 100.
+    /// `QueueDepthSample` interval (ms). Default 100.
     pub queue_depth_sample_interval_ms: u32,
     /// `SlowCallbackWarning` threshold (ms). Default 50.
     // Live reads go through Knobs; the config copy is read via test-support only.
@@ -234,8 +218,7 @@ impl DispatchEventBusConfig {
         }
     }
 
-    /// Build from the resolved `Knobs`. Queue capacities are construction-only;
-    /// the timing knobs seed a snapshot.
+    /// Builds from the resolved `Knobs`; queue capacities are construction-only.
     pub fn from_knobs(knobs: &crate::build::knobs::Knobs) -> Self {
         use std::sync::atomic::Ordering;
         Self {
@@ -272,38 +255,35 @@ pub struct DispatchEventBus {
     /// no auto-restart). Entry points read it to reject synchronously.
     loop_failed: std::sync::atomic::AtomicBool,
 
+    /// Last terminal failure per connection, written before the state reads `Failed`.
+    connection_failures: Mutex<HashMap<WsUrl, (Option<NonTransientClass>, String)>>,
+
     /// Latched by the intentional-teardown paths BEFORE they abort a reactor,
     /// so `on_loop_death` does not mis-report the abort as a loop death.
     shutting_down: std::sync::atomic::AtomicBool,
 
-    /// Latched on EVERY reactor-loop death, intended teardown included (unlike
-    /// `loop_failed`). A correlated await armed after the death drain has run
-    /// reads this to self-resolve instead of hanging.
+    /// Latched on EVERY reactor-loop death, intended teardown included; a correlated await
+    /// armed after the death drain reads it to self-resolve.
     loop_death_observed: std::sync::atomic::AtomicBool,
 
     clock: Arc<dyn Clock>,
     next_subscriber_id: AtomicU64,
 
-    /// Cumulative `io_to_dispatch` drops, surfaced in `QueueFullWarning`.
     dropped_count: AtomicU64,
-    /// Last `QueueFullWarning` emit — the debounce gate.
     last_warning_at: Mutex<Option<MonotonicInstant>>,
 
     cfg: DispatchEventBusConfig,
 
-    /// Shared knob holder; runtime-mutable timing knobs read fresh so
-    /// `Client::set_knob` is honoured.
+    /// Shared knob holder; timing knobs are read fresh so `Client::set_knob` is honoured.
     knobs: Arc<crate::build::knobs::Knobs>,
 
-    /// Full-rejected Drop teardowns waiting for a free `caller_to_io` slot.
     pending_teardowns: Mutex<Vec<CallerInbound>>,
     has_pending_teardowns: std::sync::atomic::AtomicBool,
     last_teardown_flush_warn_at: Mutex<Option<MonotonicInstant>>,
 }
 
 impl DispatchEventBus {
-    /// Construct with placeholder `Knobs::defaults()`. `set_knobs()` is MANDATORY
-    /// before starting any reactor — the defaults are not production-safe.
+    /// Constructs with placeholder `Knobs::defaults()`; `set_knobs()` MUST run before any reactor starts.
     pub(crate) fn new(cfg: DispatchEventBusConfig, clock: Arc<dyn Clock>) -> Self {
         let (caller_to_io_tx, caller_to_io_rx) = mpsc::channel(cfg.caller_to_io_capacity);
         Self {
@@ -315,6 +295,7 @@ impl DispatchEventBus {
             dispatch_reactor_state: Mutex::new(ReactorState::NotStarted),
             dispatch_reactor_join: Mutex::new(None),
             loop_failed: std::sync::atomic::AtomicBool::new(false),
+            connection_failures: Mutex::new(HashMap::new()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             loop_death_observed: std::sync::atomic::AtomicBool::new(false),
             clock,
@@ -329,7 +310,7 @@ impl DispatchEventBus {
         }
     }
 
-    /// Install the resolved `Arc<Knobs>` (at `.build()`, BEFORE the reactors start).
+    /// Installs the resolved `Arc<Knobs>`; call at `.build()` before the reactors start.
     pub(crate) fn set_knobs(&mut self, knobs: Arc<crate::build::knobs::Knobs>) {
         self.knobs = knobs;
     }
@@ -352,6 +333,120 @@ impl DispatchEventBus {
         self.record_io_to_dispatch_drop();
     }
 
+    pub(crate) fn publish_futures_subscribed(
+        &self,
+        now: crate::types::MonotonicInstant,
+        channel: crate::types::ChannelName,
+        pair: Option<&crate::types::StreamSymbol>,
+        ack: FuturesSubscribeAck,
+    ) {
+        let (symbol, interval, tick_type) = crate::types::StreamSymbol::futures_identity(pair);
+        self.publish(EventEnvelope {
+            event_type: EventType::FuturesSubscribedEvent,
+            event_version: 1,
+            timestamp_monotonic: now,
+            request_id: None,
+            payload: EventPayload::FuturesSubscribedEvent {
+                channel,
+                symbol,
+                interval,
+                tick_type,
+                subscribed_at_monotonic: now,
+                ack,
+            },
+        });
+    }
+
+    pub(crate) fn publish_subscription_gap(
+        &self,
+        now: MonotonicInstant,
+        channel: ChannelName,
+        symbol: &crate::types::StreamSymbol,
+        interval: Option<crate::types::OhlcInterval>,
+        tick_type: Option<crate::types::FuturesOhlcTickType>,
+        cause: GapCause,
+    ) {
+        let envelope = match symbol {
+            crate::types::StreamSymbol::Spot(symbol) => EventEnvelope {
+                event_type: EventType::SubscriptionGapEvent,
+                event_version: 2,
+                timestamp_monotonic: now,
+                request_id: None,
+                payload: EventPayload::SubscriptionGapEvent {
+                    channel,
+                    symbol: symbol.clone(),
+                    dropped_count: 0,
+                    cause,
+                },
+            },
+            crate::types::StreamSymbol::Futures(_)
+            | crate::types::StreamSymbol::FuturesOhlc { .. } => EventEnvelope {
+                event_type: EventType::FuturesSubscriptionGapEvent,
+                event_version: 1,
+                timestamp_monotonic: now,
+                request_id: None,
+                payload: EventPayload::FuturesSubscriptionGapEvent {
+                    channel,
+                    symbol: symbol.as_str().to_string(),
+                    interval,
+                    tick_type,
+                    dropped_count: 0,
+                    cause,
+                },
+            },
+        };
+        self.publish(envelope);
+    }
+
+    /// Publish the Spot or Unified Futures subscription-terminated event for `url`.
+    pub(crate) fn publish_subscription_terminated(
+        &self,
+        now: crate::types::MonotonicInstant,
+        url: crate::types::WsUrl,
+        channel: crate::types::ChannelName,
+        pair: Option<crate::types::StreamSymbol>,
+        cause: crate::api::subscription::TerminationCause,
+        last_error: Option<String>,
+    ) {
+        let envelope = if url.is_unified() {
+            let (symbol, interval, tick_type) =
+                crate::types::StreamSymbol::futures_identity(pair.as_ref());
+            EventEnvelope {
+                event_type: EventType::FuturesSubscriptionTerminatedEvent,
+                event_version: 1,
+                timestamp_monotonic: now,
+                request_id: None,
+                payload: EventPayload::FuturesSubscriptionTerminatedEvent {
+                    channel,
+                    symbol,
+                    interval,
+                    tick_type,
+                    cause,
+                    last_error,
+                    terminated_at_monotonic: now,
+                },
+            }
+        } else {
+            EventEnvelope {
+                event_type: EventType::SubscriptionTerminatedEvent,
+                event_version: 2,
+                timestamp_monotonic: now,
+                request_id: None,
+                payload: EventPayload::SubscriptionTerminatedEvent {
+                    channel,
+                    pair: pair
+                        .as_ref()
+                        .and_then(crate::types::StreamSymbol::spot)
+                        .cloned(),
+                    cause,
+                    last_error,
+                    terminated_at_monotonic: now,
+                },
+            }
+        };
+        self.publish(envelope);
+    }
+
     /// Enqueue a decoded user-data callback. Same drop-oldest + warning as
     /// `publish`, so a `QueueFullWarning` means user data was gapped.
     pub(crate) fn publish_data(&self, delivery: DataDelivery, routing: DataRouting) {
@@ -364,20 +459,16 @@ impl DispatchEventBus {
         self.record_io_to_dispatch_drop();
     }
 
-    /// Cumulative drop-oldest evictions, incremented producer-side so it is
-    /// observable even while the dispatch loop is parked.
+    /// Cumulative drop-oldest evictions, counted producer-side.
     #[cfg(test)]
     pub(crate) fn dropped_count(&self) -> u64 {
         self.dropped_count.load(Ordering::Relaxed)
     }
 
-    /// Drop-accounting + debounced `QueueFullWarning` emit, shared by `publish`
-    /// and `publish_data`.
     fn record_io_to_dispatch_drop(&self) {
         let total = self.dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-        // Debounce: a drop storm's warning can itself drop — avoid recursive
-        // ring saturation.
+        // Debounced: a drop storm's warning can itself drop and saturate the ring.
         let now = self.clock.now();
         let should_emit = {
             let mut last = self
@@ -479,8 +570,7 @@ impl DispatchEventBus {
             }
         };
         if let Some((env, record)) = to_fire {
-            // Same accept/decline contract as deliver_correlated: a cancelled or
-            // panicking waiter must not drop the terminal on the floor.
+            // Same accept/decline contract as `deliver_correlated`.
             if !self.fire_correlated(&env, record) {
                 self.relatch_correlated(&env);
             }
@@ -488,7 +578,7 @@ impl DispatchEventBus {
         handle
     }
 
-    /// Remove a subscriber. Idempotent — calling twice with the same handle is fine.
+    /// Removes a subscriber; idempotent.
     pub fn unsubscribe(&self, handle: SubscriberHandle) {
         {
             let mut subs = self
@@ -504,8 +594,7 @@ impl DispatchEventBus {
                 .correlated
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            // Only live waiters are keyed by handle; the miss-buffer is
-            // pre-subscription, untouched by unsubscribe.
+            // Only live waiters are keyed by handle; the pre-subscription miss-buffer is untouched.
             for records in reg.live.values_mut() {
                 records.retain(|r| r.handle != handle);
             }
@@ -539,7 +628,6 @@ impl DispatchEventBus {
             .map_or(0, |v| v.len())
     }
 
-    /// Latched completions awaiting a late arm.
     #[cfg(test)]
     pub(crate) fn correlated_missed_count(&self) -> usize {
         self.correlated
@@ -549,7 +637,6 @@ impl DispatchEventBus {
             .len()
     }
 
-    /// Count of live correlated one-shot waiters across all keys.
     #[cfg(test)]
     pub(crate) fn correlated_live_count(&self) -> usize {
         self.correlated
@@ -575,9 +662,8 @@ impl DispatchEventBus {
         })
     }
 
-    /// Like `try_post_caller_inbound` but returns the rejected item on failure.
-    /// Also reports WHY: `Full` = back-pressure (maps to retryable
-    /// `queue_full()`), `Closed` = reactor receiver dropped (`not_open()`).
+    /// Like `try_post_caller_inbound`, returning the rejected item and why: `Full` is
+    /// back-pressure (retryable `queue_full()`), `Closed` a dropped receiver (`not_open()`).
     pub(crate) fn try_post_caller_inbound_recovering_kind(
         &self,
         item: CallerInbound,
@@ -588,7 +674,10 @@ impl DispatchEventBus {
         })
     }
 
-    /// Flush queued Drop teardowns into `caller_to_io`, leaving `reserve` free slots.
+    pub(crate) fn caller_inbound_room_beyond(&self, reserve: usize) -> bool {
+        self.caller_to_io_tx.capacity() > reserve
+    }
+
     pub(crate) fn flush_pending_teardowns_leaving(&self, reserve: usize) {
         if !self
             .has_pending_teardowns
@@ -596,7 +685,7 @@ impl DispatchEventBus {
         {
             return;
         }
-        if self.caller_to_io_tx.capacity() <= reserve {
+        if !self.caller_inbound_room_beyond(reserve) {
             return;
         }
         let drained: Vec<CallerInbound> = {
@@ -618,7 +707,7 @@ impl DispatchEventBus {
         };
         let mut iter = drained.into_iter();
         while let Some(item) = iter.next() {
-            if self.caller_to_io_tx.capacity() <= reserve {
+            if !self.caller_inbound_room_beyond(reserve) {
                 self.requeue_pending_teardowns(std::iter::once(item).chain(iter));
                 return;
             }
@@ -697,7 +786,6 @@ impl DispatchEventBus {
         }
     }
 
-    /// Take the `caller_to_io` receiver half; `None` if already taken.
     pub(crate) fn take_caller_to_io_rx(&self) -> Option<mpsc::Receiver<CallerInbound>> {
         self.caller_to_io_rx
             .lock()
@@ -714,11 +802,10 @@ impl DispatchEventBus {
             .is_none()
     }
 
-    /// Spawn the Dispatch Reactor task; it holds a `Weak` to break the bus↔task cycle.
+    /// Spawns the Dispatch Reactor task; it holds a `Weak` to break the bus-task cycle.
     pub(crate) fn start_dispatch_reactor(self: &Arc<Self>, runtime: &tokio::runtime::Handle) {
         {
-            // Spawn only from NotStarted so a lazy `on()` start and the `ready()`
-            // start can't double-spawn (leaking the first loop).
+            // Spawn only from NotStarted so lazy `on()` and `ready()` cannot double-spawn.
             let mut state = self
                 .dispatch_reactor_state
                 .lock()
@@ -764,8 +851,7 @@ impl DispatchEventBus {
         }
     }
 
-    /// Stop the dispatch reactor. (The I/O reactor's `JoinHandle` is owned +
-    /// aborted by `Client`, not the bus.)
+    /// Stops the dispatch reactor; the I/O reactor's handle is owned by `Client`.
     #[cfg(test)]
     pub(crate) fn stop_reactors(&self) {
         // Latch teardown + Stopped BEFORE aborting so the guard's drop does not
@@ -791,6 +877,33 @@ impl DispatchEventBus {
             .dispatch_reactor_state
             .lock()
             .expect("dispatch_reactor_state lock poisoned — fatal")
+    }
+
+    /// Keeps the last terminal cause per url so a refused request returns it.
+    pub(crate) fn record_connection_failure(
+        &self,
+        url: WsUrl,
+        class: Option<NonTransientClass>,
+        last_error: &str,
+    ) {
+        self.connection_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(url, (class, last_error.to_owned()));
+    }
+
+    /// The error a refused request returns for `url`: its last recorded terminal cause.
+    pub(crate) fn failed_connection_error(&self, url: WsUrl) -> crate::error::ConnectionError {
+        let failures = self
+            .connection_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match failures.get(&url) {
+            Some((class, last_error)) => {
+                crate::error::ConnectionError::connection_failed(*class, last_error)
+            }
+            None => crate::error::ConnectionError::not_open(),
+        }
     }
 
     /// Whether a reactor loop has died (terminal; never cleared — v1 does not
@@ -828,8 +941,7 @@ impl DispatchEventBus {
         use std::sync::atomic::Ordering;
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let shutting_down = self.shutting_down.load(Ordering::Acquire);
-            // A Stopped dispatch loop outside shutdown is an intended stop, not a
-            // death: nothing to fail and nothing to suppress.
+            // A Stopped dispatch loop outside shutdown is an intended stop.
             if !shutting_down
                 && loop_name == ReactorName::Dispatch
                 && self
@@ -862,17 +974,16 @@ impl DispatchEventBus {
                 self.resolve_live_correlated_on_death(loop_name, cause);
                 return;
             }
-            // Emit-once-per-incident: only the first death drains + emits.
             if self.loop_failed.swap(true, Ordering::AcqRel) {
                 return;
             }
-            if loop_name == ReactorName::Dispatch {
-                if let Ok(mut g) = self.dispatch_reactor_state.lock() {
-                    *g = ReactorState::Failed(cause);
-                }
+            if loop_name == ReactorName::Dispatch
+                && let Ok(mut g) = self.dispatch_reactor_state.lock()
+            {
+                *g = ReactorState::Failed(cause);
             }
             self.resolve_live_correlated_on_death(loop_name, cause);
-            // Best-effort broadcast (undelivered if the dispatch loop is the dead one).
+            // Best-effort: undelivered if the dispatch loop is the dead one.
             if self
                 .io_to_dispatch
                 .push(DispatchItem::Event(Self::loop_failed_env(
@@ -887,7 +998,6 @@ impl DispatchEventBus {
         }));
     }
 
-    /// `LoopFailedEvent` envelope for one death incident.
     fn loop_failed_env(
         loop_name: ReactorName,
         cause: LoopFailureCause,
@@ -907,8 +1017,7 @@ impl DispatchEventBus {
         }
     }
 
-    /// Drain live correlated waiters with a per-key death envelope.
-    /// Leaves the miss-buffer alone — callers own that policy.
+    /// Drains live correlated waiters with a per-key death envelope; the miss-buffer is left to callers.
     fn resolve_live_correlated_on_death(&self, loop_name: ReactorName, cause: LoopFailureCause) {
         let now = self.clock.now();
         let by_key: Vec<((EventType, u64), Vec<SubscriberRecord>)> = match self.correlated.lock() {
@@ -971,15 +1080,12 @@ impl DispatchEventBus {
             match reg.live.remove(&(event.event_type, key)) {
                 Some(records) => records,
                 None => {
-                    // No waiter yet — latch so a late subscribe_correlated still
-                    // resolves (publish-before-subscribe race).
+                    // No waiter yet: latch so a late subscribe still resolves.
                     reg.latch_missed((event.event_type, key), event.clone());
                     Vec::new()
                 }
             }
         };
-        // Every waiter on the key resolves — one operation may be observed by the
-        // completion await AND by a handle observer, and neither may be stranded.
         let had_waiters = !one_shot.is_empty();
         let mut accepted = false;
         for record in one_shot {
@@ -1074,10 +1180,10 @@ impl DispatchEventBus {
 
 impl Drop for DispatchEventBus {
     fn drop(&mut self) {
-        if let Ok(mut g) = self.dispatch_reactor_join.lock() {
-            if let Some(join) = g.take() {
-                join.abort();
-            }
+        if let Ok(mut g) = self.dispatch_reactor_join.lock()
+            && let Some(join) = g.take()
+        {
+            join.abort();
         }
     }
 }
@@ -1099,7 +1205,6 @@ impl LoopDeathGuard {
         }
     }
 
-    /// Mark a clean exit — `drop` becomes a no-op.
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
@@ -1155,7 +1260,6 @@ pub(crate) fn truncate_panic_message(panic: &(dyn std::any::Any + Send)) -> Stri
     s
 }
 
-/// Push a `CallbackLatency` envelope; account a drop on ring overflow.
 fn emit_callback_latency(
     bus: &DispatchEventBus,
     source: CallbackSource,
@@ -1223,7 +1327,7 @@ fn emit_handler_panic_warning(
 }
 
 async fn dispatch_reactor_loop(weak_bus: Weak<DispatchEventBus>) {
-    // Take a strong Arc on the ring at startup; ring lives independent of bus.
+    // Take a strong Arc on the ring at startup; the ring outlives the bus.
     let ring = match weak_bus.upgrade() {
         Some(bus) => Arc::clone(&bus.io_to_dispatch),
         None => return,
@@ -1239,7 +1343,6 @@ async fn dispatch_reactor_loop(weak_bus: Weak<DispatchEventBus>) {
     let mut dequeues_since_sample: u32 = 0;
     let mut last_sample = std::time::Instant::now();
 
-    // Fails in-flight correlated awaits on abnormal exit; disarmed on clean exit.
     let mut death_guard = LoopDeathGuard::new(weak_bus.clone(), ReactorName::Dispatch);
 
     loop {
@@ -1352,7 +1455,6 @@ async fn dispatch_reactor_loop(weak_bus: Weak<DispatchEventBus>) {
                                 elapsed_us,
                             );
                         }
-                        // Threshold read FRESH from Knobs (runtime-mutable).
                         let threshold_ms = bus
                             .knobs
                             .slow_callback_threshold_ms
@@ -1412,11 +1514,10 @@ fn dispatch_data_delivery(
     routing: DataRouting,
 ) {
     let DataDelivery { invoke, payload } = delivery;
+    let callback_source = CallbackSource::for_data_channel(routing.url, routing.channel);
     let started = std::time::Instant::now();
-    // End the span just before invoke (counts only the loop's own work).
     #[cfg(test)]
     crate::dispatch::io_reactor::latency_histogram::dispatch_probe_end_before_invoke();
-    // A panicking user data callback must not unwind the dispatch task.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invoke(&payload)));
     match result {
         Ok(()) => {
@@ -1424,25 +1525,14 @@ fn dispatch_data_delivery(
             // Gate on ≥1 CallbackLatency subscriber — else every decoded frame
             // pushes a second ring item, doubling traffic when unobserved.
             if bus.subscriber_count(EventType::CallbackLatency) > 0 {
-                emit_callback_latency(
-                    bus,
-                    CallbackSource::DataChannel(routing.channel),
-                    routing.handler_id,
-                    elapsed_us,
-                );
+                emit_callback_latency(bus, callback_source, routing.handler_id, elapsed_us);
             }
-            // Threshold read FRESH so `set_knob` is honoured.
             let threshold_ms = bus
                 .knobs
                 .slow_callback_threshold_ms
                 .load(std::sync::atomic::Ordering::Relaxed);
             if elapsed_us >= u64::from(threshold_ms) * 1_000 {
-                emit_slow_callback_warning(
-                    bus,
-                    CallbackSource::DataChannel(routing.channel),
-                    elapsed_us,
-                    threshold_ms,
-                );
+                emit_slow_callback_warning(bus, callback_source, elapsed_us, threshold_ms);
                 tracing::warn!(
                     target: "kraken_sdk::dispatch_reactor",
                     channel = ?routing.channel,
@@ -1461,7 +1551,7 @@ fn dispatch_data_delivery(
             );
             emit_handler_panic_warning(
                 bus,
-                CallbackSource::DataChannel(routing.channel),
+                callback_source,
                 routing.handler_id,
                 truncate_panic_message(&*panic),
             );

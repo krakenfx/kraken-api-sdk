@@ -1,15 +1,28 @@
-//! Subscription auxiliary read-models and [`SubscriptionError`], the error enum
-//! returned by [`SubscriptionNamespace`](crate::api::SubscriptionNamespace)
-//! subscribe/unsubscribe methods.
+//! Subscription auxiliary read-models and [`SubscriptionError`] returned by
+//! Spot and Futures subscription-lifecycle methods.
 
 use std::collections::HashMap;
 
 use crate::types::{ChannelName, Symbol};
 
-/// Errors from `SubscriptionNamespace` subscribe and unsubscribe operations.
+/// Errors from `on_*` handler registration and `SubscriptionNamespace` subscribe and
+/// unsubscribe operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SubscriptionError {
+    /// The request is malformed or unsupported (for example, no symbols given or an
+    /// incompatible Unified book depth/snapshot).
+    #[error("Invalid arguments: {detail}.")]
+    InvalidArguments {
+        /// User-actionable validation detail.
+        detail: String,
+    },
+    /// A Futures subscription symbol is outside the native Futures wire format.
+    #[error("Unsupported Futures symbol: {symbol}.")]
+    UnsupportedFuturesSymbol {
+        /// The rejected caller-supplied symbol, preserved verbatim.
+        symbol: String,
+    },
     /// `subscribe_<channel>(...)` rejects when no handler is registered for
     /// `channel` at call time. Register a handler before subscribing.
     #[error("No handler registered for the {channel} channel; register one before subscribing.")]
@@ -17,8 +30,8 @@ pub enum SubscriptionError {
         /// Channel the rejected subscribe targeted.
         channel: ChannelName,
     },
-    /// The internal operation queue was full; the subscribe request was rejected.
-    /// The caller may retry; the subscription registry was not mutated.
+    /// The internal operation queue was full; the `on_*` registration or subscribe request
+    /// was not posted. The caller may retry; nothing was registered or mutated.
     #[error("The operation queue is full; the subscribe request was rejected.")]
     QueueFull,
     /// The client has been closed and no longer accepts new operations.
@@ -49,7 +62,9 @@ impl crate::error::ApiError for SubscriptionError {
     fn code(&self) -> &str {
         use SubscriptionError::*;
         match self {
-            NoHandlerRegistered { .. } => "INVALID_ARGUMENTS",
+            InvalidArguments { .. }
+            | UnsupportedFuturesSymbol { .. }
+            | NoHandlerRegistered { .. } => "INVALID_ARGUMENTS",
             QueueFull => "QUEUE_FULL",
             ClientClosed => "CLIENT_CLOSED",
             LoopDead => "LOOP_DEAD",
@@ -61,7 +76,9 @@ impl crate::error::ApiError for SubscriptionError {
         use crate::error::ErrorCategory;
         use SubscriptionError::*;
         match self {
-            NoHandlerRegistered { .. }
+            InvalidArguments { .. }
+            | UnsupportedFuturesSymbol { .. }
+            | NoHandlerRegistered { .. }
             | QueueFull
             | ClientClosed
             | LoopDead
@@ -153,6 +170,45 @@ pub struct SubscriptionsSummary {
     pub failed: u32,
     /// Per-channel count (sum across states).
     pub by_channel: HashMap<ChannelName, u32>,
+}
+
+/// Public read-model returned by
+/// [`FuturesSubscriptionNamespace::list_active`](crate::FuturesSubscriptionNamespace::list_active).
+/// `symbol` is `None` for channel-wide Futures subscriptions such as `instrument`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FuturesSubscriptionInfo {
+    /// Logical Futures channel this subscription is registered on.
+    pub channel: ChannelName,
+    /// Native Futures wire symbol, or `None` for a channel-wide subscription.
+    pub symbol: Option<String>,
+    /// OHLC candle interval; `None` for every other channel.
+    pub interval: Option<crate::types::OhlcInterval>,
+    /// OHLC candle tick type; `None` for every other channel.
+    pub tick_type: Option<crate::types::FuturesOhlcTickType>,
+    /// Current lifecycle state of the entry.
+    pub state: SubscriptionState,
+    /// Monotonic acknowledgement time. `None` until the venue acks the entry, on either Unified connection.
+    pub subscribed_at: Option<crate::types::MonotonicInstant>,
+}
+
+/// Lightweight read-only view returned by
+/// [`FuturesSubscriptionNamespace::find_by_channel`](crate::FuturesSubscriptionNamespace::find_by_channel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FuturesSubscriptionRef {
+    /// Logical Futures channel this subscription is registered on.
+    pub channel: ChannelName,
+    /// Native Futures wire symbol, or `None` for a channel-wide subscription.
+    pub symbol: Option<String>,
+    /// OHLC candle interval; `None` for every other channel.
+    pub interval: Option<crate::types::OhlcInterval>,
+    /// OHLC candle tick type; `None` for every other channel.
+    pub tick_type: Option<crate::types::FuturesOhlcTickType>,
+    /// Current lifecycle state of the entry.
+    pub state: SubscriptionState,
+    /// Monotonic timestamp in milliseconds.
+    pub registered_at_monotonic: u64,
 }
 
 #[cfg(test)]

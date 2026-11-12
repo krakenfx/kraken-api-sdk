@@ -7,7 +7,6 @@ use crate::transport::TransportErrorKind;
 use serde::Serialize;
 use serde_with::skip_serializing_none;
 
-/// Or-join the op's legal transports into the `UnsupportedTransport` remedy.
 fn remedy(legal: &[Transport]) -> String {
     legal
         .iter()
@@ -17,7 +16,7 @@ fn remedy(legal: &[Transport]) -> String {
 }
 
 /// Errors returned by trade-namespace operations.
-// `Eq` not derived — `Transport { kind }` carries non-Eq context in some kinds.
+// `Eq` is not derived: `Transport { kind }` carries non-Eq context in some kinds.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TradeError {
@@ -27,7 +26,8 @@ pub enum TradeError {
         /// Per-dispatch correlation id; stamped once at dispatch, first stamp wins.
         request_id: Option<String>,
     },
-    /// Exchange rejected the order: free margin cannot cover it (`EOrder:Insufficient margin`).
+    /// Exchange rejected the order: free margin cannot cover it (Spot `EOrder:Insufficient margin`,
+    /// Futures `Other:INSUFFICIENT_MARGIN`).
     #[error("Insufficient margin.")]
     InsufficientMargin {
         /// Per-dispatch correlation id; stamped once at dispatch, first stamp wins.
@@ -61,8 +61,9 @@ pub enum TradeError {
         /// Per-dispatch correlation id; stamped once at dispatch, first stamp wins.
         request_id: Option<String>,
     },
-    /// Amend targeted a `cl_ord_id` matching no open order. Non-retryable.
-    #[error("Order not found; no open order matches the cl_ord_id.")]
+    /// An amend or cancel targeted a `cl_ord_id` (on Futures, or an `order_id`) matching no
+    /// open order (on Futures, also a filled or already-cancelled one). Non-retryable.
+    #[error("Order not found; no open order matches the given cl_ord_id or order_id.")]
     UnknownOrder {
         /// Per-dispatch correlation id; stamped once at dispatch, first stamp wins.
         request_id: Option<String>,
@@ -91,7 +92,8 @@ pub enum TradeError {
     /// Rate limited — Kraken `Rate limit` / `Throttled` / `Too many requests` strings or the SDK's own pre-send limiter; back off, then retry.
     #[error("Rate limited.")]
     RateLimited {
-        /// Unix seconds to retry after, parsed from `EService:Throttled: <ts>`; `None` when no throttle timestamp is available.
+        /// Unix seconds to retry after: parsed from `EService:Throttled: <ts>`, or local wall clock plus a Futures
+        /// reply's `retry_after_ms`, the sum rounded up to whole seconds; `None` when neither is available.
         retry_after_ts: Option<u64>,
         /// Per-dispatch correlation id; stamped once at dispatch, first stamp wins.
         request_id: Option<String>,
@@ -147,7 +149,7 @@ pub enum TradeError {
     /// An explicit `.via(...)` selected a [`Transport`] with no dispatch entry
     /// for this op. Never sent; the message names only legal transports.
     #[error(
-        "Transport {transport:?} cannot serve this spot order operation; use {}.",
+        "Transport {transport:?} cannot serve this order operation; use {}.",
         remedy(.legal)
     )]
     UnsupportedTransport {
@@ -163,10 +165,45 @@ pub enum TradeError {
          use `.via(Transport::Rest)` for order operations."
     )]
     WsSurfaceUnavailable,
-    /// The caller→I/O queue was full at post time; the order was NOT sent.
-    /// The SDK never auto-retries an order.
+    /// The WebSocket session token was rejected by the venue, or was missing or expired at compose time (then not sent).
+    /// A refresh starts while the connection is live; after `AuthenticationFailedEvent` or `RetryCapExhausted` the client must be rebuilt.
+    /// Retryable; the SDK never resends an order.
+    #[error(
+        "The session token was rejected and the request was not accepted; retry once the token is refreshed."
+    )]
+    SessionExpired {
+        /// Per-dispatch correlation id; stamped once at dispatch, first stamp wins.
+        request_id: Option<String>,
+    },
+    /// The caller→I/O queue was full at post time; the order was NOT sent. The SDK never
+    /// auto-retries an order.
     #[error("Order send queue is full; back off and retry.")]
     QueueFull {
+        /// Per-dispatch correlation id; stamped once at dispatch, first stamp wins.
+        request_id: Option<String>,
+    },
+    /// The Futures placement limit (`futures_max_in_flight`) was reached; the order was NOT
+    /// sent. Retryable once a pending placement is answered, its deadline passes, or its await is
+    /// dropped (the venue may still hold a dropped order).
+    #[error(
+        "Futures in-flight placement limit reached; the order was not sent. Wait for a reply or raise futures_max_in_flight."
+    )]
+    InFlightLimitReached {
+        /// Per-dispatch correlation id; stamped once at dispatch, first stamp wins.
+        request_id: Option<String>,
+    },
+    /// The API key lacks a required permission (`Permission denied`). Non-retryable.
+    #[error("Permission denied.")]
+    PermissionDenied {
+        /// Per-dispatch correlation id; stamped once at dispatch, first stamp wins.
+        request_id: Option<String>,
+    },
+    /// The private WebSocket connection could not authenticate; nothing was sent.
+    /// Non-retryable: rebuild the client with a working key.
+    #[error("Authentication failed: {kraken_message}")]
+    AuthenticationFailed {
+        /// Why authentication failed.
+        kraken_message: String,
         /// Per-dispatch correlation id; stamped once at dispatch, first stamp wins.
         request_id: Option<String>,
     },
@@ -184,14 +221,37 @@ pub enum TradeError {
 
 crate::error::impl_error_common!(TradeError);
 
+impl TradeError {
+    pub(crate) fn invalid_order(detail: impl Into<String>) -> Self {
+        Self::InvalidOrder {
+            detail: detail.into(),
+            request_id: None,
+        }
+    }
+
+    pub(crate) fn check_batch_size(
+        len: usize,
+        range: std::ops::RangeInclusive<usize>,
+    ) -> Result<(), Self> {
+        if range.contains(&len) {
+            Ok(())
+        } else {
+            Err(Self::BatchSizeOutOfRange {
+                min: *range.start() as u32,
+                max: *range.end() as u32,
+            })
+        }
+    }
+}
+
 crate::error::impl_with_request_id!(
     TradeError: InsufficientFunds, InsufficientMargin, NoAmendableParameters,
     UnknownOrder, InvalidOrder, RateLimited, Transport, MalformedResponse,
-    QueueFull, Unknown
+    QueueFull, InFlightLimitReached, SessionExpired, PermissionDenied, AuthenticationFailed,
+    Unknown
 );
 
-/// Classify a `RestError` into a namespace variant. Baseline only —
-/// context variants are built by callers holding request context.
+/// Baseline classification; context variants are built by callers holding request context.
 impl From<RestError> for TradeError {
     fn from(e: RestError) -> Self {
         match e {
@@ -218,14 +278,15 @@ impl From<RestError> for TradeError {
     }
 }
 
-/// Classify a single Kraken error string into the baseline `TradeError` family
-/// shared by the REST and WS paths.
+/// Classify one Kraken error string into the baseline family shared by the REST and WS paths.
 pub(crate) fn classify_kraken_error_string(msg: String) -> TradeError {
     if crate::error::is_kraken_rate_limit(&msg) {
         TradeError::RateLimited {
             retry_after_ts: crate::error::parse_throttle_until(&msg),
             request_id: None,
         }
+    } else if msg.contains("Permission denied") {
+        TradeError::PermissionDenied { request_id: None }
     } else if msg.contains("Insufficient funds") {
         TradeError::InsufficientFunds { request_id: None }
     } else if msg.contains("Insufficient") && msg.contains("margin") {
@@ -238,24 +299,66 @@ pub(crate) fn classify_kraken_error_string(msg: String) -> TradeError {
         TradeError::UnknownOrder { request_id: None }
     } else if msg.contains("EOrder")
         || msg.contains("Invalid arguments")
-        // Validate-mode price rejections arrive bare (non-E-prefixed);
-        // price-anchored so "Symbol(s) not found" stays out.
+        // Bare validate-mode price rejections; price-anchored so "Symbol(s) not found" stays out.
         || msg.contains("price(s) not found")
         || msg.contains("Price(s) not found")
-        // REST >24h cancel_all_orders_after deadline phrasing.
+        // REST phrasing for a cancel_all_orders_after timeout above 24h.
         || msg.contains("Invalid timeout argument")
     {
-        // Trim trailing period so `{detail}.` renders exactly one.
-        TradeError::InvalidOrder {
-            detail: msg.trim_end_matches('.').to_string(),
-            request_id: None,
-        }
+        // Trim the trailing period so `{detail}.` renders exactly one.
+        TradeError::invalid_order(msg.trim_end_matches('.'))
     } else {
         TradeError::Unknown {
             kraken_code: crate::error::kraken_eclass_code(&msg),
             kraken_message: msg,
             request_id: None,
         }
+    }
+}
+
+/// Classify a Unified (Futures) WS error string. The venue words rejects as
+/// `Other:<CODE>` or bare parameter messages rather than `EOrder:` strings, so
+/// those map here; everything else falls through to [`classify_kraken_error_string`].
+pub(crate) fn classify_futures_ws_error(msg: String) -> TradeError {
+    const INVALID_ORDER: &[&str] = &[
+        "CLIENT_ORDER_ID_IN_USE",
+        "CANNOT_EDIT_TRIGGER_PRICE_OF_TRAILING_STOP",
+        "ORDER_CANNOT_HAVE_TRIGGER_PRICE",
+        "CANNOT_EDIT_LIMIT_PRICE_OF_TRAILING_STOP",
+        "PRICE_COLLAR",
+        "SMALL_ORDER_LIMIT_EXCEEDED",
+        "TRAILING_STOP_PERCENT_DEVIATION_EXCEEDS_MAX_DECIMAL_PLACES",
+        "TRAILING_STOP_QUOTE_DEVIATION_NOT_MULTIPLE_OF_TICK_SIZE",
+        "TRAILING_STOP_MAX_DEVIATION_TOO_LARGE",
+        "TRAILING_STOP_MAX_DEVIATION_TOO_SMALL",
+        "CLIENT_ORDER_ID_TOO_LONG",
+        "CLIENT_ORDER_ID_INVALID",
+        "VIOLATES_REDUCE_ONLY",
+        "POST_WOULD_EXECUTE",
+        "IOC_WOULD_ENTER_BOOK",
+        "Missing arguments",
+        "Missing or invalid 'params.",
+        "' must be ",
+        "Unknown 'params",
+        "Invalid 'params.",
+        "Bad request",
+        "Unknown asset",
+        "only supported for spot orders",
+    ];
+    if crate::error::is_token_stale_reject(crate::types::WsUrl::UnifiedPrivate, &msg) {
+        TradeError::SessionExpired { request_id: None }
+    } else if msg.contains("ORDER_FOR_EDIT_NOT_FOUND")
+        || msg.contains("ORDER_FOR_CANCELLATION_NOT_FOUND")
+    {
+        TradeError::UnknownOrder { request_id: None }
+    } else if msg.contains("EDIT_HAS_NO_EFFECT") {
+        TradeError::NoAmendableParameters { request_id: None }
+    } else if msg.contains("INSUFFICIENT_MARGIN") || msg.contains("INSUFFICIENT_CLOSING_MARGIN") {
+        TradeError::InsufficientMargin { request_id: None }
+    } else if INVALID_ORDER.iter().any(|needle| msg.contains(needle)) {
+        TradeError::invalid_order(msg.trim_end_matches('.'))
+    } else {
+        classify_kraken_error_string(msg)
     }
 }
 
@@ -340,6 +443,10 @@ impl crate::error::ApiError for TradeError {
             SystemStatusBlocked { .. } => "SYSTEM_STATUS_MAINTENANCE",
             RateLimited { .. } => "RATE_LIMIT_EXCEEDED",
             QueueFull { .. } => "QUEUE_FULL",
+            InFlightLimitReached { .. } => "IN_FLIGHT_LIMIT_REACHED",
+            SessionExpired { .. } => "SESSION_EXPIRED",
+            PermissionDenied { .. } => "PERMISSION_DENIED",
+            AuthenticationFailed { .. } => "AUTHENTICATION_FAILED",
             Transport { .. } => "CONNECTION_ERROR",
             MalformedResponse { .. } => "MALFORMED_RESPONSE",
             ClientClosed => "CLIENT_CLOSED",
@@ -367,18 +474,25 @@ impl crate::error::ApiError for TradeError {
             | ClientClosed
             | LoopDead
             | QueueFull { .. }
+            | InFlightLimitReached { .. }
             | WsUnsupportedOrderField { .. }
             | RestUnsupportedOrderField { .. }
             | UnsupportedTransport { .. }
             | WsSurfaceUnavailable => ErrorCategory::Client,
             RateLimited { .. } => ErrorCategory::RateLimit,
+            SessionExpired { .. } | PermissionDenied { .. } | AuthenticationFailed { .. } => {
+                ErrorCategory::Auth
+            }
             Transport { .. } => ErrorCategory::Network,
         }
     }
     fn retryable(&self) -> bool {
         use TradeError::*;
         match self {
-            RateLimited { .. } | QueueFull { .. } => true,
+            RateLimited { .. }
+            | QueueFull { .. }
+            | InFlightLimitReached { .. }
+            | SessionExpired { .. } => true,
             // Never retry a sent-ambiguous drop (duplicate-fill risk).
             Transport {
                 kind, transient, ..
@@ -398,6 +512,10 @@ impl crate::error::ApiError for TradeError {
             | Transport { request_id, .. }
             | MalformedResponse { request_id, .. }
             | QueueFull { request_id }
+            | InFlightLimitReached { request_id }
+            | SessionExpired { request_id }
+            | PermissionDenied { request_id }
+            | AuthenticationFailed { request_id, .. }
             | Unknown { request_id, .. } => request_id.as_deref(),
             ConflictingOrderIdentifiers
             | SettlePositionRequiresLeverage
@@ -425,7 +543,6 @@ mod tests {
         use crate::error::ApiError;
         let e = TradeError::malformed("bad body".into()).with_request_id("rid-1");
         assert_eq!(e.request_id(), Some("rid-1"));
-        // First stamp wins; later stamps are no-ops.
         let e = e.with_request_id("rid-2");
         assert_eq!(e.request_id(), Some("rid-1"));
         let e = TradeError::EmptyAmendRequest.with_request_id("rid-3");
@@ -448,8 +565,230 @@ mod tests {
     }
 
     #[test]
+    fn futures_ws_rejects_classify_by_the_venue_vocabulary() {
+        use crate::error::ApiError;
+        // (venue string, code, retryable)
+        let cases = [
+            ("Other:ORDER_FOR_EDIT_NOT_FOUND", "ORDER_NOT_FOUND", false),
+            (
+                "Other:ORDER_FOR_CANCELLATION_NOT_FOUND",
+                "ORDER_NOT_FOUND",
+                false,
+            ),
+            ("Other:EDIT_HAS_NO_EFFECT", "NON_AMENDABLE_FIELD", false),
+            ("Other:INSUFFICIENT_MARGIN", "INSUFFICIENT_MARGIN", false),
+            ("Rate limit exceeded", "RATE_LIMIT_EXCEEDED", true),
+            ("Other:CLIENT_ORDER_ID_IN_USE", "INVALID_ORDER", false),
+            (
+                "EGeneral:Other:CLIENT_ORDER_ID_IN_USE",
+                "INVALID_ORDER",
+                false,
+            ),
+            ("Other:VIOLATES_REDUCE_ONLY", "INVALID_ORDER", false),
+            (
+                "Other:CANNOT_EDIT_TRIGGER_PRICE_OF_TRAILING_STOP",
+                "INVALID_ORDER",
+                false,
+            ),
+            (
+                "Other:ORDER_CANNOT_HAVE_TRIGGER_PRICE",
+                "INVALID_ORDER",
+                false,
+            ),
+            (
+                "Other:CANNOT_EDIT_LIMIT_PRICE_OF_TRAILING_STOP",
+                "INVALID_ORDER",
+                false,
+            ),
+            ("Other:PRICE_COLLAR", "INVALID_ORDER", false),
+            ("Other:SMALL_ORDER_LIMIT_EXCEEDED", "INVALID_ORDER", false),
+            (
+                "Other:TRAILING_STOP_PERCENT_DEVIATION_EXCEEDS_MAX_DECIMAL_PLACES",
+                "INVALID_ORDER",
+                false,
+            ),
+            (
+                "Other:TRAILING_STOP_QUOTE_DEVIATION_NOT_MULTIPLE_OF_TICK_SIZE",
+                "INVALID_ORDER",
+                false,
+            ),
+            (
+                "Other:TRAILING_STOP_MAX_DEVIATION_TOO_LARGE",
+                "INVALID_ORDER",
+                false,
+            ),
+            (
+                "Other:TRAILING_STOP_MAX_DEVIATION_TOO_SMALL",
+                "INVALID_ORDER",
+                false,
+            ),
+            ("Other:CLIENT_ORDER_ID_TOO_LONG", "INVALID_ORDER", false),
+            ("Other:CLIENT_ORDER_ID_INVALID", "INVALID_ORDER", false),
+            (
+                "Other:INSUFFICIENT_CLOSING_MARGIN",
+                "INSUFFICIENT_MARGIN",
+                false,
+            ),
+            ("Other:POST_WOULD_EXECUTE", "INVALID_ORDER", false),
+            ("Other:IOC_WOULD_ENTER_BOOK", "INVALID_ORDER", false),
+            ("EGeneral:Invalid arguments:price", "INVALID_ORDER", false),
+            ("Invalid arguments:volume", "INVALID_ORDER", false),
+            ("Invalid arguments:cl_ord_id", "INVALID_ORDER", false),
+            ("Missing arguments:no arguments", "INVALID_ORDER", false),
+            ("Missing or invalid 'params.symbol'", "INVALID_ORDER", false),
+            (
+                "'params.timeout' must be between 0 and 86400 seconds",
+                "INVALID_ORDER",
+                false,
+            ),
+            ("Unknown 'params' key: leverage", "INVALID_ORDER", false),
+            (
+                "Unknown 'params.orders' key: symbol",
+                "INVALID_ORDER",
+                false,
+            ),
+            ("Invalid 'params.order_type'", "INVALID_ORDER", false),
+            (
+                "Bad request:`fee_preference` not supported for Futures",
+                "INVALID_ORDER",
+                false,
+            ),
+            (
+                "'params.display_qty' is only supported for spot orders",
+                "INVALID_ORDER",
+                false,
+            ),
+            ("Unknown asset", "INVALID_ORDER", false),
+            ("Unknown asset pair", "INVALID_ORDER", false),
+            ("Invalid session", "SESSION_EXPIRED", true),
+            ("ESession:Invalid session token", "SESSION_EXPIRED", true),
+            ("Missing or invalid 'params.token'", "SESSION_EXPIRED", true),
+            ("Token(s) not found", "SESSION_EXPIRED", true),
+            ("Token field must be a string", "SESSION_EXPIRED", true),
+        ];
+        for (msg, code, retryable) in cases {
+            let e = classify_futures_ws_error(msg.to_string());
+            assert_eq!((e.code(), e.retryable()), (code, retryable), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_unified_throttle_reply_sets_retry_after_ts_from_retry_after_ms() {
+        use super::super::ws_compose::classify_ws_failure;
+        use crate::conn::managed_connection::WsResponse;
+        use crate::types::WsUrl;
+        // (url, wire retry_after_ms, decoded wait in ms)
+        let cases = [
+            (
+                WsUrl::UnifiedPrivate,
+                Some(serde_json::json!(588)),
+                Some(588),
+            ),
+            (
+                WsUrl::UnifiedPrivate,
+                Some(serde_json::json!(1000)),
+                Some(1000),
+            ),
+            (
+                WsUrl::UnifiedPrivate,
+                Some(serde_json::json!(1001)),
+                Some(1001),
+            ),
+            (WsUrl::UnifiedPrivate, Some(serde_json::json!(0)), Some(0)),
+            (WsUrl::UnifiedPrivate, None, None),
+            (WsUrl::UnifiedPrivate, Some(serde_json::json!("588")), None),
+            (WsUrl::UnifiedPrivate, Some(serde_json::json!(-588)), None),
+            (WsUrl::UnifiedPrivate, Some(serde_json::json!(588.5)), None),
+            (WsUrl::Auth, Some(serde_json::json!(588)), None),
+        ];
+        for (url, retry_after_ms, wait_ms) in cases {
+            let mut frame = serde_json::json!({
+                "error": "Rate limit exceeded", "method": "add_order", "req_id": 7, "success": false,
+            });
+            if let Some(ms) = &retry_after_ms {
+                frame["retry_after_ms"] = ms.clone();
+            }
+            let resp = WsResponse::from_frame(7, false, &frame);
+            let before = crate::rest::surface::unix_now_ms().expect("clock after epoch");
+            let e = classify_ws_failure(url, resp.error, resp.retry_after_ms);
+            let after = crate::rest::surface::unix_now_ms().expect("clock after epoch");
+            let TradeError::RateLimited { retry_after_ts, .. } = e else {
+                panic!("{url:?} {retry_after_ms:?}: not RateLimited: {e:?}");
+            };
+            match wait_ms {
+                Some(ms) => {
+                    let ts = retry_after_ts.unwrap_or_else(|| panic!("{url:?} {retry_after_ms:?}"));
+                    assert!(
+                        ts * 1000 >= before + ms && ts <= (after + ms).div_ceil(1000),
+                        "{url:?} {retry_after_ms:?}: {ts} not in [{}ms, {}s]",
+                        before + ms,
+                        (after + ms).div_ceil(1000)
+                    );
+                }
+                None => assert_eq!(retry_after_ts, None, "{url:?} {retry_after_ms:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn retry_after_ts_rounds_the_retry_instant_up_to_whole_seconds() {
+        use super::super::ws_compose::retry_after_ts_at;
+        // (now_ms, retry_after_ms, retry_after_ts)
+        let cases = [
+            (1_500, 588, 3),
+            (1_412, 588, 2),
+            (1_000, 0, 1),
+            (1_001, 0, 2),
+            (1_999, 1_002, 4),
+            (u64::MAX - 10, 588, u64::MAX.div_ceil(1000)),
+        ];
+        for (now_ms, retry_after_ms, ts) in cases {
+            assert_eq!(
+                retry_after_ts_at(now_ms, retry_after_ms),
+                ts,
+                "now_ms={now_ms} retry_after_ms={retry_after_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_session_token_is_session_expired_on_both_ws_products() {
+        use super::super::ws_compose::classify_ws_failure;
+        use crate::error::{ApiError, ErrorCategory};
+        use crate::types::WsUrl;
+        // (url, venue string, session expired)
+        let cases = [
+            (WsUrl::Auth, "EAPI:Invalid token", true),
+            (WsUrl::Auth, "ESession:Invalid session", true),
+            (WsUrl::UnifiedPrivate, "Invalid session", true),
+            (WsUrl::UnifiedPrivate, "Token(s) not found", true),
+            (WsUrl::Auth, "EAPI:Invalid key", false),
+            (WsUrl::Auth, "EOrder:Insufficient funds", false),
+            (
+                WsUrl::UnifiedPrivate,
+                "Unknown 'params' key: leverage",
+                false,
+            ),
+        ];
+        for (url, msg, expired) in cases {
+            let e = classify_ws_failure(url, Some(msg.to_string()), None);
+            assert_eq!(
+                matches!(e, TradeError::SessionExpired { .. }),
+                expired,
+                "{url:?} {msg}"
+            );
+            if expired {
+                assert_eq!(
+                    (e.code(), e.category(), e.retryable()),
+                    ("SESSION_EXPIRED", ErrorCategory::Auth, true),
+                    "{url:?} {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn validate_mode_price_rejections_classify_as_invalid_order() {
-        // Bare validate-mode price rejections must not fall through to Unknown.
         for msg in [
             "Limit_price(s) not found",
             "Stop_price(s) not found",
@@ -468,7 +807,6 @@ mod tests {
             classify_kraken_error_string("EGeneral:Invalid timeout argument:above max".to_string()),
             TradeError::InvalidOrder { .. }
         ));
-        // Symbol(s) not found stays out of the price family.
         assert!(matches!(
             classify_kraken_error_string("Symbol(s) not found".to_string()),
             TradeError::Unknown { .. }
@@ -533,6 +871,20 @@ mod tests {
         assert_eq!(e.code(), "NON_AMENDABLE_FIELD");
         assert_eq!(e.category(), crate::error::ErrorCategory::Client);
         assert!(!e.retryable());
+        let cap = TradeError::InFlightLimitReached { request_id: None };
+        assert_eq!(cap.code(), "IN_FLIGHT_LIMIT_REACHED");
+        assert_eq!(cap.category(), crate::error::ErrorCategory::Client);
+        assert!(cap.retryable());
+        assert_ne!(
+            cap.code(),
+            TradeError::QueueFull { request_id: None }.code(),
+            "the cap refusal is not the SDK queue being full"
+        );
+        assert_eq!(
+            cap.clone().with_request_id("7").request_id(),
+            Some("7"),
+            "the cap refusal carries its dispatch correlation id"
+        );
         let u = classify_kraken_error_string("EOrder:Unknown order".to_string());
         assert!(matches!(u, TradeError::UnknownOrder { .. }));
         assert_eq!(u.code(), "ORDER_NOT_FOUND");
@@ -544,7 +896,6 @@ mod tests {
             ),
             TradeError::InvalidOrder { .. }
         ));
-        // "Unknown order action." is InvalidOrder, not UnknownOrder.
         assert!(matches!(
             classify_kraken_error_string("EOrder:Unknown order action.".to_string()),
             TradeError::InvalidOrder { .. }
@@ -572,7 +923,6 @@ mod tests {
 
     #[test]
     fn eorder_invalid_order_pins_as_client_invalid_order() {
-        // EOrder:Invalid order covers both gone and garbage ids.
         use crate::error::ApiError;
         use crate::error::ErrorCategory;
 
@@ -588,6 +938,101 @@ mod tests {
         assert_eq!(ws.code(), "INVALID_ORDER");
         assert_eq!(ws.category(), ErrorCategory::Client);
         assert!(!ws.retryable());
+    }
+
+    #[test]
+    fn permission_refusals_classify_as_a_typed_auth_error() {
+        use crate::error::{ApiError, ErrorCategory};
+        for msg in [
+            "Permission denied",
+            "EGeneral:Permission denied",
+            "EAPI:Permission denied",
+        ] {
+            for e in [
+                classify_kraken_error_string(msg.to_string()),
+                classify_futures_ws_error(msg.to_string()),
+                super::super::ws_compose::classify_ws_error(Some(msg.to_string())),
+            ] {
+                assert_eq!(
+                    (e.code(), e.category(), e.retryable(), e.message()),
+                    (
+                        "PERMISSION_DENIED",
+                        ErrorCategory::Auth,
+                        false,
+                        "Permission denied.".to_string()
+                    ),
+                    "{msg}: {e:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_authentication_is_a_non_retryable_auth_error_carrying_its_cause() {
+        use crate::error::{ApiError, ConnectionError, ErrorCategory};
+        let e = super::super::ws_conn_error_to_trade(ConnectionError::authentication_failed(
+            "EAPI:Invalid key".into(),
+        ));
+        assert_eq!(
+            (e.code(), e.category(), e.retryable(), e.message()),
+            (
+                "AUTHENTICATION_FAILED",
+                ErrorCategory::Auth,
+                false,
+                "Authentication failed: EAPI:Invalid key".to_string()
+            ),
+            "{e:?}"
+        );
+        assert_eq!(e.with_request_id("rid-1").request_id(), Some("rid-1"));
+    }
+
+    #[test]
+    fn a_failed_connection_reports_its_cause_by_class() {
+        use crate::dispatch::NonTransientClass::*;
+        use crate::error::{ApiError, ConnectionError};
+        // (class, last_error, code, message)
+        let cases = [
+            (
+                Some(BadCreds),
+                "auth handshake failed: BadCreds",
+                "AUTHENTICATION_FAILED",
+                "Authentication failed: Invalid API key or signature",
+            ),
+            (
+                Some(PermissionDenied),
+                "auth handshake failed: PermissionDenied",
+                "PERMISSION_DENIED",
+                "Permission denied.",
+            ),
+            (
+                Some(ClientError),
+                "AuthRefreshFailed: Invalid API key.",
+                "AUTHENTICATION_FAILED",
+                "Authentication failed: Invalid API key.",
+            ),
+            (
+                Some(RetryCapExhausted),
+                "token-stale handshake cap reached",
+                "CONNECTION_ERROR",
+                "Transport: Other(\"Connection is not open; the request was not sent.\")",
+            ),
+            (
+                None,
+                "ws close 1008",
+                "CONNECTION_ERROR",
+                "Transport: Other(\"Connection is not open; the request was not sent.\")",
+            ),
+        ];
+        for (class, last_error, code, message) in cases {
+            let e = super::super::ws_conn_error_to_trade(ConnectionError::connection_failed(
+                class, last_error,
+            ));
+            assert_eq!(
+                (e.code(), e.message()),
+                (code, message.to_string()),
+                "{class:?}"
+            );
+        }
     }
 
     #[test]
@@ -648,7 +1093,6 @@ mod tests {
 
     #[test]
     fn invalid_order_period_terminated_detail_is_not_doubled() {
-        // Period-terminated passthrough must not render "..".
         let msg =
             classify_kraken_error_string("EOrder:Unknown order action.".to_string()).to_string();
         assert!(
@@ -659,7 +1103,6 @@ mod tests {
 
     #[test]
     fn transport_routing_faults_classify_as_client_non_retryable() {
-        // Wrong/unavailable transport: never sent, non-retryable, no request_id.
         use crate::error::{ApiError, ErrorCategory};
 
         let unsupported = TradeError::UnsupportedTransport {

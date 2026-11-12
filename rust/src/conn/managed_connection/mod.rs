@@ -15,7 +15,9 @@ use crate::dispatch::DispatchEventBus;
 use crate::error::ConnectionError;
 use crate::jitter::JitterSource;
 use crate::transport::{WsSocket, WsSocketFactoryLike};
-use crate::types::{ChannelName, ConnectionState, Symbol, WsUrl};
+#[cfg(test)]
+use crate::types::Symbol;
+use crate::types::{ChannelName, ConnectionState, StreamSymbol, WsUrl};
 
 pub use fsm_event::{AuthErrorKind, FsmEvent};
 pub(crate) use inner::{
@@ -23,8 +25,7 @@ pub(crate) use inner::{
     WsResponse,
 };
 
-/// Next reconnect backoff: `min(base * factor^attempt, max)`, then partial
-/// jitter (`frac = backoff_jitter`). Pure; all params read from `Knobs`.
+/// Reconnect backoff: `min(base * factor^attempt, max)` with partial jitter (`frac = backoff_jitter`).
 pub(crate) fn next_backoff(
     knobs: &crate::build::knobs::Knobs,
     attempt: u32,
@@ -42,7 +43,6 @@ pub(crate) fn next_backoff(
     // Clamp the u32 attempt into `powi`'s i32 so it saturates rather than wraps.
     let exp = i32::try_from(attempt).unwrap_or(i32::MAX);
     let scaled = base_ms * factor.powi(exp);
-    // NaN/+inf (f64 overflow) falls back to the ceiling.
     let computed = if scaled.is_finite() {
         scaled.min(max_ms)
     } else {
@@ -59,6 +59,18 @@ pub(crate) fn next_backoff(
     std::time::Duration::from_millis(delay_ms as u64)
 }
 
+fn rekey<V>(
+    map: &mut std::collections::HashMap<(ChannelName, Option<StreamSymbol>), V>,
+    from: &(ChannelName, Option<StreamSymbol>),
+    to: &(ChannelName, Option<StreamSymbol>),
+) {
+    if let Some(value) = map.remove(from) {
+        map.entry(to.clone()).or_insert(value);
+    }
+}
+
+pub(crate) type SubscribeKeys = Arc<Vec<(ChannelName, Option<StreamSymbol>)>>;
+
 /// Per-`WsUrl` FSM driver. Mutated only by the I/O Reactor.
 pub struct ManagedConnection {
     url: WsUrl,
@@ -74,7 +86,19 @@ pub struct ManagedConnection {
     /// Set on first `Open`, never reset; gates resubscribe-replay to reconnects only.
     has_been_open: bool,
 
+    /// Entries of a tokenless connection whose initial subscribe did not hand off to
+    /// the writer, or was lost with its socket. They replay after the first upgrade only.
+    initial_subscribe_replay: std::collections::HashSet<(ChannelName, Option<StreamSymbol>)>,
+
+    snapshot_opt_out_written: std::collections::HashSet<ChannelName>,
+
+    /// The first socket died before `Open` after a subscribe was queued; pending Unified entries
+    /// are restored into [`Self::initial_subscribe_replay`] on the next upgrade.
+    pre_open_subscribe_lost: bool,
+
     awaiting_token_refresh: bool,
+
+    pending_reactive_token_refresh_id: Option<u64>,
 
     server_connection_id: Option<u64>,
 
@@ -94,14 +118,12 @@ pub struct ManagedConnection {
     /// FSM-owned so socket opens preserve the single-writer rule.
     factory: Arc<dyn WsSocketFactoryLike>,
 
-    /// Host-scoped connect-rate budget; consumed on every `Connecting` entry.
     rate_budget: Arc<ConnectionRateBudget>,
 
     timers: TimerSet,
 
-    subscribe_ack_attempts: std::collections::HashMap<(ChannelName, Option<Symbol>), u8>,
+    subscribe_ack_attempts: std::collections::HashMap<(ChannelName, Option<StreamSymbol>), u8>,
 
-    /// `request_id` that drove `Connecting`; stamps the open event.
     pending_connect_request_id: Option<u64>,
 
     pending_close_request_id: Option<u64>,
@@ -118,18 +140,17 @@ pub struct ManagedConnection {
     /// Auth subscribes deferred on a token miss; cleared on socket teardown.
     deferred_open_auth_subscribes: Vec<(
         ChannelName,
-        Option<Symbol>,
+        Option<StreamSymbol>,
         crate::conn::subscription_registry::SubscribeParams,
     )>,
 
     /// Starts at 1 (`0` is the unstamped sentinel).
     next_subscribe_req_id: u64,
 
-    /// Correlates `channel`-less rejects.
-    pending_subscribe_req_ids: std::collections::HashMap<u64, (ChannelName, Option<Symbol>)>,
+    pending_subscribe_req_ids: std::collections::HashMap<u64, SubscribeKeys>,
 
-    /// Reverse index so disarm/teardown drops the forward entry in O(1).
-    subscribe_req_id_by_key: std::collections::HashMap<(ChannelName, Option<Symbol>), u64>,
+    /// Reverse index so disarm and teardown find a key's req_id without scanning.
+    subscribe_req_id_by_key: std::collections::HashMap<(ChannelName, Option<StreamSymbol>), u64>,
 }
 
 impl ManagedConnection {
@@ -148,10 +169,14 @@ impl ManagedConnection {
             attempt_count: 0,
             auth_handshake_fail_count: 0,
             has_been_open: false,
+            initial_subscribe_replay: std::collections::HashSet::new(),
+            snapshot_opt_out_written: std::collections::HashSet::new(),
+            pre_open_subscribe_lost: false,
             awaiting_token_refresh: false,
+            pending_reactive_token_refresh_id: None,
             server_connection_id: None,
             socket: None,
-            pending_requests: PendingRequestMap::default(),
+            pending_requests: PendingRequestMap::new(url),
             staleness_monitor: StalenessMonitor::new(staleness_window_ms),
             bus,
             clock,
@@ -183,26 +208,74 @@ impl ManagedConnection {
         &mut self,
         req_id: u64,
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
     ) {
         let key = (channel, pair);
         // Evict any lingering prior req_id for this key so neither map leaks.
         if let Some(prev) = self.subscribe_req_id_by_key.insert(key.clone(), req_id) {
-            self.pending_subscribe_req_ids.remove(&prev);
+            self.detach_req_key(prev, &key);
         }
-        self.pending_subscribe_req_ids.insert(req_id, key);
+        Arc::make_mut(self.pending_subscribe_req_ids.entry(req_id).or_default()).push(key);
     }
 
-    pub(crate) fn resolve_subscribe_req_id(
-        &self,
-        req_id: u64,
-    ) -> Option<(ChannelName, Option<Symbol>)> {
+    /// Move an in-flight subscribe from a released Unified book row onto its peer.
+    /// Returns `false` when no frame is outstanding and the caller must subscribe the peer itself.
+    pub(crate) fn handoff_subscribe_inflight(
+        &mut self,
+        from: ChannelName,
+        to: ChannelName,
+        pair: Option<StreamSymbol>,
+    ) -> bool {
+        let from_key = (from, pair.clone());
+        let to_key = (to, pair);
+        if self.subscribe_req_id_by_key.contains_key(&to_key) {
+            return true;
+        }
+        if self.initial_subscribe_replay.remove(&from_key) {
+            self.initial_subscribe_replay.insert(to_key.clone());
+        }
+        let Some(req_id) = self.subscribe_req_id_by_key.remove(&from_key) else {
+            return false;
+        };
+        if let Some(entries) = self.pending_subscribe_req_ids.get_mut(&req_id) {
+            let entries = Arc::make_mut(entries);
+            entries.retain(|entry| entry != &from_key);
+            if !entries.iter().any(|entry| entry == &to_key) {
+                entries.push(to_key.clone());
+            }
+        }
+        self.subscribe_req_id_by_key.insert(to_key.clone(), req_id);
+        rekey(
+            &mut self.timers.per_entry_subscribe_ack_timeouts,
+            &from_key,
+            &to_key,
+        );
+        rekey(&mut self.subscribe_ack_attempts, &from_key, &to_key);
+        rekey(
+            &mut self.timers.per_entry_subscribe_resend_due,
+            &from_key,
+            &to_key,
+        );
+        true
+    }
+
+    fn detach_req_key(&mut self, req_id: u64, key: &(ChannelName, Option<StreamSymbol>)) {
+        if let Some(entries) = self.pending_subscribe_req_ids.get_mut(&req_id) {
+            let entries = Arc::make_mut(entries);
+            entries.retain(|entry| entry != key);
+            if entries.is_empty() {
+                self.pending_subscribe_req_ids.remove(&req_id);
+            }
+        }
+    }
+
+    pub(crate) fn resolve_subscribe_req_id(&self, req_id: u64) -> Option<SubscribeKeys> {
         self.pending_subscribe_req_ids.get(&req_id).cloned()
     }
 
-    fn forget_subscribe_req_id_for_key(&mut self, key: &(ChannelName, Option<Symbol>)) {
+    fn forget_subscribe_req_id_for_key(&mut self, key: &(ChannelName, Option<StreamSymbol>)) {
         if let Some(req_id) = self.subscribe_req_id_by_key.remove(key) {
-            self.pending_subscribe_req_ids.remove(&req_id);
+            self.detach_req_key(req_id, key);
         }
     }
 
@@ -214,16 +287,105 @@ impl ManagedConnection {
         self.clock.now()
     }
 
-    /// Transient: burn retry budget or escalate to teardown; non-transient:
-    /// terminate only that entry.
+    pub(crate) fn emit_futures_subscribed(
+        &self,
+        channel: ChannelName,
+        pair: &Option<StreamSymbol>,
+        ack: &crate::dispatch::FuturesSubscribeAck,
+    ) {
+        if !self.url.is_unified() {
+            return;
+        }
+        self.bus
+            .publish_futures_subscribed(self.clock.now(), channel, pair.as_ref(), ack.clone());
+    }
+
+    pub(crate) fn emit_futures_subscribe_failed(
+        &self,
+        channel: ChannelName,
+        pair: &Option<StreamSymbol>,
+        transient: bool,
+        error: Option<&str>,
+        ack: &crate::dispatch::FuturesSubscribeAck,
+    ) {
+        if !self.url.is_unified() {
+            return;
+        }
+        let (symbol, interval, tick_type) = StreamSymbol::futures_identity(pair.as_ref());
+        self.bus.publish(crate::dispatch::EventEnvelope {
+            event_type: crate::dispatch::EventType::FuturesSubscribeFailedEvent,
+            event_version: 1,
+            timestamp_monotonic: self.clock.now(),
+            request_id: None,
+            payload: crate::dispatch::EventPayload::FuturesSubscribeFailedEvent {
+                channel,
+                symbol,
+                interval,
+                tick_type,
+                attempt: self.subscribe_attempt(channel, pair),
+                error_class: if transient {
+                    crate::dispatch::FuturesSubscribeFailureClass::Transient
+                } else {
+                    crate::dispatch::FuturesSubscribeFailureClass::NonTransient
+                },
+                error: error.map(str::to_owned),
+                ack: ack.clone(),
+            },
+        });
+    }
+
+    fn subscribe_ack_budget(&self) -> u8 {
+        self.bus
+            .knobs()
+            .subscribe_ack_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(u8::MAX as u32) as u8
+    }
+
+    fn subscribe_attempt(&self, channel: ChannelName, pair: &Option<StreamSymbol>) -> u32 {
+        let budget = self.subscribe_ack_budget();
+        let remaining = self
+            .subscribe_ack_attempts
+            .get(&(channel, pair.clone()))
+            .copied()
+            .unwrap_or(budget);
+        u32::from(budget.saturating_sub(remaining).saturating_add(1))
+    }
+
+    fn handle_subscribe_rejected(
+        &mut self,
+        channel: ChannelName,
+        pair: Option<StreamSymbol>,
+        error: crate::conn::SubscribeErrorKind,
+    ) {
+        let crate::conn::SubscribeErrorKind::SubscribeRejected {
+            kraken_code,
+            transient,
+            ack,
+        } = error;
+        self.handle_subscribe_failure(channel, pair, transient, Some(kraken_code), &ack);
+    }
+
+    fn handle_subscribe_ack_timeout(&mut self, channel: ChannelName, pair: Option<StreamSymbol>) {
+        self.handle_subscribe_failure(
+            channel,
+            pair,
+            true,
+            None,
+            &crate::dispatch::FuturesSubscribeAck::default(),
+        );
+    }
+
     pub(crate) fn handle_subscribe_failure(
         &mut self,
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
         transient: bool,
         last_error: Option<String>,
+        ack: &crate::dispatch::FuturesSubscribeAck,
     ) {
         use ConnectionState::*;
+        self.emit_futures_subscribe_failed(channel, &pair, transient, last_error.as_deref(), ack);
         let key = (channel, pair.clone());
         self.timers.per_entry_subscribe_ack_timeouts.remove(&key);
         self.timers.per_entry_subscribe_resend_due.remove(&key);
@@ -231,20 +393,14 @@ impl ManagedConnection {
 
         if !transient {
             self.subscribe_ack_attempts.remove(&key);
-            let now = self.clock.now();
-            self.bus.publish(crate::dispatch::EventEnvelope {
-                event_type: crate::dispatch::EventType::SubscriptionTerminatedEvent,
-                event_version: 2,
-                timestamp_monotonic: now,
-                request_id: None,
-                payload: crate::dispatch::EventPayload::SubscriptionTerminatedEvent {
-                    channel,
-                    pair: pair.clone(),
-                    cause: crate::api::subscription::TerminationCause::NonTransientWireRejection,
-                    last_error,
-                    terminated_at_monotonic: now,
-                },
-            });
+            self.bus.publish_subscription_terminated(
+                self.clock.now(),
+                self.url,
+                channel,
+                pair.clone(),
+                crate::api::subscription::TerminationCause::NonTransientWireRejection,
+                last_error,
+            );
             tracing::warn!(
                 target: "kraken_sdk::fsm",
                 url = ?self.url,
@@ -265,12 +421,7 @@ impl ManagedConnection {
                 *n
             }
             None => {
-                let budget = self
-                    .bus
-                    .knobs()
-                    .subscribe_ack_attempts
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .min(u8::MAX as u32) as u8;
+                let budget = self.subscribe_ack_budget();
                 let seeded = budget.saturating_sub(1);
                 self.subscribe_ack_attempts.insert(key.clone(), seeded);
                 seeded
@@ -326,6 +477,7 @@ impl ManagedConnection {
                 "pre-Open: subscribe_ack budget exhausted — AttemptFailed → BackingOff"
             );
             self.state = BackingOff;
+            self.timers.upgrade_timeout_due_at = None;
             let backoff_due = self.compute_backoff_due();
             self.timers.backoff_due_at = Some(backoff_due);
             self.emit_attempt_failed(
@@ -337,11 +489,12 @@ impl ManagedConnection {
                 None,
                 None,
             );
+            self.note_pre_open_socket_lost();
         }
     }
 
-    /// Clear all per-entry subscribe-ack state on exits that bypass
-    /// `disarm_subscribe_ack` (stale timers must not leak).
+    /// Clear per-entry subscribe-ack state on exits that bypass `disarm_subscribe_ack`,
+    /// so stale timers do not leak.
     fn clear_subscribe_ack_state(&mut self) {
         self.timers.per_entry_subscribe_ack_timeouts.clear();
         self.timers.per_entry_subscribe_resend_due.clear();
@@ -354,6 +507,7 @@ impl ManagedConnection {
         self.deferred_open_auth_subscribes.clear();
         // A stale-true refresh flag would suppress every later force_refresh kick.
         self.awaiting_token_refresh = false;
+        self.pending_reactive_token_refresh_id = None;
     }
 
     /// Drains the pending map LAST so drain-before-emit holds for every caller.
@@ -374,7 +528,7 @@ impl ManagedConnection {
         self.clear_subscribe_ack_state();
     }
 
-    /// Same shape as the `Authenticating` exit (drain LAST).
+    /// Drains the pending map LAST.
     fn exit_resubscribing_teardown(&mut self) {
         self.socket = None;
         self.staleness_monitor.disarm();
@@ -392,14 +546,12 @@ impl ManagedConnection {
         self.timers.staleness_due_at = None;
     }
 
-    /// Backoff due instant with `attempt = attempt_count − 1` (count 1 yields `base_ms`).
     fn compute_backoff_due(&self) -> crate::types::MonotonicInstant {
         let attempt = self.attempt_count.saturating_sub(1);
         let delay = next_backoff(self.bus.knobs(), attempt, self.jitter.as_ref());
         crate::types::MonotonicInstant(self.clock.now().0 + delay)
     }
 
-    /// Reads `staleness_window_ms` fresh off `Knobs`.
     fn arm_staleness(&mut self) {
         let window_ms = self.bus.knobs().staleness_window_ms;
         self.staleness_monitor = StalenessMonitor::new(window_ms);
@@ -434,7 +586,6 @@ impl ManagedConnection {
         self.timers.token_refresh_due_at = None;
     }
 
-    /// Earliest pending timer due instant + the `FsmEvent` to dispatch.
     pub(crate) fn next_timer_due(&self) -> Option<(crate::types::MonotonicInstant, FsmEvent)> {
         // `make_ev` is lazy so a losing per-entry timer never clones its `Symbol`.
         fn consider(
@@ -509,7 +660,7 @@ impl ManagedConnection {
     pub(crate) fn arm_subscribe_ack(
         &mut self,
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
         due_at: crate::types::MonotonicInstant,
     ) {
         let key = (channel, pair);
@@ -517,16 +668,25 @@ impl ManagedConnection {
             .per_entry_subscribe_ack_timeouts
             .insert(key.clone(), due_at);
         // First arm seeds the budget; re-arms leave it alone so the decrement walks toward 0.
-        let budget = self
-            .bus
-            .knobs()
-            .subscribe_ack_attempts
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .min(u8::MAX as u32) as u8;
+        let budget = self.subscribe_ack_budget();
         self.subscribe_ack_attempts.entry(key).or_insert(budget);
     }
 
-    pub(crate) fn disarm_subscribe_ack(&mut self, channel: ChannelName, pair: Option<Symbol>) {
+    pub(crate) fn disarm_subscribe_ack(
+        &mut self,
+        channel: ChannelName,
+        pair: Option<StreamSymbol>,
+    ) {
+        for channel in self.wire_stream_channels(channel) {
+            self.disarm_subscribe_ack_key(channel, pair.clone());
+        }
+    }
+
+    pub(crate) fn disarm_subscribe_ack_key(
+        &mut self,
+        channel: ChannelName,
+        pair: Option<StreamSymbol>,
+    ) {
         let key = (channel, pair);
         self.timers.per_entry_subscribe_ack_timeouts.remove(&key);
         self.timers.per_entry_subscribe_resend_due.remove(&key);
@@ -534,18 +694,39 @@ impl ManagedConnection {
         self.forget_subscribe_req_id_for_key(&key);
     }
 
+    /// Cancels a resend made redundant by another route; the attempt budget is kept.
+    pub(crate) fn cancel_subscribe_resend(
+        &mut self,
+        channel: ChannelName,
+        pair: &Option<StreamSymbol>,
+    ) {
+        for channel in self.wire_stream_channels(channel) {
+            self.timers
+                .per_entry_subscribe_resend_due
+                .remove(&(channel, pair.clone()));
+        }
+    }
+
+    /// Logical channels sharing one wire subscription (Unified Public: maintained and raw book share one `book` stream).
+    fn wire_stream_channels(&self, channel: ChannelName) -> Vec<ChannelName> {
+        if self.url.shares_unified_book_stream(channel) {
+            vec![ChannelName::Book, ChannelName::BookRaw]
+        } else {
+            vec![channel]
+        }
+    }
+
     pub(crate) fn disarm_book_reseed_snapshot(
         &mut self,
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
     ) {
         self.timers
             .per_entry_book_reseed_snapshot
             .remove(&(channel, pair));
     }
 
-    /// The reactor uses it to set `WireSubscribeAck.last` (final ack drives
-    /// `Resubscribing → Open`).
+    /// Used to set `WireSubscribeAck.last`; the final ack drives `Resubscribing → Open`.
     pub(crate) fn pending_subscribe_ack_count(&self) -> usize {
         self.timers.per_entry_subscribe_ack_timeouts.len()
     }
@@ -554,7 +735,7 @@ impl ManagedConnection {
     pub(crate) fn is_subscribe_ack_armed(
         &self,
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
     ) -> bool {
         self.timers
             .per_entry_subscribe_ack_timeouts
@@ -564,7 +745,7 @@ impl ManagedConnection {
     pub(crate) fn arm_book_reseed_snapshot(
         &mut self,
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
         due_at: crate::types::MonotonicInstant,
     ) {
         self.timers
@@ -572,16 +753,126 @@ impl ManagedConnection {
             .insert((channel, pair), due_at);
     }
 
-    /// Fires on reconnect only, never the initial bring-up.
     pub(crate) fn has_been_open(&self) -> bool {
         self.has_been_open
+    }
+
+    pub(crate) fn mark_initial_subscribe_replay(
+        &mut self,
+        channel: ChannelName,
+        pairs: &[Option<StreamSymbol>],
+    ) {
+        if !self.has_been_open && !self.url.requires_ws_token() {
+            self.initial_subscribe_replay
+                .extend(pairs.iter().cloned().map(|pair| (channel, pair)));
+        }
+    }
+
+    pub(crate) fn note_snapshot_opt_out_written(
+        &mut self,
+        channel: ChannelName,
+        pairs: &[Option<StreamSymbol>],
+    ) {
+        if pairs.iter().any(Option::is_none) {
+            self.snapshot_opt_out_written.insert(channel);
+        }
+    }
+
+    pub(crate) fn forget_snapshot_opt_out_written(
+        &mut self,
+        channel: ChannelName,
+        pair: &Option<StreamSymbol>,
+    ) {
+        if pair.is_none() {
+            self.snapshot_opt_out_written.remove(&channel);
+        }
+    }
+
+    pub(crate) fn take_snapshot_opt_out_written(
+        &mut self,
+    ) -> std::collections::HashSet<ChannelName> {
+        std::mem::take(&mut self.snapshot_opt_out_written)
+    }
+
+    pub(crate) fn needs_initial_subscribe_replay(&self) -> bool {
+        !self.initial_subscribe_replay.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initial_subscribe_replay_keys(
+        &self,
+    ) -> &std::collections::HashSet<(ChannelName, Option<StreamSymbol>)> {
+        &self.initial_subscribe_replay
+    }
+
+    pub(crate) fn initial_replay_filter(
+        &self,
+    ) -> Option<&std::collections::HashSet<(ChannelName, Option<StreamSymbol>)>> {
+        (!self.has_been_open && !self.url.requires_ws_token())
+            .then_some(&self.initial_subscribe_replay)
+    }
+
+    pub(crate) fn clear_initial_subscribe_replay(
+        &mut self,
+        channel: ChannelName,
+        pairs: &[Option<StreamSymbol>],
+    ) {
+        if self.initial_subscribe_replay.is_empty() {
+            return;
+        }
+        for pair in pairs {
+            self.initial_subscribe_replay
+                .remove(&(channel, pair.clone()));
+        }
+    }
+
+    /// Records a discarded pre-`Open` socket so a queued subscribe is replayed.
+    pub(crate) fn note_pre_open_socket_lost(&mut self) {
+        if self.url.requires_ws_token() || self.has_been_open {
+            return;
+        }
+        if !matches!(
+            self.state,
+            ConnectionState::BackingOff | ConnectionState::Failed
+        ) {
+            return;
+        }
+        self.pre_open_subscribe_lost = true;
+        self.clear_subscribe_ack_state();
+    }
+
+    pub(crate) fn take_pre_open_subscribe_lost(&mut self) -> bool {
+        std::mem::take(&mut self.pre_open_subscribe_lost)
     }
 
     pub(crate) fn awaiting_token_refresh(&self) -> bool {
         self.awaiting_token_refresh
     }
 
-    /// `Authenticating` with nothing in flight — the ONE auth-probe predicate.
+    pub(crate) fn pending_reactive_token_refresh_id(&self) -> Option<u64> {
+        self.pending_reactive_token_refresh_id
+    }
+
+    /// Single-flight: returns whether this call spawned the refresh.
+    pub(crate) fn force_reactive_token_refresh(
+        &mut self,
+        auth_stack: &crate::auth::AuthStack,
+    ) -> bool {
+        if self.pending_reactive_token_refresh_id.is_some() {
+            return false;
+        }
+        let handle = auth_stack.force_refresh(crate::auth::RefreshReason::AuthHandshakeFailed);
+        self.awaiting_token_refresh = true;
+        self.pending_reactive_token_refresh_id = Some(handle.id);
+        true
+    }
+
+    pub(crate) fn complete_reactive_token_refresh(&mut self, request_id: u64) {
+        debug_assert_eq!(self.pending_reactive_token_refresh_id, Some(request_id));
+        self.awaiting_token_refresh = false;
+        self.pending_reactive_token_refresh_id = None;
+    }
+
     pub(crate) fn authenticating_nothing_in_flight(&self) -> bool {
         self.state == ConnectionState::Authenticating
             && self.pending_subscribe_ack_count() == 0
@@ -589,25 +880,36 @@ impl ManagedConnection {
             && !self.awaiting_token_refresh
     }
 
+    #[cfg(test)]
     pub(crate) fn set_awaiting_token_refresh(&mut self, v: bool) {
         self.awaiting_token_refresh = v;
+    }
+
+    /// Drops a released key's reseed timer, deferred re-subscribe and initial replay; the caller disarms its ack.
+    pub(crate) fn forget_released_key(
+        &mut self,
+        channel: ChannelName,
+        pair: &Option<StreamSymbol>,
+    ) {
+        self.disarm_book_reseed_snapshot(channel, pair.clone());
+        self.remove_deferred_open_auth_subscribe(channel, pair);
+        self.clear_initial_subscribe_replay(channel, std::slice::from_ref(pair));
     }
 
     /// A removed key's queued re-subscribe must die with it.
     pub(crate) fn remove_deferred_open_auth_subscribe(
         &mut self,
         channel: ChannelName,
-        pair: &Option<Symbol>,
+        pair: &Option<StreamSymbol>,
     ) {
         self.deferred_open_auth_subscribes
             .retain(|(c, p, _)| !(*c == channel && p == pair));
     }
 
-    /// De-duplicated by `(channel, pair)`.
     pub(crate) fn defer_open_auth_subscribe(
         &mut self,
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
         params: crate::conn::subscription_registry::SubscribeParams,
     ) {
         if self
@@ -626,13 +928,12 @@ impl ManagedConnection {
         &mut self,
     ) -> Vec<(
         ChannelName,
-        Option<Symbol>,
+        Option<StreamSymbol>,
         crate::conn::subscription_registry::SubscribeParams,
     )> {
         std::mem::take(&mut self.deferred_open_auth_subscribes)
     }
 
-    /// Short-circuit `Resubscribing → Open` when no resubscribe work is outstanding.
     pub(crate) fn complete_resubscribe_if_empty(&mut self) {
         if self.state == ConnectionState::Resubscribing
             && self.pending_subscribe_ack_count() == 0
@@ -689,7 +990,15 @@ impl ManagedConnection {
         }
     }
 
-    /// One event per waiter (primary + cohort), or a single broadcast when there is none.
+    /// The error for a refused request: the recorded cause once failed, else `NotOpen`.
+    pub(crate) fn refusal_error(&self) -> crate::error::ConnectionError {
+        if self.state == ConnectionState::Failed {
+            self.bus.failed_connection_error(self.url)
+        } else {
+            crate::error::ConnectionError::not_open()
+        }
+    }
+
     fn emit_connection_failed(
         &mut self,
         last_error: String,
@@ -700,6 +1009,8 @@ impl ManagedConnection {
         let cohort = std::mem::take(&mut self.additional_connect_request_ids);
         let attempt_count = self.attempt_count;
         let url = self.url;
+        self.bus
+            .record_connection_failure(url, non_transient_class, &last_error);
         let emit = |request_id: Option<u64>, last_error: String| {
             self.emit_lifecycle(
                 crate::dispatch::EventType::ConnectionFailedEvent,
@@ -770,7 +1081,6 @@ impl ManagedConnection {
         }
     }
 
-    /// Open a socket, arm the upgrade timeout, emit `ConnectionConnectingEvent`.
     fn enter_connecting(&mut self, rid: Option<u64>) {
         self.socket = Some(self.factory.open_socket(self.url));
         self.arm_upgrade_timeout();
@@ -919,12 +1229,6 @@ impl ManagedConnection {
         self.pending_requests.contains(req_id)
     }
 
-    /// The SDK never auto-resends; the caller reconciles.
-    pub(crate) fn drain_one_retryable(&mut self, req_id: u64) {
-        self.pending_requests.drain_one_retryable(req_id, &self.bus);
-    }
-
-    #[cfg(test)]
     pub(crate) fn pending_request_count(&self) -> usize {
         self.pending_requests.pending_request_count()
     }
@@ -932,7 +1236,6 @@ impl ManagedConnection {
 
 #[cfg(test)]
 impl ManagedConnection {
-    /// Bypasses the transition table.
     pub(crate) fn test_set_state(&mut self, s: ConnectionState) {
         self.state = s;
     }
@@ -945,7 +1248,7 @@ impl ManagedConnection {
     pub(crate) fn test_has_subscribe_resend_timer(
         &self,
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
     ) -> bool {
         self.timers
             .per_entry_subscribe_resend_due

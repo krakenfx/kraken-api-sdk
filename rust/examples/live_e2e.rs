@@ -268,7 +268,7 @@ async fn main() -> ExitCode {
         "STAGE 4b — OrderCancellationAttempted observer registered (fires on mid-flight drop)\n"
     );
 
-    if env_or("KRAKEN_PLACE_REAL", "").is_empty() {
+    if env_or("KRAKEN_PLACE_REAL", "") != "1" {
         println!("STAGE 5 — SKIPPED (set KRAKEN_PLACE_REAL=1 to place real, FILLING orders)\n");
         return finish(client, &failures, &submitted, &cancel_attempted).await;
     }
@@ -451,7 +451,7 @@ async fn finish(
     submitted: &Arc<AtomicUsize>,
     cancel: &Arc<AtomicUsize>,
 ) -> ExitCode {
-    // close() drains both WS connections; completion resolves on ClientClosedEvent.
+    // close() drains all four WS connections; completion resolves on ClientClosedEvent.
     let _ = client.close().await;
     println!("STAGE 6 — client closed (graceful drain complete)\n");
     println!(

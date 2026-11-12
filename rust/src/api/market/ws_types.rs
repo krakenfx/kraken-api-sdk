@@ -55,9 +55,20 @@ pub(crate) fn parse_wire_decimal(v: &Value) -> Option<Decimal> {
     }
     let parsed = decimal_from_value(v).ok();
     if parsed.is_none() {
-        tracing::warn!(target: "kraken_sdk::decode", value = %v, "money value failed Decimal parse — field dropped");
+        tracing::warn!(target: "kraken_sdk::decode", kind = json_kind(v), "money value failed Decimal parse — field dropped");
     }
     parsed
+}
+
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 /// Aggressor side of a trade print.
@@ -99,7 +110,7 @@ impl TradeSide {
     }
 }
 
-/// One `trade` channel print per Kraken WS v2 (`update` frames only — no snapshot).
+/// One `trade` channel print per Kraken WS v2 (`snapshot` + `update` frames).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct TradeUpdate {
@@ -117,6 +128,8 @@ pub struct TradeUpdate {
     pub trade_id: u64,
     /// Exchange trade time, RFC 3339 text passed through verbatim.
     pub timestamp: String,
+    /// Whether the print came from a snapshot frame rather than a live update.
+    pub is_snapshot: bool,
 }
 
 /// One `ohlc` channel candle per Kraken WS v2 (`snapshot` + `update` frames);
@@ -286,6 +299,23 @@ mod tests {
         let msg = TickerUpdate::from_wire(raw).unwrap_err().to_string();
         assert!(!msg.ends_with(".."), "double terminal period: {msg:?}");
         assert_eq!(msg, "Ticker decode: symbol: Symbol cannot be empty.");
+    }
+
+    #[test]
+    fn a_dropped_money_value_is_logged_by_kind_and_never_by_content() {
+        let logs = crate::test_logs::capture_logs(|| {
+            assert!(parse_wire_decimal(&Value::String("SECRET-12345.67".into())).is_none());
+            assert!(parse_wire_decimal(&serde_json::json!({"balance": "SECRET-777"})).is_none());
+            assert!(parse_wire_decimal(&serde_json::json!(true)).is_none());
+        });
+        assert_eq!(logs.matches("money value failed Decimal parse").count(), 3);
+        for kind in ["string", "object", "bool"] {
+            assert!(logs.contains(&format!("kind=\"{kind}\"")), "{kind}: {logs}");
+        }
+        assert!(
+            !logs.contains("SECRET"),
+            "a wire value reached the log: {logs}"
+        );
     }
 
     #[test]

@@ -130,8 +130,7 @@ fn make_namespace_with_bus(
         mirror,
         alloc,
     ));
-    let dispatch =
-        Arc::new(crate::dispatch::dispatch_table::DispatchTable::with_default_spot_table());
+    let dispatch = Arc::new(crate::dispatch::dispatch_table::DispatchTable::with_default_table());
     (AccountNamespace::new(rest, ws, dispatch), mock, bus)
 }
 
@@ -1546,9 +1545,13 @@ mod ws_combiners {
 
         match rx.try_recv().expect("register posted first") {
             CallerInbound::HandlerMutation {
+                url,
                 channel,
                 op: HandlerMutationOp::Register { .. },
-            } => assert_eq!(channel, ChannelName::Executions),
+            } => {
+                assert_eq!(url, WsUrl::Auth);
+                assert_eq!(channel, ChannelName::Executions);
+            }
             other => panic!("expected HandlerMutation::Register, got {other:?}"),
         }
         let ref_id = match rx.try_recv().expect("subscribe posted second") {
@@ -1571,10 +1574,12 @@ mod ws_combiners {
         match rx.try_recv().expect("guard drop posts teardown") {
             CallerInbound::SubscriptionGuardDrop {
                 handler_id,
+                url,
                 channel,
                 symbols,
             } => {
                 assert_eq!(handler_id, ref_id, "drop releases the registering ref");
+                assert_eq!(url, WsUrl::Auth);
                 assert_eq!(channel, ChannelName::Executions);
                 assert!(symbols.is_empty(), "channel-wide guard carries no pairs");
             }
@@ -1643,5 +1648,29 @@ mod ws_combiners {
             account.on_balances_for(|_u: &BalanceUpdate| {}),
             Err(SubscriptionError::ClientClosed)
         ));
+    }
+
+    #[test]
+    fn on_handlers_after_close_reject_client_closed() {
+        let (account, bus) = make_ws_namespace();
+        drop(bus.take_caller_to_io_rx().expect("rx present"));
+        assert!(matches!(
+            account.on_executions(|_u: &ExecutionUpdate| {}),
+            Err(SubscriptionError::ClientClosed)
+        ));
+        assert!(matches!(
+            account.on_balances(|_u: &BalanceUpdate| {}),
+            Err(SubscriptionError::ClientClosed)
+        ));
+    }
+
+    #[test]
+    fn execution_decode_reads_is_snapshot_from_the_envelope_type() {
+        let decode = |ty: &str| {
+            super::ws_types::decode_executions(json!({"type": ty, "data": {"exec_type": "new"}}))
+                .expect("decodes")
+        };
+        assert!(decode("snapshot").is_snapshot);
+        assert!(!decode("update").is_snapshot);
     }
 }

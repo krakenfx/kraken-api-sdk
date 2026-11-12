@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-`OrderBookUpdate`: `symbol`, `bids` / `asks` (`Vec<BookLevel>` with `price`, `qty`), `checksum: u32`, `timestamp: Option<MonotonicInstant>` (always `None` in v1), `exchange_timestamp: String` (RFC 3339; `""` if absent).
+`OrderBookUpdate`: `symbol`, `bids` / `asks` (`Vec<BookLevel>` with `price`, `qty`; after [degradation](#gap-recovery) a removal arrives as `qty == 0`), `checksum: u32`, `timestamp: Option<MonotonicInstant>` (always `None` in v1), `exchange_timestamp: String` (RFC 3339; `""` if absent).
 
 `BookDepth`: `D10`, `D25`, `D100`, `D500`, `D1000`. Depth is fixed at first subscribe for the pair. [Depth coalescing](#depth-coalescing).
 
@@ -129,16 +129,80 @@ CRC32 (IEEE) over the post-apply top 10 levels per side: asks (lowest first) the
 ## Channel-wide handler
 
 ```rust
-let _handle = client.market().on_book(|update: OrderBookUpdate| {
+let _handle = client.market().on_book(|update: &OrderBookUpdate| {
     println!("{} book update: {} bids", update.symbol.as_str(), update.bids.len());
-});
+})?;
 client.ready().await?;
 client
     .subscription()
     .subscribe_book(vec![Symbol::new("BTC/USD")?], BookDepth::D10)?;
 ```
 
+## Futures
+
+Futures books use native wire symbols (`Vec<String>`) and the same `BookDepth` values. There is no REST snapshot.
+
+### Maintained stream
+
+`on_book_for` delivers `FuturesOrderBookUpdate`. The SDK applies each frame and checks CRC32 as on Spot.
+
+```rust
+use kraken_sdk::{BookDepth, FuturesOrderBookUpdate};
+
+client.ready().await?;
+
+let _guard = client.market().futures().on_book_for(
+    vec!["PF_XBTUSD".to_owned()],
+    BookDepth::D10,
+    |update: &FuturesOrderBookUpdate| {
+        println!(
+            "{} bids={} asks={} best_bid={:?}",
+            update.symbol,
+            update.bids.len(),
+            update.asks.len(),
+            update.bids.first().map(|l| l.price)
+        );
+    },
+)?;
+```
+
+`FuturesOrderBookUpdate`: `symbol` (`String`), `bids` / `asks` (`Vec<BookLevel>`, best first, capped to the requested depth; after degradation, the frame's levels as sent), `checksum: u32`, `exchange_timestamp: String` (RFC 3339).
+
+On a CRC mismatch the update is withheld, `FuturesOrderBookGapEvent` and `FuturesSubscriptionGapEvent` are emitted, and the SDK requests a new snapshot for that symbol. [Events → `FuturesOrderBookGapEvent`](../events.md#futuresorderbookgapevent).
+
+### Raw deltas
+
+`on_book_raw_for` delivers `FuturesBookDelta`. No CRC check, no maintained state, no gap events.
+
+```rust
+use kraken_sdk::{BookDepth, FuturesBookDelta};
+
+let _guard = client.market().futures().on_book_raw_for(
+    vec!["PF_ETHUSD".to_owned()],
+    BookDepth::D25,
+    None, // snapshot
+    |delta: &FuturesBookDelta| {
+        println!(
+            "{} snapshot={} bid_changes={} ask_changes={}",
+            delta.symbol,
+            delta.is_snapshot,
+            delta.bids.len(),
+            delta.asks.len()
+        );
+    },
+)?;
+```
+
+`snapshot: None` keeps Kraken's opening snapshot. `Some(false)` is delta-only. Maintained `on_book_for` always requests a snapshot.
+
+`FuturesBookDelta`: `symbol`, `bids` / `asks` (`PriceLevel` with `price`/`qty` plus `price_wire`/`qty_wire`; complete on a snapshot, changed levels on a delta), `checksum: u32` (not validated), `is_snapshot`, `exchange_timestamp`. A `qty` of zero removes the level.
+
+### Depth and coexistence
+
+Unified Public has one `book` subscription per symbol. Maintained `D10` is subscribed at wire depth 25; the caller still sees 10 levels. Maintained and raw owners of a symbol share the stream only when their effective depth and snapshot match. The full table: [Market data → Maintained/raw coexistence](market-data.md#maintainedraw-coexistence).
+
 ## Related
 
 - [Streaming](streaming.md)
+- [Market data → Unified Futures order books](market-data.md#unified-futures-order-books)
 - [`examples/live_book.rs`](../../examples/live_book.rs)

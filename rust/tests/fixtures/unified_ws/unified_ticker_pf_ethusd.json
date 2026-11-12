@@ -1,0 +1,32 @@
+{
+  "channel": "ticker",
+  "type": "update",
+  "data": [{
+    "symbol": "PF_ETHUSD",
+    "timestamp": "2026-10-05T00:00:01Z",
+    "next_funding_rate_time": "2026-10-05T08:00:00Z",
+    "suspended": false,
+    "trades": 9,
+    "ask": "2500.5",
+    "ask_qty": 2,
+    "bid": 2500,
+    "bid_qty": "3",
+    "change": 1,
+    "change_pct": "0.1",
+    "funding_rate": 0,
+    "funding_rate_prediction": "0",
+    "high": 2502,
+    "index": "2500",
+    "last": 2501,
+    "low": "2499",
+    "mark": 2500,
+    "open": "2500",
+    "open_interest": 12,
+    "premium": "0",
+    "relative_funding_rate": 0,
+    "relative_funding_rate_prediction": "0",
+    "volume": 20,
+    "volume_quote": "50000",
+    "vwap": 2500
+  }]
+}

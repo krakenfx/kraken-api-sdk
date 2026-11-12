@@ -9,6 +9,10 @@ fn test_jitter() -> Arc<dyn JitterSource> {
     Arc::new(SplitMix64Jitter::with_seed(0xC0FFEE))
 }
 
+fn spot(s: &str) -> Option<StreamSymbol> {
+    Some(StreamSymbol::from(Symbol::new(s).expect("valid symbol")))
+}
+
 fn mc(url: WsUrl) -> ManagedConnection {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let bus = Arc::new(DispatchEventBus::new(
@@ -35,14 +39,7 @@ fn mc_with_budget(
     ManagedConnection::new(url, bus, factory, budget, clock, test_jitter())
 }
 
-/// A clock pinned to a fixed instant (`secs` seconds since the monotonic
-/// epoch) — makes backoff/timer due-at deterministic in tests.
-struct FixedClock(std::time::Duration);
-impl Clock for FixedClock {
-    fn now(&self) -> crate::types::MonotonicInstant {
-        crate::types::MonotonicInstant(self.0)
-    }
-}
+use crate::clock::FixedClock;
 
 /// MC whose bus carries a custom `Knobs` + `FixedClock` + `FixedJitter`, for the backoff /
 /// reconnect-cap / timer-knob tests.
@@ -138,6 +135,39 @@ fn authenticating_token_stale_re_enters_and_increments_attempt() {
 }
 
 #[test]
+fn resolving_a_batch_correlation_returns_every_recorded_entry() {
+    let mut c = mc(WsUrl::UnifiedPublic);
+    for i in 0..500 {
+        c.record_subscribe_req_id(
+            9,
+            ChannelName::Ticker,
+            Some(crate::types::StreamSymbol::Futures(format!("PF_SYM{i}USD"))),
+        );
+    }
+    let resolved = c.resolve_subscribe_req_id(9);
+    assert_eq!(resolved.expect("recorded").len(), 500);
+}
+
+fn caller_error_for_failure(
+    events: &[crate::dispatch::EventEnvelope],
+) -> crate::error::ConnectionError {
+    events
+        .iter()
+        .find_map(|e| match &e.payload {
+            crate::dispatch::EventPayload::ConnectionFailedEvent {
+                non_transient_class,
+                last_error,
+                ..
+            } => Some(crate::error::ConnectionError::connection_failed(
+                *non_transient_class,
+                last_error,
+            )),
+            _ => None,
+        })
+        .expect("ConnectionFailedEvent must be emitted on → Failed")
+}
+
+#[test]
 fn authenticating_token_stale_handshake_refreshes_then_caps_to_failed() {
     let mut c = mc(WsUrl::Auth); // default knobs → max_auth_handshake_failures = 3
     c.test_set_state(ConnectionState::Authenticating);
@@ -189,6 +219,11 @@ fn authenticating_token_stale_handshake_refreshes_then_caps_to_failed() {
         auth_failed,
         Some(crate::dispatch::NonTransientClass::RetryCapExhausted),
         "cap-exhausted token-stale must emit AuthenticationFailedEvent{{RetryCapExhausted}}"
+    );
+    assert_eq!(
+        caller_error_for_failure(&events).kind(),
+        crate::error::ConnectionErrorKind::NotOpen,
+        "the auth-handshake cap reaches a caller as NotOpen"
     );
 }
 
@@ -346,23 +381,40 @@ fn removed_key_drops_its_deferral_record() {
     use crate::conn::SubscribeParams;
     use crate::types::ChannelName;
     let mut c = mc(WsUrl::Auth);
-    c.defer_open_auth_subscribe(ChannelName::Executions, None, SubscribeParams::Executions);
-    c.defer_open_auth_subscribe(ChannelName::Balances, None, SubscribeParams::Balances);
+    c.defer_open_auth_subscribe(
+        ChannelName::Executions,
+        None,
+        SubscribeParams::Executions {
+            snap_orders: None,
+            snap_trades: None,
+        },
+    );
+    c.defer_open_auth_subscribe(
+        ChannelName::Balances,
+        None,
+        SubscribeParams::Balances { snapshot: None },
+    );
     c.remove_deferred_open_auth_subscribe(ChannelName::Executions, &None);
     assert_eq!(
         c.drain_deferred_open_auth_subscribes(),
-        vec![(ChannelName::Balances, None, SubscribeParams::Balances)],
+        vec![(
+            ChannelName::Balances,
+            None,
+            SubscribeParams::Balances { snapshot: None }
+        )],
         "only the removed key's record dies"
     );
 }
 
 #[test]
-fn socket_teardown_resets_awaiting_token_refresh() {
-    // A refresh outcome landing in BackingOff has no arm to clear the flag, so the flag must
-    // die with the socket — else it suppresses every later force_refresh kick and the
+fn socket_teardown_resets_awaiting_token_refresh_and_its_pending_id() {
+    // A refresh outcome landing in BackingOff has no arm to clear the flag, so the flag and its
+    // pending id must die with the socket — else the flag suppresses every later
+    // force_refresh kick.
     let mut c = mc(WsUrl::Auth);
     c.test_set_state(ConnectionState::Resubscribing);
     c.set_awaiting_token_refresh(true);
+    c.pending_reactive_token_refresh_id = Some(1);
     c.handle_event(FsmEvent::WireCloseReceived {
         code: 1006,
         reason: None,
@@ -372,6 +424,19 @@ fn socket_teardown_resets_awaiting_token_refresh() {
         !c.awaiting_token_refresh(),
         "the refresh-in-flight flag dies on the socket-teardown edge"
     );
+    assert_eq!(c.pending_reactive_token_refresh_id(), None);
+}
+
+#[test]
+fn matching_refresh_completion_clears_connection_owned_id() {
+    let mut c = mc(WsUrl::Auth);
+    c.set_awaiting_token_refresh(true);
+    c.pending_reactive_token_refresh_id = Some(1);
+
+    c.complete_reactive_token_refresh(1);
+
+    assert!(!c.awaiting_token_refresh());
+    assert_eq!(c.pending_reactive_token_refresh_id(), None);
 }
 
 #[test]
@@ -380,7 +445,14 @@ fn socket_teardown_clears_deferrals() {
     use crate::types::ChannelName;
     let mut c = mc(WsUrl::Auth);
     c.test_set_state(ConnectionState::Resubscribing);
-    c.defer_open_auth_subscribe(ChannelName::Executions, None, SubscribeParams::Executions);
+    c.defer_open_auth_subscribe(
+        ChannelName::Executions,
+        None,
+        SubscribeParams::Executions {
+            snap_orders: None,
+            snap_trades: None,
+        },
+    );
     // Transient close → BackingOff teardown: the reconnect replay re-issues the
     // whole registry, so the deferral must die with the socket.
     c.handle_event(FsmEvent::WireCloseReceived {
@@ -523,6 +595,24 @@ fn happy_path_idle_to_open_public_url() {
     });
     assert_eq!(c.state(), ConnectionState::Open);
     assert_eq!(c.test_attempt_count(), 0);
+}
+
+#[test]
+fn upgrade_routes_every_url_by_its_token_requirement() {
+    for (url, expected) in [
+        (WsUrl::Public, ConnectionState::Resubscribing),
+        (WsUrl::UnifiedPublic, ConnectionState::Resubscribing),
+        (WsUrl::Auth, ConnectionState::Authenticating),
+        (WsUrl::UnifiedPrivate, ConnectionState::Authenticating),
+    ] {
+        let mut c = mc(url);
+        c.handle_event(FsmEvent::CallStartConnect { request_id: 1 });
+        c.handle_event(FsmEvent::WireUpgradeOk {
+            connection_id: Some(7),
+        });
+
+        assert_eq!(c.state(), expected, "{url:?} post-upgrade state");
+    }
 }
 
 #[test]
@@ -867,8 +957,8 @@ async fn force_reconnect_await_resolves_via_reopened_event() {
 }
 
 /// Test correlation key — a `(channel, pair)` tuple.
-fn ack_key() -> (ChannelName, Option<Symbol>) {
-    (ChannelName::Ticker, Some(Symbol::new("BTC/USD").unwrap()))
+fn ack_key() -> (ChannelName, Option<StreamSymbol>) {
+    (ChannelName::Ticker, spot("BTC/USD"))
 }
 
 #[test]
@@ -890,7 +980,7 @@ fn arm_subscribe_ack_inserts_timer_and_seeds_attempts() {
 #[test]
 fn arm_book_reseed_snapshot_surfaces_via_next_timer_due_and_clears_on_teardown() {
     let mut c = mc(WsUrl::Public);
-    let key = (ChannelName::Book, Some(Symbol::new("BTC/USD").unwrap()));
+    let key = (ChannelName::Book, spot("BTC/USD"));
     let due = crate::types::MonotonicInstant(std::time::Duration::from_secs(5));
     c.arm_book_reseed_snapshot(key.0, key.1.clone(), due);
     let (next_due, ev) = c.next_timer_due().expect("reseed timer armed");
@@ -961,6 +1051,7 @@ async fn non_transient_subscribe_failed_emits_SubscriptionTerminatedEvent() {
         error: crate::conn::SubscribeErrorKind::SubscribeRejected {
             kraken_code: "EOrder:Invalid market".into(),
             transient: false,
+            ack: Default::default(),
         },
     });
     // Per-entry only: the connection survives — and since this was the LAST pending entry, the
@@ -1057,7 +1148,7 @@ fn open_subscribe_budget_exhaustion_drains_pending_and_backs_off() {
     });
     let sub = ack_key();
     c.subscribe_ack_attempts.insert(sub.clone(), 1);
-    c.handle_subscribe_failure(sub.0, sub.1.clone(), true, None);
+    c.handle_subscribe_failure(sub.0, sub.1.clone(), true, None, &Default::default());
 
     assert_eq!(c.state(), ConnectionState::BackingOff);
     assert!(c.socket.is_none());
@@ -1087,7 +1178,7 @@ fn authenticating_subscribe_budget_exhaustion_drains_pending_bare_order() {
     });
     let sub = ack_key();
     c.subscribe_ack_attempts.insert(sub.clone(), 1);
-    c.handle_subscribe_failure(sub.0, sub.1.clone(), true, None);
+    c.handle_subscribe_failure(sub.0, sub.1.clone(), true, None, &Default::default());
 
     assert_eq!(c.state(), ConnectionState::BackingOff);
     match rx.try_recv() {
@@ -1137,7 +1228,7 @@ fn replay_arms_one_timer_per_composed_frame_and_drains_to_open() {
         SubscriptionEntry::new(
             WsUrl::Public,
             ChannelName::Ticker,
-            Some(Symbol::new("BTC/USD").unwrap()),
+            spot("BTC/USD"),
             SubscribeParams::Ticker {
                 snapshot: None,
                 event_trigger: None,
@@ -1150,7 +1241,7 @@ fn replay_arms_one_timer_per_composed_frame_and_drains_to_open() {
         SubscriptionEntry::new(
             WsUrl::Public,
             ChannelName::Ticker,
-            Some(Symbol::new("ETH/USD").unwrap()),
+            spot("ETH/USD"),
             SubscribeParams::Ticker {
                 snapshot: None,
                 event_trigger: None,
@@ -1163,7 +1254,7 @@ fn replay_arms_one_timer_per_composed_frame_and_drains_to_open() {
         SubscriptionEntry::new(
             WsUrl::Public,
             ChannelName::Book,
-            Some(Symbol::new("BTC/USD").unwrap()),
+            spot("BTC/USD"),
             SubscribeParams::Book {
                 depth: crate::types::BookDepth::D10,
             },
@@ -1182,7 +1273,7 @@ fn replay_arms_one_timer_per_composed_frame_and_drains_to_open() {
     let frames = reg.compose_subscribe_frames_for_url(WsUrl::Public);
     assert_eq!(frames.len(), 4, "all 4 public entries composed");
     let due = crate::types::MonotonicInstant(std::time::Duration::from_secs(5));
-    let keys: Vec<(ChannelName, Option<Symbol>)> = frames
+    let keys: Vec<(ChannelName, Option<StreamSymbol>)> = frames
         .iter()
         .map(|(ch, pair, _)| (*ch, pair.clone()))
         .collect();
@@ -1236,6 +1327,453 @@ fn has_been_open_false_until_first_open_then_sticky() {
 }
 
 #[test]
+fn only_channel_wide_subscribes_are_recorded_as_written() {
+    let mut c = mc(WsUrl::UnifiedPrivate);
+    let symbol = Some(StreamSymbol::Futures("PI_XBTUSD".to_owned()));
+
+    c.note_snapshot_opt_out_written(ChannelName::Ticker, std::slice::from_ref(&symbol));
+    c.note_snapshot_opt_out_written(ChannelName::Executions, &[None]);
+
+    assert_eq!(
+        c.take_snapshot_opt_out_written(),
+        std::collections::HashSet::from([ChannelName::Executions]),
+        "a per-symbol subscribe has no opt-out to drop and must not be retained"
+    );
+    assert!(c.take_snapshot_opt_out_written().is_empty());
+}
+
+#[test]
+fn the_initial_replay_filter_applies_only_to_a_tokenless_connection_that_never_opened() {
+    let pair = [Some(StreamSymbol::Futures("PI_XBTUSD".to_owned()))];
+    // (url, has_been_open, filtered)
+    for (url, opened, filtered) in [
+        (WsUrl::Public, false, true),
+        (WsUrl::UnifiedPublic, false, true),
+        (WsUrl::Public, true, false),
+        (WsUrl::UnifiedPublic, true, false),
+        (WsUrl::Auth, false, false),
+        (WsUrl::UnifiedPrivate, false, false),
+    ] {
+        let mut c = mc(url);
+        c.mark_initial_subscribe_replay(ChannelName::Ticker, &pair);
+        c.test_set_has_been_open(opened);
+        assert_eq!(
+            c.initial_replay_filter().is_some(),
+            filtered,
+            "{url:?} opened={opened}"
+        );
+    }
+    let mut c = mc(WsUrl::Public);
+    c.mark_initial_subscribe_replay(ChannelName::Ticker, &pair);
+    assert_eq!(
+        c.initial_replay_filter(),
+        Some(&std::collections::HashSet::from([(
+            ChannelName::Ticker,
+            pair[0].clone()
+        )]))
+    );
+}
+
+#[test]
+fn only_a_tokenless_connection_marks_initial_replay() {
+    let pair = [Some(StreamSymbol::Futures("PI_XBTUSD".to_owned()))];
+    // (url, marked)
+    for (url, marked) in [
+        (WsUrl::Public, true),
+        (WsUrl::UnifiedPublic, true),
+        (WsUrl::Auth, false),
+        (WsUrl::UnifiedPrivate, false),
+    ] {
+        let mut c = mc(url);
+        c.mark_initial_subscribe_replay(ChannelName::Ticker, &pair);
+        assert_eq!(c.needs_initial_subscribe_replay(), marked, "{url:?}");
+        c.clear_initial_subscribe_replay(ChannelName::Ticker, &pair);
+        assert!(!c.needs_initial_subscribe_replay(), "{url:?}");
+    }
+}
+
+#[test]
+fn initial_replay_markers_track_partial_handoff() {
+    let mut c = mc(WsUrl::UnifiedPublic);
+    let ticker_pairs = [
+        Some(StreamSymbol::Futures("PI_XBTUSD".to_owned())),
+        Some(StreamSymbol::Futures("PF_ETHUSD".to_owned())),
+    ];
+    let book_pair = Some(StreamSymbol::Futures("PI_XBTUSD".to_owned()));
+
+    // The initial multi-batch registration marks all groups before sending.
+    c.mark_initial_subscribe_replay(ChannelName::Ticker, &ticker_pairs);
+    c.mark_initial_subscribe_replay(ChannelName::Book, std::slice::from_ref(&book_pair));
+    assert_eq!(c.initial_subscribe_replay_keys().len(), 3);
+
+    // A first replay batch handed to the writer clears only its own entries.
+    c.clear_initial_subscribe_replay(ChannelName::Ticker, &ticker_pairs);
+    assert_eq!(
+        c.initial_subscribe_replay_keys(),
+        &std::collections::HashSet::from([(ChannelName::Book, book_pair.clone())]),
+        "a later failed replay batch remains eligible"
+    );
+
+    // The marker belongs to the subscription lifetime, not the connection:
+    // tombstoning/deregistering it prevents a stale replay.
+    c.clear_initial_subscribe_replay(ChannelName::Book, std::slice::from_ref(&book_pair));
+    assert!(!c.needs_initial_subscribe_replay());
+}
+
+#[test]
+fn unified_public_ack_timeout_publishes_futures_subscribe_failed() {
+    let mut c = mc(WsUrl::UnifiedPublic);
+    c.test_set_state(ConnectionState::Open);
+    let pair = Some(StreamSymbol::Futures("PI_XBTUSD".to_owned()));
+    c.handle_event(FsmEvent::TimerSubscribeAckTimeout {
+        channel: ChannelName::Ticker,
+        pair,
+    });
+    let events = c.test_bus().test_drain_published();
+    assert!(events.iter().any(|event| matches!(
+        event.payload,
+        crate::dispatch::EventPayload::FuturesSubscribeFailedEvent {
+            channel: ChannelName::Ticker,
+            symbol: Some(ref symbol),
+            interval: None,
+            tick_type: None,
+            attempt: 1,
+            error_class: crate::dispatch::FuturesSubscribeFailureClass::Transient,
+            error: None,
+            ref ack,
+        } if symbol == "PI_XBTUSD" && *ack == crate::dispatch::FuturesSubscribeAck::default()
+    )));
+}
+
+#[test]
+fn unified_private_ack_timeout_publishes_futures_subscribe_failed() {
+    let mut c = mc(WsUrl::UnifiedPrivate);
+    c.test_set_state(ConnectionState::Open);
+    c.handle_event(FsmEvent::TimerSubscribeAckTimeout {
+        channel: ChannelName::Executions,
+        pair: None,
+    });
+    let events = c.test_bus().test_drain_published();
+    assert!(events.iter().any(|event| matches!(
+        event.payload,
+        crate::dispatch::EventPayload::FuturesSubscribeFailedEvent {
+            channel: ChannelName::Executions,
+            symbol: None,
+            interval: None,
+            tick_type: None,
+            attempt: 1,
+            error_class: crate::dispatch::FuturesSubscribeFailureClass::Transient,
+            error: None,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn unified_ohlc_lifecycle_events_carry_interval_and_tick_type() {
+    use crate::dispatch::{EventPayload, EventType};
+    use crate::types::{FuturesOhlcTickType, OhlcInterval};
+
+    let mut c = mc(WsUrl::UnifiedPublic);
+    c.test_set_state(ConnectionState::Open);
+    let pair = Some(StreamSymbol::futures_ohlc(
+        "PF_XBTUSD".to_owned(),
+        OhlcInterval::M5,
+        Some(FuturesOhlcTickType::Mark),
+    ));
+    c.emit_futures_subscribed(ChannelName::Ohlc, &pair, &Default::default());
+    c.arm_subscribe_ack(
+        ChannelName::Ohlc,
+        pair.clone(),
+        crate::types::MonotonicInstant(std::time::Duration::from_secs(5)),
+    );
+    c.handle_event(FsmEvent::WireSubscribeFailed {
+        channel: ChannelName::Ohlc,
+        pair,
+        error: crate::conn::SubscribeErrorKind::SubscribeRejected {
+            kraken_code: "Unknown symbol: PF_XBTUSD".into(),
+            transient: false,
+            ack: Default::default(),
+        },
+    });
+
+    let identities: Vec<_> = c
+        .test_bus()
+        .test_drain_published()
+        .into_iter()
+        .filter_map(|event| match event.payload {
+            EventPayload::FuturesSubscribedEvent {
+                symbol,
+                interval,
+                tick_type,
+                ..
+            }
+            | EventPayload::FuturesSubscribeFailedEvent {
+                symbol,
+                interval,
+                tick_type,
+                ..
+            }
+            | EventPayload::FuturesSubscriptionTerminatedEvent {
+                symbol,
+                interval,
+                tick_type,
+                ..
+            } => Some((event.event_type, symbol, interval, tick_type)),
+            _ => None,
+        })
+        .collect();
+    let mark_m5 = |event_type| {
+        (
+            event_type,
+            Some("PF_XBTUSD".to_owned()),
+            Some(OhlcInterval::M5),
+            Some(FuturesOhlcTickType::Mark),
+        )
+    };
+    assert_eq!(
+        identities,
+        vec![
+            mark_m5(EventType::FuturesSubscribedEvent),
+            mark_m5(EventType::FuturesSubscribeFailedEvent),
+            mark_m5(EventType::FuturesSubscriptionTerminatedEvent),
+        ]
+    );
+}
+
+#[test]
+fn unified_private_acks_publish_futures_subscribed_but_spot_auth_does_not() {
+    let c = mc(WsUrl::UnifiedPrivate);
+    c.emit_futures_subscribed(ChannelName::Balances, &None, &Default::default());
+    assert!(
+        c.test_bus()
+            .test_drain_published()
+            .iter()
+            .any(|event| matches!(
+                event.payload,
+                crate::dispatch::EventPayload::FuturesSubscribedEvent {
+                    channel: ChannelName::Balances,
+                    symbol: None,
+                    ..
+                }
+            ))
+    );
+
+    let spot = mc(WsUrl::Auth);
+    spot.emit_futures_subscribed(ChannelName::Balances, &None, &Default::default());
+    assert!(spot.test_bus().test_drain_published().is_empty());
+}
+
+#[test]
+fn unified_private_non_transient_reject_terminates_with_the_futures_event_only() {
+    let mut c = mc(WsUrl::UnifiedPrivate);
+    c.test_set_state(ConnectionState::Open);
+    c.arm_subscribe_ack(
+        ChannelName::Executions,
+        None,
+        crate::types::MonotonicInstant(std::time::Duration::from_secs(5)),
+    );
+    c.handle_event(FsmEvent::WireSubscribeFailed {
+        channel: ChannelName::Executions,
+        pair: None,
+        error: crate::conn::SubscribeErrorKind::SubscribeRejected {
+            kraken_code: "Missing 'params.asset_class'".into(),
+            transient: false,
+            ack: Default::default(),
+        },
+    });
+    let events = c.test_bus().test_drain_published();
+    assert!(events.iter().any(|event| matches!(
+        event.payload,
+        crate::dispatch::EventPayload::FuturesSubscriptionTerminatedEvent {
+            channel: ChannelName::Executions,
+            symbol: None,
+            cause: crate::api::subscription::TerminationCause::NonTransientWireRejection,
+            ..
+        }
+    )));
+    assert!(
+        !events.iter().any(
+            |event| event.event_type == crate::dispatch::EventType::SubscriptionTerminatedEvent
+        ),
+        "a Futures private rejection must not look like a Spot termination: {events:?}"
+    );
+}
+
+#[test]
+fn a_socket_lost_in_first_resubscribing_flags_pre_open_replay_only_without_a_token() {
+    let close_events = || {
+        [
+            FsmEvent::WireAbnormalClose {
+                error: crate::transport::TransportError {
+                    kind: crate::transport::TransportErrorKind::SocketReset,
+                    transient: true,
+                },
+            },
+            FsmEvent::WireCloseReceived {
+                code: 1006,
+                reason: None,
+            },
+            FsmEvent::TimerStalenessElapsed,
+        ]
+    };
+    // (url, flagged)
+    for (url, flagged) in [
+        (WsUrl::Public, true),
+        (WsUrl::UnifiedPublic, true),
+        (WsUrl::Auth, false),
+        (WsUrl::UnifiedPrivate, false),
+    ] {
+        for event in close_events() {
+            let mut c = mc(url);
+            c.test_set_state(ConnectionState::Resubscribing);
+            c.handle_event(event);
+            assert_eq!(c.state(), ConnectionState::BackingOff, "{url:?}");
+            assert_eq!(c.take_pre_open_subscribe_lost(), flagged, "{url:?}");
+        }
+    }
+}
+
+#[test]
+fn unified_upgrade_failure_before_open_drops_the_dead_sockets_ack_timers() {
+    let mut c = mc(WsUrl::UnifiedPublic);
+    c.test_set_state(ConnectionState::Connecting);
+    let pair = Some(StreamSymbol::Futures("PI_XBTUSD".to_owned()));
+    c.arm_subscribe_ack(
+        ChannelName::Ticker,
+        pair.clone(),
+        crate::types::MonotonicInstant(std::time::Duration::from_secs(5)),
+    );
+    assert!(c.is_subscribe_ack_armed(ChannelName::Ticker, pair.clone()));
+
+    c.handle_event(FsmEvent::WireUpgradeFailed { http_status: 503 });
+
+    assert_eq!(c.state(), ConnectionState::BackingOff);
+    assert!(c.take_pre_open_subscribe_lost());
+    assert!(!c.is_subscribe_ack_armed(ChannelName::Ticker, pair));
+}
+
+#[test]
+fn replay_after_a_pre_open_loss_marks_every_entry_and_demotes_acked_ones_to_pending() {
+    let mut reg = SubscriptionRegistry::new();
+    let mut c = mc(WsUrl::UnifiedPublic);
+    let ticker = Some(StreamSymbol::Futures("PI_XBTUSD".to_owned()));
+    let trade = Some(StreamSymbol::Futures("PF_ETHUSD".to_owned()));
+    let now = crate::types::MonotonicInstant::now();
+    reg.register(
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPublic,
+            ChannelName::Ticker,
+            ticker.clone(),
+            SubscribeParams::Ticker {
+                snapshot: None,
+                event_trigger: None,
+            },
+        ),
+        now,
+        false,
+    );
+    reg.register(
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPublic,
+            ChannelName::Trade,
+            trade.clone(),
+            SubscribeParams::Trade { snapshot: None },
+        ),
+        now,
+        false,
+    );
+    assert!(reg.note_acked_for(WsUrl::UnifiedPublic, ChannelName::Ticker, &ticker, now));
+
+    reg.mark_pending_entries_for_initial_replay(WsUrl::UnifiedPublic, &mut c);
+
+    assert_eq!(
+        c.initial_subscribe_replay_keys(),
+        &std::collections::HashSet::from([
+            (ChannelName::Ticker, ticker.clone()),
+            (ChannelName::Trade, trade),
+        ])
+    );
+    assert!(
+        reg.note_acked_for(WsUrl::UnifiedPublic, ChannelName::Ticker, &ticker, now),
+        "the entry acked on the dead socket is Pending again"
+    );
+}
+
+#[test]
+fn late_unified_book_ack_cancels_the_raw_only_resend() {
+    let mut c = mc(WsUrl::UnifiedPublic);
+    c.test_set_state(ConnectionState::Open);
+    let pair = Some(StreamSymbol::Futures("PI_XBTUSD".to_owned()));
+    c.handle_event(FsmEvent::TimerSubscribeAckTimeout {
+        channel: ChannelName::BookRaw,
+        pair: pair.clone(),
+    });
+    let raw_key = (ChannelName::BookRaw, pair.clone());
+    assert!(
+        c.timers
+            .per_entry_subscribe_resend_due
+            .contains_key(&raw_key)
+    );
+
+    c.handle_event(FsmEvent::WireSubscribeAck {
+        last: false,
+        channel: ChannelName::Book,
+        pair,
+    });
+    assert!(
+        !c.timers
+            .per_entry_subscribe_resend_due
+            .contains_key(&raw_key)
+    );
+}
+
+#[test]
+fn replayed_frame_cancels_a_pre_upgrade_resend_but_keeps_the_budget() {
+    let mut c = mc(WsUrl::UnifiedPublic);
+    let pair = Some(StreamSymbol::Futures("PI_XBTUSD".to_owned()));
+    c.handle_subscribe_failure(
+        ChannelName::Ticker,
+        pair.clone(),
+        true,
+        None,
+        &Default::default(),
+    );
+    let key = (ChannelName::Ticker, pair.clone());
+    assert!(c.timers.per_entry_subscribe_resend_due.contains_key(&key));
+    let budget = c.subscribe_ack_attempts.get(&key).copied();
+
+    c.cancel_subscribe_resend(ChannelName::Ticker, &pair);
+    assert!(!c.timers.per_entry_subscribe_resend_due.contains_key(&key));
+    assert_eq!(c.subscribe_ack_attempts.get(&key).copied(), budget);
+}
+
+#[test]
+fn handoff_subscribe_inflight_moves_req_id_timer_and_replay_to_the_peer() {
+    let mut c = mc(WsUrl::UnifiedPublic);
+    let pair = Some(StreamSymbol::Futures("PI_XBTUSD".to_owned()));
+    c.record_subscribe_req_id(7, ChannelName::Book, pair.clone());
+    c.arm_subscribe_ack(
+        ChannelName::Book,
+        pair.clone(),
+        crate::types::MonotonicInstant(std::time::Duration::from_secs(5)),
+    );
+    c.mark_initial_subscribe_replay(ChannelName::Book, std::slice::from_ref(&pair));
+
+    assert!(c.handoff_subscribe_inflight(ChannelName::Book, ChannelName::BookRaw, pair.clone()));
+    assert_eq!(
+        c.resolve_subscribe_req_id(7),
+        Some(Arc::new(vec![(ChannelName::BookRaw, pair.clone())]))
+    );
+    assert!(!c.is_subscribe_ack_armed(ChannelName::Book, pair.clone()));
+    assert!(c.is_subscribe_ack_armed(ChannelName::BookRaw, pair.clone()));
+    assert_eq!(
+        c.initial_subscribe_replay_keys(),
+        &std::collections::HashSet::from([(ChannelName::BookRaw, pair)])
+    );
+}
+
+#[test]
 fn empty_reconnect_short_circuits_resubscribing_to_open() {
     // Liveness: a reconnect with zero subscriptions composes 0 frames → 0 ack timers → no
     // last-ack transition.
@@ -1260,11 +1798,7 @@ fn complete_resubscribe_if_empty_is_noop_with_pending_timers() {
     let mut c = mc(WsUrl::Public);
     c.test_set_state(ConnectionState::Resubscribing);
     let due = crate::types::MonotonicInstant(std::time::Duration::from_secs(5));
-    c.arm_subscribe_ack(
-        ChannelName::Ticker,
-        Some(Symbol::new("BTC/USD").unwrap()),
-        due,
-    );
+    c.arm_subscribe_ack(ChannelName::Ticker, spot("BTC/USD"), due);
     c.complete_resubscribe_if_empty();
     assert_eq!(
         c.state(),
@@ -1281,7 +1815,7 @@ fn complete_resubscribe_if_empty_is_noop_with_pending_resend_timer() {
     c.test_set_state(ConnectionState::Resubscribing);
     let sub = ack_key();
     c.subscribe_ack_attempts.insert(sub.clone(), 2);
-    c.handle_subscribe_failure(sub.0, sub.1.clone(), true, None);
+    c.handle_subscribe_failure(sub.0, sub.1.clone(), true, None, &Default::default());
     assert_eq!(
         c.pending_subscribe_ack_count(),
         0,
@@ -1846,6 +2380,11 @@ async fn reconnect_cap_escalation_emits_connection_failed_event() {
         .await
         .expect("ConnectionFailedEvent not delivered")
         .expect("oneshot sender dropped");
+    assert_eq!(
+        caller_error_for_failure(std::slice::from_ref(&env)).kind(),
+        crate::error::ConnectionErrorKind::NotOpen,
+        "the reconnect cap reaches a caller as NotOpen, like the auth-handshake cap"
+    );
     match env.payload {
         EventPayload::ConnectionFailedEvent {
             non_transient_class,
@@ -2728,6 +3267,20 @@ fn authenticating_bus_token_refresh_failed_drains_pending_request() {
 
     let events = c.test_bus().test_drain_published();
     assert_ws_request_failed_published(&events, 7);
+    let caller = caller_error_for_failure(&events);
+    assert_eq!(
+        caller.kind(),
+        crate::error::ConnectionErrorKind::AuthenticationFailed
+    );
+    assert_eq!(
+        caller.authentication_failure(),
+        Some(
+            crate::auth::AuthError::TokenRefreshFailed
+                .to_string()
+                .as_str()
+        ),
+        "the refresh failure reaches a caller without the event's internal prefix"
+    );
 
     assert_pending_drained_err(&mut rx);
 
@@ -3113,5 +3666,93 @@ fn connecting_exit_clears_upgrade_timeout_table() {
                 "{label}: close-handshake timeout armed on Closing entry"
             );
         }
+    }
+}
+
+#[test]
+fn subscribe_reject_while_connecting_terminates_only_on_tokenless_urls() {
+    for url in [
+        WsUrl::Public,
+        WsUrl::UnifiedPublic,
+        WsUrl::Auth,
+        WsUrl::UnifiedPrivate,
+    ] {
+        let mut c = mc(url);
+        c.test_set_state(ConnectionState::Connecting);
+        let sub = ack_key();
+        c.arm_subscribe_ack(
+            sub.0,
+            sub.1.clone(),
+            crate::types::MonotonicInstant(std::time::Duration::from_secs(5)),
+        );
+        let _ = c.test_bus().test_drain_published();
+        c.handle_event(FsmEvent::WireSubscribeFailed {
+            channel: sub.0,
+            pair: sub.1.clone(),
+            error: crate::conn::SubscribeErrorKind::SubscribeRejected {
+                kraken_code: "Currency pair not supported BTC/USD".into(),
+                transient: false,
+                ack: Default::default(),
+            },
+        });
+        let terminated: Vec<_> = c
+            .test_bus()
+            .test_drain_published()
+            .iter()
+            .filter(|env| {
+                matches!(
+                    env.event_type,
+                    crate::dispatch::EventType::SubscriptionTerminatedEvent
+                        | crate::dispatch::EventType::FuturesSubscriptionTerminatedEvent
+                )
+            })
+            .map(|env| (env.event_type, env.event_version))
+            .collect();
+        let expected = match url {
+            WsUrl::Public => vec![(crate::dispatch::EventType::SubscriptionTerminatedEvent, 2)],
+            WsUrl::UnifiedPublic => {
+                vec![(
+                    crate::dispatch::EventType::FuturesSubscriptionTerminatedEvent,
+                    1,
+                )]
+            }
+            WsUrl::Auth | WsUrl::UnifiedPrivate => Vec::new(),
+        };
+        let tokenless = matches!(url, WsUrl::Public | WsUrl::UnifiedPublic);
+        assert_eq!(c.state(), ConnectionState::Connecting, "{url:?}");
+        assert_eq!(terminated, expected, "{url:?}");
+        assert_eq!(
+            c.is_subscribe_ack_armed(sub.0, sub.1.clone()),
+            !tokenless,
+            "{url:?}"
+        );
+    }
+}
+
+#[test]
+fn subscribe_budget_exhausted_while_connecting_disarms_upgrade_timeout() {
+    for url in [WsUrl::Public, WsUrl::UnifiedPublic] {
+        let mut c = mc_with_knobs_clock_jitter(
+            url,
+            crate::build::knobs::Knobs::defaults(),
+            100,
+            test_jitter(),
+        );
+        c.handle_event(FsmEvent::CallStartConnect { request_id: 1 });
+        assert!(c.timers.upgrade_timeout_due_at.is_some(), "{url:?}");
+        let sub = ack_key();
+        for _ in 0..3 {
+            c.handle_event(FsmEvent::WireSubscribeFailed {
+                channel: sub.0,
+                pair: sub.1.clone(),
+                error: crate::conn::SubscribeErrorKind::SubscribeRejected {
+                    kraken_code: "EGeneral:Too many requests".into(),
+                    transient: true,
+                    ack: Default::default(),
+                },
+            });
+        }
+        assert_eq!(c.state(), ConnectionState::BackingOff, "{url:?}");
+        assert_eq!(c.timers.upgrade_timeout_due_at, None, "{url:?}");
     }
 }

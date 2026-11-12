@@ -35,6 +35,7 @@ authenticated streams as noted.
 | `shorthand_orders` | creds | `market_buy/sell`, `limit_buy/sell`, `stop_loss_*` shorthands. |
 | `advanced_orders` | creds | Generic `order(req)`, conditional close, order flags, amend. |
 | `batch_orders` | creds | Placing and cancelling orders in batches. |
+| `futures_orders` | creds | Futures order entry over the Unified private WebSocket: dry runs, then rest, amend and cancel. |
 | `cleanup_orders` | creds | Cancel resting orders (a handy account-reset utility). |
 
 ## Streaming (WebSocket)
@@ -44,6 +45,7 @@ authenticated streams as noted.
 | `live_streams` | public | Multiple public channels at once, including a Bbo-triggered ticker. |
 | `live_book` | public | The maintained, CRC-validated order book (`on_book`). |
 | `account_streams` | creds | Authenticated executions / balances streams. |
+| `futures_streams` | public; creds optional | Futures ticker, maintained book and system status; with creds also executions, positions and balances. |
 
 ## Putting it together
 

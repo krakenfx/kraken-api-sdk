@@ -13,12 +13,12 @@ use crate::transport::{TransportError, TransportErrorKind};
 /// SDK User-Agent token — always on the wire (alone, or appended after the app token).
 pub(crate) const SDK_USER_AGENT: &str = concat!("kraken-sdk-rust/", env!("CARGO_PKG_VERSION"));
 
-/// Attribution header, always on the wire and reserved against `with_headers`.
+/// Attribution header, reserved against `with_headers`.
 /// Packed korigin (radix-32): channel 3=REST / 4=WS, interface ID 17.
 pub(crate) const SDK_KORIGIN_HEADER: &str = "x-korigin";
 /// `x-korigin` value for REST requests (Channel = REST API).
 pub(crate) const SDK_KORIGIN_REST: &str = "12003";
-/// `x-korigin` value for the WS upgrade requests (Channel = WebSocket).
+/// `x-korigin` value for WS upgrades that carry it (Channel = WebSocket; see `WsUrl::sends_korigin`).
 pub(crate) const SDK_KORIGIN_WS: &str = "12004";
 
 /// REST transport interface (`async_trait` for dyn-safety). Invoked via `RestSurface`.
@@ -60,7 +60,12 @@ impl ReqwestHttpTransport {
 
     /// Custom base URL and per-request timeout (baked into the reqwest client).
     pub fn with_base_url_and_timeout(base_url: impl Into<String>, timeout: Duration) -> Self {
-        Self::with_headers(base_url, timeout, &reqwest::header::HeaderMap::new())
+        Self::with_headers(
+            base_url,
+            timeout,
+            &reqwest::header::HeaderMap::new(),
+            &crate::transport::tls::default_client_config(),
+        )
     }
 
     /// Extra default headers (embedding identity). App `user-agent` gets
@@ -69,6 +74,7 @@ impl ReqwestHttpTransport {
         base_url: impl Into<String>,
         timeout: Duration,
         headers: &reqwest::header::HeaderMap,
+        tls: &rustls::ClientConfig,
     ) -> Self {
         // Bound connect separately so a connect/TLS stall isn't mislabeled sent-ambiguous.
         let connect_timeout = std::cmp::min(timeout, Duration::from_secs(10));
@@ -81,9 +87,11 @@ impl ReqwestHttpTransport {
             HeaderValue::from_static(SDK_KORIGIN_REST),
         );
         let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls.clone())
             .timeout(timeout)
             .connect_timeout(connect_timeout)
             .default_headers(defaults)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest::Client::build() — invariant: rustls feature available");
         Self {
@@ -274,11 +282,12 @@ mod tests {
         }
     }
 
-    /// Identity headers and composed UA reach the wire.
-    #[tokio::test]
-    async fn with_headers_stamps_identity_headers_on_the_wire() {
-        use super::ReqwestHttpTransport;
-        use crate::transport::HttpTransport;
+    const OK_EMPTY_JSON: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                 content-length: 2\r\nconnection: close\r\n\r\n{}";
+
+    async fn serve_once(
+        response: String,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -294,12 +303,20 @@ mod tests {
                     break;
                 }
             }
-            let resp = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
-                        content-length: 2\r\nconnection: close\r\n\r\n{}";
-            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.write_all(response.as_bytes()).await.unwrap();
             sock.shutdown().await.unwrap();
             String::from_utf8_lossy(&head).to_lowercase()
         });
+        (addr, server)
+    }
+
+    /// Identity headers and composed UA reach the wire.
+    #[tokio::test]
+    async fn with_headers_stamps_identity_headers_on_the_wire() {
+        use super::ReqwestHttpTransport;
+        use crate::transport::HttpTransport;
+
+        let (addr, server) = serve_once(OK_EMPTY_JSON.to_owned()).await;
 
         let mut headers = HeaderMap::new();
         headers.insert("x-kraken-client", HeaderValue::from_static("kraken-cli"));
@@ -311,6 +328,7 @@ mod tests {
             format!("http://{addr}"),
             std::time::Duration::from_secs(5),
             &headers,
+            &crate::transport::tls::default_client_config(),
         );
         transport.get_json("/0/public/Time", &[]).await.unwrap();
 
@@ -319,6 +337,38 @@ mod tests {
         let want_ua = format!("user-agent: kraken-cli/0.2.0 {SDK_USER_AGENT}").to_lowercase();
         assert!(head.contains(&want_ua), "{head}");
         assert!(head.contains("x-korigin: 12003"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn signed_post_does_not_follow_a_redirect() {
+        use super::ReqwestHttpTransport;
+        use crate::transport::{HttpTransport, TransportError};
+
+        let (target, _) = serve_once(OK_EMPTY_JSON.to_owned()).await;
+        let (origin, server) = serve_once(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{target}/0/private/Balance\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n"
+        ))
+        .await;
+        let transport = ReqwestHttpTransport::with_base_url_and_timeout(
+            format!("http://{origin}"),
+            std::time::Duration::from_secs(5),
+        );
+        let result = transport
+            .post_form_signed("/0/private/Balance", "nonce=1", "key", "sign")
+            .await;
+
+        server.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(TransportError {
+                    kind: TransportErrorKind::HttpStatus { status: 307 },
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     /// x-korigin: Channel 3/4, Interface 17, other dimensions zero.

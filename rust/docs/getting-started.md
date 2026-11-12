@@ -2,16 +2,17 @@
 
 ## Installation
 
-Add the crate to `Cargo.toml`:
+Depend on the tagged release:
 
 ```toml
 [dependencies]
-kraken-sdk = "0.1.0"
+kraken-sdk = { git = "https://github.com/krakenfx/kraken-api-sdk", tag = "v0.2.0" }
 tokio = { version = "1", features = ["full"] }
 rust_decimal = "1"
+anyhow = "1"
 ```
 
-Requires Rust 1.85 or later (edition 2024) and the tokio async runtime.
+Requires Rust 1.88 or later (edition 2024) and the tokio async runtime.
 
 ## Create a client
 
@@ -122,9 +123,11 @@ async fn main() -> anyhow::Result<()> {
 
 Authenticate, balance, WS ticker, and a validate-mode order: [`examples/quickstart.rs`](../examples/quickstart.rs).
 
+Futures streams (ticker, book, account channels) work the same way: [Futures streams](guides/streaming.md#futures-streams) and [`examples/futures_streams.rs`](../examples/futures_streams.rs).
+
 ## Shutdown
 
-Dropping `Client` aborts the reactor. For a drain of in-flight WebSocket requests, a clean socket close, and a best-effort dead-man disarm over REST, call `client.close()`. It consumes the client.
+Dropping `Client` aborts the reactor. For a drain of in-flight WebSocket requests, a clean socket close, and a best-effort disarm for each product on which this client requested a dead-man arm, call `client.close()`. The Spot disarm is a REST call; the Futures disarm goes over the Unified private socket. A client that never requested an arm sends no disarm, and a client without credentials sends no Spot disarm. Neither disarm is awaited. `close()` consumes the client.
 
 ```rust
 client.close().await?;

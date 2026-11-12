@@ -12,14 +12,14 @@ use crate::api::ws_surface::WsSurface;
 use crate::dispatch::dispatch_table::Product;
 use crate::dispatch::{Op, Transport};
 use crate::rest::RestSurface;
-use crate::types::ClOrdId;
+use crate::types::{ClOrdId, WsUrl};
 
 use super::error::TradeError;
 
 /// Boxed future produced by a per-op executor closure.
 pub(super) type ExecFut<Resp> = Pin<Box<dyn Future<Output = Result<Resp, TradeError>> + Send>>;
 
-/// WS-branch context an executor needs when the resolved transport is `WsV2Auth`.
+/// WS-branch context an executor needs when the resolved transport is a private WS leg.
 pub(super) struct WsOrderCtx {
     /// The internal WS facade (`send_request` / `next_req_id`). `None` when no
     /// WS surface was wired at construction.
@@ -28,11 +28,22 @@ pub(super) struct WsOrderCtx {
     pub system_status: SystemStatus,
     /// The dispatch op for this order; the REST arm resolves it to the endpoint.
     pub op: Op,
+    /// Product the order belongs to; selects the private connection it is sent on.
+    pub product: Product,
     /// Frozen dispatch table — resolves the REST endpoint + auth for this op.
     pub dispatch: Arc<crate::dispatch::dispatch_table::DispatchTable>,
     /// Per-request WS order-response deadline from the
     /// `ws_order_response_deadline_ms` knob; `None` = unbounded.
     pub order_deadline: Option<std::time::Duration>,
+    /// Futures placement slots from the `futures_max_in_flight` knob; `None` = unlimited.
+    pub futures_in_flight: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+impl WsOrderCtx {
+    /// Private connection this order is sent on.
+    pub fn url(&self) -> WsUrl {
+        self.product.order_ws_url()
+    }
 }
 
 /// Per-op executor: consumes the request + owned `Arc<RestSurface>` + resolved
@@ -51,30 +62,35 @@ pub struct PendingTrade<Req, Resp> {
     rest: Arc<RestSurface>,
     ws: Option<Arc<WsSurface>>,
     system_status: SystemStatus,
+    futures_in_flight: Option<Arc<tokio::sync::Semaphore>>,
     /// Snapshot of the session-wide `prefer_rest_for_orders` knob at method-call
     /// time. `false` (default) resolves orders to `WsV2Auth`; `true` forces REST.
     /// A caller overrides per-call via `.via(...)`.
     prefer_rest_for_orders: bool,
     op: Op,
+    product: Product,
     dispatch: Arc<crate::dispatch::dispatch_table::DispatchTable>,
     exec: ExecFn<Req, Resp>,
-    /// `Some` for `order_buy`/`order_sell` (synchronously allocated), the input
-    /// id for `cancel`/`order_amend`, `None` for `cancel_all`/deadman.
+    /// `Some` for the shorthands and `order` (synchronously allocated), the input
+    /// id for `cancel`/`order_amend` by `cl_ord_id`, `None` for `cancel_all`, deadman, the
+    /// batch methods and a Futures `cancel`/`order_amend` by order id.
     cl_ord_id: Option<ClOrdId>,
     _resp: PhantomData<Resp>,
 }
 
 impl<Req, Resp> PendingTrade<Req, Resp> {
-    /// Internal constructor — used only by [`super::TradeNamespace`].
+    /// Internal constructor — used only by `TradeCore::make_pending`, for Spot and Futures.
     #[allow(clippy::too_many_arguments)] // internal constructor; args mirror the
-    // per-op call context (req + 3 shared Arcs + status + knobs + op + id + exec).
+    // per-op call context.
     pub(super) fn new(
         req: Req,
         rest: Arc<RestSurface>,
         ws: Option<Arc<WsSurface>>,
         system_status: SystemStatus,
         knobs: Arc<crate::build::knobs::Knobs>,
+        futures_in_flight: Option<Arc<tokio::sync::Semaphore>>,
         op: Op,
+        product: Product,
         dispatch: Arc<crate::dispatch::dispatch_table::DispatchTable>,
         cl_ord_id: Option<ClOrdId>,
         exec: ExecFn<Req, Resp>,
@@ -88,7 +104,9 @@ impl<Req, Resp> PendingTrade<Req, Resp> {
             rest,
             ws,
             system_status,
+            futures_in_flight,
             op,
+            product,
             dispatch,
             exec,
             cl_ord_id,
@@ -107,7 +125,9 @@ impl<Req, Resp> PendingTrade<Req, Resp> {
 
     /// Read the client order id this call will send, BEFORE `.await` — lets a
     /// caller durably record it for crash-safe reconciliation. `Some` for
-    /// `order_buy`/`order_sell`/`cancel`/`order_amend`, `None` for `cancel_all`/deadman.
+    /// the shorthands, `order`, and `cancel` / `order_amend` by `cl_ord_id`; `None` for
+    /// `cancel_all`, deadman, the batch methods, and a Futures `cancel` / `order_amend` by
+    /// order id.
     pub fn cl_ord_id(&self) -> Option<&ClOrdId> {
         self.cl_ord_id.as_ref()
     }
@@ -132,14 +152,12 @@ impl<Req: Send + 'static, Resp: Send + 'static> IntoFuture for PendingTrade<Req,
     type IntoFuture = ExecFut<Resp>;
 
     fn into_future(self) -> Self::IntoFuture {
-        // Transport precedence: transport_override, else prefer_rest_for_orders ?
-        // Rest : WsV2Auth. Default knob (false) -> WsV2Auth; .via(...) overrides per-call.
-        let transport = self.transport_override.unwrap_or({
-            if self.prefer_rest_for_orders {
-                Transport::Rest
-            } else {
-                Transport::WsV2Auth
-            }
+        // Transport precedence: transport_override, else Spot's prefer_rest_for_orders ?
+        // Rest : WsV2Auth (default knob false -> WsV2Auth); Futures is always FuturesWs.
+        let transport = self.transport_override.unwrap_or(match self.product {
+            Product::Spot if self.prefer_rest_for_orders => Transport::Rest,
+            Product::Spot => Transport::WsV2Auth,
+            Product::Futures => Transport::FuturesWs,
         });
         tracing::trace!(
             target: "kraken_sdk::trade",
@@ -149,20 +167,21 @@ impl<Req: Send + 'static, Resp: Send + 'static> IntoFuture for PendingTrade<Req,
         // An explicit `.via(...)` with no dispatch entry for this op rejects
         // pre-wire. The knob default is a preference, not a selection — it
         // never rejects; a single-transport op serves its only leg.
-        if let Some(explicit) = self.transport_override {
-            if self
+        if let Some(explicit) = self.transport_override
+            && self
                 .dispatch
-                .resolve(self.op, Product::Spot, explicit)
+                .resolve(self.op, self.product, explicit)
                 .is_err()
-            {
-                let err = super::unsupported_transport(self.op, &self.dispatch, explicit);
-                return Box::pin(async move { Err(err) });
-            }
+        {
+            let err = super::unsupported_transport(self.op, self.product, &self.dispatch, explicit);
+            return Box::pin(async move { Err(err) });
         }
         let ctx = WsOrderCtx {
             ws: self.ws,
             system_status: self.system_status,
+            futures_in_flight: self.futures_in_flight,
             op: self.op,
+            product: self.product,
             dispatch: self.dispatch,
             // Treat 0 as unset (no instant-timeout footgun).
             order_deadline: self

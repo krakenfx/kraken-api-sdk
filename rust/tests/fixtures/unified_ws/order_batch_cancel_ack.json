@@ -1,0 +1,7 @@
+{
+  "method": "batch_cancel",
+  "result": {
+    "count": 2
+  },
+  "success": true
+}
