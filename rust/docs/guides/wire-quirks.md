@@ -13,9 +13,9 @@ REST and WebSocket edges the SDK absorbs. Use this when debugging a decode or co
 ```rust
 use kraken_sdk::SystemStatusUpdate;
 
-let _ss = client.market().on_system_status(|s: SystemStatusUpdate| {
+let _ss = client.market().on_system_status(|s: &SystemStatusUpdate| {
     println!("system={:?} version={:?}", s.system, s.version);
-});
+})?;
 client.ready().await?;
 ```
 
@@ -26,6 +26,28 @@ A later handler misses that frame. Kraken re-pushes status periodically. Subscri
 **Ticker numbers.** Docs say decimal-strings; live wire often uses JSON numbers. The decoder accepts both.
 
 **Book checksum.** CRC32 uses `price_wire` / `qty_wire`, not `Decimal::to_string()`. [Order book → Checksum](order-book.md#checksum).
+
+## Futures executions
+
+**`cum_qty`.**
+
+- Omitted on the `new` and `amended` records of stop-loss, take-profit and trailing-stop orders (and their `-limit` variants), and on `canceled` records.
+- Those `new` records report the conditional `order_type` (for example `stop-loss`) and carry `triggers` (`FuturesExecutionUpdate::triggers`).
+- Plain orders and fill (`trade`) records carry it.
+- `FuturesExecutionUpdate::cum_qty` is `None` for an omitted figure, never zero. Read `None` as "not reported", not "nothing filled".
+
+**`cl_ord_id`.** Reported in a normalised form:
+
+| Sent | Reported |
+|------|----------|
+| Lowercase UUID | unchanged |
+| Uppercase UUID | lowercased (the `add_order`, `amend_order` and `cancel_order` replies echo it lowercased too) |
+| 32 hex digits | hyphenated |
+| Any other id | packed 7 bits per character into a UUID (`kp3s` → `00000000-0000-0000-0000-00000e6cf86b`) |
+
+- The mapping is many-to-one, so distinct ids can collide when matched by the reported `cl_ord_id`. Examples: an uppercase and a lowercase form of one UUID, or a 32-hex id and a short custom id.
+- `amended` and `canceled` records carry no `cl_ord_id`. `order_id` joins every record.
+- Amend and cancel accept the id as sent.
 
 ## Order placement
 
@@ -38,7 +60,7 @@ A later handler misses that frame. Kraken re-pushes status periodically. Subscri
 
 **Leverage on WS.** Schema has `margin: true` and no leverage ratio. Pre-send: `WsUnsupportedOrderField { field: "leverage" }`. Use REST.
 
-**`deadline`.** RFC3339 with timezone; wire `deadline` must be within 60 s. A set `deadline` is rejected at `validate()` in v1 on every transport. [Placing orders](placing-orders.md).
+**`deadline`.** Spot: RFC3339 with timezone, within 60 s; a set `deadline` is rejected at `validate()` in v1 on every transport. Futures: `FuturesOrder::deadline` and `FuturesOrderAmendRequest::deadline` take an absolute `TimeSpec`, sent as RFC 3339. [Placing orders](placing-orders.md).
 
 **`starttm` / `expiretm`.** Stored once as Unix seconds. REST sends the epoch integer. WS v2 sends RFC 3339 with timezone (`effective_time` / `expire_time`). Relative `+60` is not modelled. Negative epoch is clamped to the epoch; the exchange then rejects the past time.
 

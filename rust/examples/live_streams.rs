@@ -26,39 +26,48 @@ async fn main() {
     client.ready();
 
     // Register system-status first — status arrives as the first public-WS frame once trade/ohlc connect.
-    let _ss = client.market().on_system_status(|s: &SystemStatusUpdate| {
-        println!(
-            "[status] system={} version={} api_version={} (connection_id omitted)",
-            s.system.as_deref().unwrap_or("?"),
-            s.version.as_deref().unwrap_or("?"),
-            s.api_version.as_deref().unwrap_or("?"),
-        );
-    });
+    let _ss = client
+        .market()
+        .on_system_status(|s: &SystemStatusUpdate| {
+            println!(
+                "[status] system={} version={} api_version={} (connection_id omitted)",
+                s.system.as_deref().unwrap_or("?"),
+                s.version.as_deref().unwrap_or("?"),
+                s.api_version.as_deref().unwrap_or("?"),
+            );
+        })
+        .expect("register system status handler");
 
     // Channel-wide handlers must be registered before subscribe.
-    let _t = client.market().on_trade(|t: &TradeUpdate| {
-        println!(
-            "[trade] {} {:?} px={} qty={} id={}",
-            t.symbol.as_str(),
-            t.side,
-            t.price,
-            t.qty,
-            t.trade_id
-        );
-    });
-    let _o = client.market().on_ohlc(|c: &OhlcUpdate| {
-        println!(
-            "[ohlc] {} O={} H={} L={} C={} vol={} ({}m @ {})",
-            c.symbol.as_str(),
-            c.open,
-            c.high,
-            c.low,
-            c.close,
-            c.volume,
-            c.interval,
-            c.interval_begin
-        );
-    });
+    let _t = client
+        .market()
+        .on_trade(|t: &TradeUpdate| {
+            println!(
+                "[trade] {} {:?} px={} qty={} id={}",
+                t.symbol.as_str(),
+                t.side,
+                t.price,
+                t.qty,
+                t.trade_id
+            );
+        })
+        .expect("register trade handler");
+    let _o = client
+        .market()
+        .on_ohlc(|c: &OhlcUpdate| {
+            println!(
+                "[ohlc] {} O={} H={} L={} C={} vol={} ({}m @ {})",
+                c.symbol.as_str(),
+                c.open,
+                c.high,
+                c.low,
+                c.close,
+                c.volume,
+                c.interval,
+                c.interval_begin
+            );
+        })
+        .expect("register ohlc handler");
 
     if let Err(e) = client.subscription().subscribe_trade(vec![btc()], None) {
         println!("[main] trade sub error: {e:?}");

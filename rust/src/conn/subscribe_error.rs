@@ -7,5 +7,6 @@ pub enum SubscribeErrorKind {
     SubscribeRejected {
         kraken_code: String,
         transient: bool,
+        ack: crate::dispatch::FuturesSubscribeAck,
     },
 }

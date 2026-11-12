@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 
 use crate::book::{BookDelta, OrderBookUpdate};
 use crate::rest::RestSurface;
-use crate::types::{BookDepth, ChannelName, Symbol};
+use crate::types::{BookDepth, ChannelName, StreamSymbol, Symbol};
 
 use super::ws::{
     decode_book, decode_book_raw, decode_ohlc, decode_system_status, decode_ticker, decode_trade,
@@ -104,7 +104,7 @@ fn make_market(canned: serde_json::Value) -> (MarketNamespace, Arc<MockHttp>) {
         last_request: Mutex::new(None),
     });
     (
-        wire_namespace(Arc::clone(&mock) as Arc<dyn HttpTransport>),
+        wire_namespace(Arc::clone(&mock) as Arc<dyn HttpTransport>).0,
         mock,
     )
 }
@@ -117,12 +117,14 @@ fn make_market_routed(
         calls: Mutex::new(HashMap::new()),
     });
     (
-        wire_namespace(Arc::clone(&mock) as Arc<dyn HttpTransport>),
+        wire_namespace(Arc::clone(&mock) as Arc<dyn HttpTransport>).0,
         mock,
     )
 }
 
-fn wire_namespace(transport: Arc<dyn HttpTransport>) -> MarketNamespace {
+fn wire_namespace(
+    transport: Arc<dyn HttpTransport>,
+) -> (MarketNamespace, Arc<crate::dispatch::DispatchEventBus>) {
     let auth = Arc::new(AuthStack::new(
         None,
         None,
@@ -163,9 +165,8 @@ fn wire_namespace(transport: Arc<dyn HttpTransport>) -> MarketNamespace {
         mirror,
         alloc,
     ));
-    let dispatch =
-        Arc::new(crate::dispatch::dispatch_table::DispatchTable::with_default_spot_table());
-    MarketNamespace::new(rest, ws, dispatch)
+    let dispatch = Arc::new(crate::dispatch::dispatch_table::DispatchTable::with_default_table());
+    (MarketNamespace::new(rest, ws, dispatch), bus)
 }
 
 fn canned_ticker_response() -> serde_json::Value {
@@ -815,9 +816,11 @@ fn on_ticker_returns_handle_and_decode_helper_unwraps_envelope() {
     let (market, _mock) = make_market(canned_ticker_response());
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hits_cb = Arc::clone(&hits);
-    let handle = market.on_ticker(move |_u: &TickerUpdate| {
-        hits_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    });
+    let handle = market
+        .on_ticker(move |_u: &TickerUpdate| {
+            hits_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+        .expect("register");
     assert_eq!(handle.channel(), ChannelName::Ticker);
 
     let envelope = json!({
@@ -864,8 +867,8 @@ fn on_ticker_for_dedupes_pairs_before_register_and_guard() {
     assert_eq!(
         guard.pairs(),
         &[
-            Symbol::new("BTC/USD").unwrap(),
-            Symbol::new("ETH/USD").unwrap()
+            StreamSymbol::from(Symbol::new("BTC/USD").unwrap()),
+            StreamSymbol::from(Symbol::new("ETH/USD").unwrap())
         ],
         "order-preserving dedupe, first occurrence wins"
     );
@@ -999,9 +1002,9 @@ fn decode_book_returns_none_on_malformed_frame() {
 #[test]
 fn on_book_and_on_book_raw_register_under_correct_channels() {
     let (market, _mock) = make_market(canned_ticker_response());
-    let h_book = market.on_book(|_u: &OrderBookUpdate| {});
+    let h_book = market.on_book(|_u: &OrderBookUpdate| {}).expect("register");
     assert_eq!(h_book.channel(), ChannelName::Book);
-    let h_raw = market.on_book_raw(|_d: &BookDelta| {});
+    let h_raw = market.on_book_raw(|_d: &BookDelta| {}).expect("register");
     assert_eq!(h_raw.channel(), ChannelName::BookRaw);
 }
 
@@ -1052,6 +1055,17 @@ fn decode_trade_happy_path_buy_and_sell_and_sci_notation_qty() {
     let sell = decode_trade(trade_envelope("sell", json!("0.25"))).expect("decode sell trade");
     assert_eq!(sell.side, TradeSide::Sell);
     assert_eq!(sell.qty, "0.25".parse::<Decimal>().unwrap());
+}
+
+#[test]
+fn decode_trade_reads_is_snapshot_from_envelope_type() {
+    let upd = decode_trade(trade_envelope("buy", json!("0.25"))).expect("decode update");
+    assert!(!upd.is_snapshot);
+
+    let mut snap = trade_envelope("buy", json!("0.25"));
+    snap["type"] = json!("snapshot");
+    let snap = decode_trade(snap).expect("decode snapshot");
+    assert!(snap.is_snapshot);
 }
 
 #[test]
@@ -1145,9 +1159,9 @@ fn decode_ohlc_returns_none_on_malformed_frame() {
 #[test]
 fn on_trade_and_on_ohlc_register_under_correct_channels() {
     let (market, _mock) = make_market(canned_ticker_response());
-    let h_trade = market.on_trade(|_u: &TradeUpdate| {});
+    let h_trade = market.on_trade(|_u: &TradeUpdate| {}).expect("register");
     assert_eq!(h_trade.channel(), ChannelName::Trade);
-    let h_ohlc = market.on_ohlc(|_u: &OhlcUpdate| {});
+    let h_ohlc = market.on_ohlc(|_u: &OhlcUpdate| {}).expect("register");
     assert_eq!(h_ohlc.channel(), ChannelName::Ohlc);
 }
 
@@ -1218,9 +1232,56 @@ fn decode_system_status_lenient_connection_id() {
 }
 
 #[test]
+fn on_handlers_after_close_reject_client_closed() {
+    use crate::api::subscription_types::SubscriptionError;
+
+    let (market, bus) = wire_namespace(Arc::new(MockHttp {
+        canned: json!({}),
+        last_request: Mutex::new(None),
+    }));
+    drop(bus.take_caller_to_io_rx().expect("rx present"));
+    let closed = |r: Result<crate::dispatch::HandlerHandle, SubscriptionError>| {
+        matches!(r, Err(SubscriptionError::ClientClosed))
+    };
+    assert!(closed(market.on_ticker(|_: &TickerUpdate| {})));
+    assert!(closed(market.on_book(|_: &OrderBookUpdate| {})));
+    assert!(closed(market.on_book_raw(|_: &BookDelta| {})));
+    assert!(closed(market.on_trade(|_: &TradeUpdate| {})));
+    assert!(closed(market.on_ohlc(|_: &OhlcUpdate| {})));
+    assert!(closed(market.on_system_status(|_: &SystemStatusUpdate| {})));
+}
+
+#[test]
+fn on_handlers_after_loop_death_reject_loopdead() {
+    use crate::api::subscription_types::SubscriptionError;
+
+    let (market, bus) = wire_namespace(Arc::new(MockHttp {
+        canned: json!({}),
+        last_request: Mutex::new(None),
+    }));
+    bus.on_loop_death(
+        crate::dispatch::ReactorName::Io,
+        crate::dispatch::LoopFailureCause::Panic,
+    );
+    let dead = |r: Result<crate::dispatch::HandlerHandle, SubscriptionError>| {
+        matches!(r, Err(SubscriptionError::LoopDead))
+    };
+    assert!(dead(market.on_ticker(|_: &TickerUpdate| {})));
+    assert!(dead(market.on_book(|_: &OrderBookUpdate| {})));
+    assert!(dead(market.on_book_raw(|_: &BookDelta| {})));
+    assert!(dead(market.on_trade(|_: &TradeUpdate| {})));
+    assert!(dead(market.on_ohlc(|_: &OhlcUpdate| {})));
+    assert!(dead(market.on_system_status(|_: &SystemStatusUpdate| {})));
+    assert!(dead(market.futures().on_ticker(|_| {})));
+    assert!(dead(market.futures().on_system_status(|_| {})));
+}
+
+#[test]
 fn on_system_status_returns_handle_under_status_channel() {
     let (market, _mock) = make_market(canned_ticker_response());
-    let handle = market.on_system_status(|_u: &SystemStatusUpdate| {});
+    let handle = market
+        .on_system_status(|_u: &SystemStatusUpdate| {})
+        .expect("register");
     assert_eq!(handle.channel(), ChannelName::Status);
 }
 
@@ -1589,6 +1650,7 @@ fn ws_trade_update_serializes_under_its_descriptive_field_names() {
     assert_eq!(v["ord_type"], json!("limit"));
     assert_eq!(v["trade_id"], json!(123456789_u64));
     assert_eq!(v["timestamp"], json!("2026-06-02T12:00:00.000000Z"));
+    assert_eq!(v["is_snapshot"], json!(false));
 }
 
 /// Kraken sends `status` partially populated; what it omitted stays omitted.

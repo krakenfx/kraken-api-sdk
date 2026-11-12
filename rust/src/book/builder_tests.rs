@@ -132,7 +132,7 @@ fn build_update_caps_at_depth() {
         DescPrice("49800.00".parse().unwrap()),
         lvl("49800.00", "1.0"),
     );
-    let update = b.build_update(42, None, String::new());
+    let update = b.build_update(sym(), 42, None, String::new());
     assert_eq!(update.bids.len(), 2);
     assert_eq!(update.bids[0].price, "50000.00".parse().unwrap());
     assert_eq!(update.bids[1].price, "49900.00".parse().unwrap());
@@ -309,7 +309,7 @@ fn build_update_caps_to_caller_depth_below_maintained() {
     assert_eq!(b.caller_depth(), CALLER_DEPTH);
     assert_eq!(b.bids.len(), 12, "maintained book retains all 12 levels");
     assert_eq!(b.asks.len(), 12);
-    let update = b.build_update(seed_crc, None, String::new());
+    let update = b.build_update(sym(), seed_crc, None, String::new());
     assert_eq!(
         update.bids.len(),
         CALLER_DEPTH,
@@ -355,4 +355,36 @@ fn book_delta_monotonic_clock_emits_milliseconds() {
 fn book_delta_omits_an_absent_monotonic_clock() {
     let v = serde_json::to_value(make_delta(None)).expect("BookDelta serializes");
     assert!(v.get("timestamp").is_none(), "expected omission: {v}");
+}
+
+#[test]
+fn captured_unified_futures_book_sequence_validates_every_crc() {
+    let frames: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../tests/fixtures/unified_ws/unified_futures_book_crc_sequence.json"
+    ))
+    .expect("checked-in Unified Futures book fixture is valid JSON");
+    assert_eq!(frames.len(), 487, "snapshot plus every captured delta");
+
+    let first =
+        crate::book::parse_book_frame(&frames[0]["data"].as_array().expect("book data array")[0])
+            .expect("captured snapshot parses");
+    assert_eq!(first.bids[0].price_wire, "83347.0");
+    assert_eq!(first.asks[0].qty_wire, "74");
+
+    let mut builder = OrderBookBuilder::new("PI_XBTUSD", 25, 10);
+    for frame in &frames {
+        let entries = frame["data"].as_array().expect("book data array");
+        assert_eq!(entries.len(), 1, "each captured frame has one book entry");
+        let parsed =
+            crate::book::parse_book_frame(&entries[0]).expect("every captured book frame parses");
+        let result = match frame["type"].as_str() {
+            Some("snapshot") => builder.apply_snapshot(parsed.bids, parsed.asks, parsed.checksum),
+            Some("update") => builder.apply_delta(parsed.bids, parsed.asks, parsed.checksum),
+            other => panic!("unexpected captured book frame type: {other:?}"),
+        };
+        assert!(
+            result.is_ok(),
+            "captured checksum must validate: {result:?}"
+        );
+    }
 }

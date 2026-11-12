@@ -128,6 +128,7 @@ pub enum KnobName {
     BackoffFactor,
     ReconnectAttempts,
     WsOrderResponseDeadlineMs,
+    FuturesMaxInFlight,
     StalenessWindowMs,
     SubscribeAckAttempts,
     SubscribeAckTimeoutMs,
@@ -153,6 +154,9 @@ pub enum KnobName {
     RestBaseUrl,
     WsPublicUrl,
     WsAuthUrl,
+    UnifiedWsPublicUrl,
+    UnifiedWsPrivateUrl,
+    TlsExtraRootCertsFile,
 }
 
 impl KnobName {
@@ -185,11 +189,16 @@ impl KnobName {
         !self.is_runtime_mutable()
     }
 
-    /// Whether the knob is a URL string.
+    /// Whether the knob is a string (an endpoint URL or a file path).
     pub const fn is_string_knob(self) -> bool {
         matches!(
             self,
-            Self::RestBaseUrl | Self::WsPublicUrl | Self::WsAuthUrl
+            Self::RestBaseUrl
+                | Self::WsPublicUrl
+                | Self::WsAuthUrl
+                | Self::UnifiedWsPublicUrl
+                | Self::UnifiedWsPrivateUrl
+                | Self::TlsExtraRootCertsFile
         )
     }
 }
@@ -229,6 +238,10 @@ pub struct Knobs {
     /// CONSTRUCTION-ONLY. Optional client-side deadline (ms) on the WS order
     /// response await; `None`/`0` = unbounded.
     pub ws_order_response_deadline_ms: Option<u32>,
+    /// CONSTRUCTION-ONLY. Most Futures placements (add, amend, batch add) awaiting a reply
+    /// at once; more are refused unsent. `None`/`0` = unlimited; otherwise needs
+    /// `ws_order_response_deadline_ms` >= 1, since a dropped reply holds its slot.
+    pub futures_max_in_flight: Option<u32>,
     /// CONSTRUCTION-ONLY. Session-wide order-transport default (`true` = REST);
     /// per-call `PendingTrade::via` wins.
     pub prefer_rest_for_orders: bool,
@@ -265,6 +278,13 @@ pub struct Knobs {
     pub ws_public_url: String,
     /// CONSTRUCTION-ONLY. Auth WS endpoint (default `wss://ws-auth.kraken.com/v2`).
     pub ws_auth_url: String,
+    /// CONSTRUCTION-ONLY. Unified public WS endpoint (default `wss://uws.kraken.com/v2/public`).
+    pub unified_ws_public_url: String,
+    /// CONSTRUCTION-ONLY. Unified private WS endpoint (default `wss://uws.kraken.com/v2/private`).
+    pub unified_ws_private_url: String,
+    /// CONSTRUCTION-ONLY. PEM file of extra root CAs trusted beside the built-in set
+    /// (default empty: none), for endpoints signed by a private CA.
+    pub tls_extra_root_certs_file: String,
 }
 
 impl Knobs {
@@ -286,6 +306,7 @@ impl Knobs {
             connection_rate_window_secs: 600,
             slow_callback_threshold_ms: AtomicU32::new(50),
             ws_order_response_deadline_ms: None,
+            futures_max_in_flight: None,
             prefer_rest_for_orders: false,
             request_timeout_ms: 30_000,
             rest_retry_max_attempts: 3,
@@ -302,6 +323,11 @@ impl Knobs {
             rest_base_url: "https://api.kraken.com".to_string(),
             ws_public_url: crate::types::WsUrl::Public.as_wire_url().to_string(),
             ws_auth_url: crate::types::WsUrl::Auth.as_wire_url().to_string(),
+            unified_ws_public_url: crate::types::WsUrl::UnifiedPublic.as_wire_url().to_string(),
+            unified_ws_private_url: crate::types::WsUrl::UnifiedPrivate
+                .as_wire_url()
+                .to_string(),
+            tls_extra_root_certs_file: String::new(),
         }
     }
 
@@ -381,6 +407,7 @@ impl Knobs {
             KnobName::WsOrderResponseDeadlineMs => {
                 KnobValue::OptU32(self.ws_order_response_deadline_ms)
             }
+            KnobName::FuturesMaxInFlight => KnobValue::OptU32(self.futures_max_in_flight),
             KnobName::PreferRestForOrders => KnobValue::Bool(self.prefer_rest_for_orders),
             KnobName::RequestTimeoutMs => KnobValue::U32(self.request_timeout_ms),
             KnobName::RestRetryMaxAttempts => KnobValue::U32(self.rest_retry_max_attempts),
@@ -403,6 +430,11 @@ impl Knobs {
             KnobName::RestBaseUrl => KnobValue::Str(self.rest_base_url.clone()),
             KnobName::WsPublicUrl => KnobValue::Str(self.ws_public_url.clone()),
             KnobName::WsAuthUrl => KnobValue::Str(self.ws_auth_url.clone()),
+            KnobName::UnifiedWsPublicUrl => KnobValue::Str(self.unified_ws_public_url.clone()),
+            KnobName::UnifiedWsPrivateUrl => KnobValue::Str(self.unified_ws_private_url.clone()),
+            KnobName::TlsExtraRootCertsFile => {
+                KnobValue::Str(self.tls_extra_root_certs_file.clone())
+            }
         }
     }
 
@@ -577,7 +609,7 @@ mod tests {
             );
             let _ = Knobs::defaults().snapshot_knob(knob);
         }
-        assert_eq!(n, 31);
+        assert_eq!(n, 35);
         assert!(KnobName::from_str("nope").is_err());
     }
 

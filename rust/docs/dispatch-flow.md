@@ -44,7 +44,7 @@ flowchart TB
 
 WS trade methods post a `WsRequestFrame` on `caller_to_io` and `.await` a oneshot. That hop does not enter the dispatch loop. REST (`.via(Transport::Rest)` / `prefer_rest_for_orders`) is HTTP.
 
-On T1 the trading tracker is charged, then `try_send`. Full or closed rejects immediately (`TradeError::QueueFull` / not-open); the frame is not sent. T2 runs `handle_ws_request_frame`: cached token, `{method, params, req_id}`, record pending, `send_frame` (`try_send` on the auth outbox). A send error fails the pending.
+On T1 the trading tracker is charged, then `try_send`. Full or closed rejects immediately (`TradeError::QueueFull` / not-open); the frame is not sent. T2 runs `handle_ws_request_frame`: cached token (none or expired: refresh started and the request fails `SessionExpired`, nothing sent), `{method, params, req_id}`, record pending, `send_frame` (`try_send` on the auth outbox). A send error fails the pending.
 
 ```mermaid
 flowchart LR

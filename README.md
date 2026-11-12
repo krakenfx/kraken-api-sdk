@@ -10,6 +10,7 @@ One SDK design, implemented per language under its own top-level directory.
 
 - One client for market data, account, trading, and subscriptions
 - Spot REST and Spot WebSocket v2
+- Futures streams and order entry on the Unified WebSocket
 - Request signing, nonce handling, and WebSocket token refresh
 - Reconnect with resubscribe
 - Order books built from snapshot and deltas, CRC32-checked on each update
@@ -18,14 +19,20 @@ One SDK design, implemented per language under its own top-level directory.
 - Events for connection and client status, order lifecycle, rate limits,
   stream and book gaps, queue depth, and callback latency
 - API keys kept in memory and cleared when the client closes
-- Pair names in modern format (`BTC/USD`)
+- Spot pairs in modern format (`BTC/USD`); Futures symbols as venue wire
+  strings (`PF_XBTUSD`)
 
 ## Languages
 
 | Language | Path | Status |
 |----------|------|--------|
-| Rust + tokio | [`rust/`](rust/) | Spot trading + portfolio. |
+| Rust + tokio | [`rust/`](rust/) | Spot trading + portfolio; Futures streams and orders. |
 | C++ · Python · Go · TypeScript/JS | _(coming)_ | Coming soon. |
+
+## Documentation
+
+API reference and guides for Kraken's APIs and SDKs:
+<https://docs.kraken.com/home/sdks>
 
 ## Contributing
 

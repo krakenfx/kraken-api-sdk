@@ -34,6 +34,26 @@ pub(in crate::dispatch::io_reactor) use subscribe_send::{
     send_remaining_signed_subscribes, send_single_subscribe,
 };
 
+fn bus_clock_now(bus_back_ref: &Weak<DispatchEventBus>) -> crate::types::MonotonicInstant {
+    bus_back_ref
+        .upgrade()
+        .map(|bus| bus.clock().now())
+        .unwrap_or_else(crate::types::MonotonicInstant::now)
+}
+
+fn subscribe_ack_timeout_ms(bus_back_ref: &Weak<DispatchEventBus>) -> u32 {
+    bus_back_ref
+        .upgrade()
+        .map(|bus| bus.knobs().subscribe_ack_timeout_ms.load(Ordering::Relaxed))
+        .unwrap_or(5_000)
+}
+
+fn due_after_ms(mc: &ManagedConnection, ms: u32) -> crate::types::MonotonicInstant {
+    crate::types::MonotonicInstant(
+        mc.clock_now().0 + std::time::Duration::from_millis(u64::from(ms)),
+    )
+}
+
 /// Init bundle moved by value into the spawned reactor task at `Client::ready()`.
 pub struct IoReactorInit {
     pub conns: HashMap<WsUrl, ManagedConnection>,
@@ -49,16 +69,25 @@ pub struct IoReactorInit {
     /// Shared with the supervisor so auto-connect draws `request_id`s from the
     /// same space as caller `connect()`.
     pub connect_id_allocator: Arc<AtomicU64>,
-    /// "auth has ≥1 subscription" hint; reactor single-writer.
-    pub auth_has_subscriptions: Arc<std::sync::atomic::AtomicBool>,
-    /// "auth bare-order send-ready" level flag; reactor single-writer.
-    pub auth_send_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-url bare-order hints; reactor single-writer.
+    pub order_gate: Arc<crate::conn::OrderGate>,
 }
 
 /// Request-id + capability snapshot for the first-iteration `BUS.ClientReady` emit.
 pub struct ReadySignal {
     pub request_id: u64,
     pub capability_snapshot: crate::types::CapabilitySnapshot,
+}
+
+/// Shared (`&`) reactor handles, some to atomics the reactor writes; passed by value.
+#[derive(Clone, Copy)]
+struct SharedHandles<'a> {
+    auth_stack: &'a Arc<crate::auth::AuthStack>,
+    order_gate: &'a Arc<crate::conn::OrderGate>,
+    bus_back_ref: &'a Weak<DispatchEventBus>,
+    state_mirrors: &'a HashMap<WsUrl, Arc<AtomicU8>>,
+    upgrade_tx: &'a mpsc::Sender<UpgradeOutcome>,
+    connect_id_allocator: &'a Arc<AtomicU64>,
 }
 
 /// Upgrade outcome bridged back onto the reactor task so `mc.handle_event(...)`
@@ -111,8 +140,7 @@ pub async fn run(init: IoReactorInit) {
         bus_back_ref,
         ready_signal,
         connect_id_allocator,
-        auth_has_subscriptions,
-        auth_send_ready,
+        order_gate,
     } = init;
 
     // Fails in-flight correlated awaits + latches LoopDead on abnormal exit;
@@ -127,11 +155,11 @@ pub async fn run(init: IoReactorInit) {
     // from `sockets`.
     let mut upgrade_guards: HashMap<WsUrl, SubscriberGuard> = HashMap::new();
 
-    let mut drop_tracker: HashMap<ChannelName, (crate::types::MonotonicInstant, u32)> =
+    let mut drop_tracker: HashMap<(WsUrl, ChannelName), (crate::types::MonotonicInstant, u32)> =
         HashMap::new();
     let mut malformed_warn_tracker: frame_routing::SuppressWarnTracker = HashMap::new();
 
-    // Set by a `ClientClose` marker; once BOTH conns reach `Closed`, emit one
+    // Set by a `ClientClose` marker; once every conn reaches `Closed`, emit one
     // ClientClosedEvent and self-exit.
     let mut pending_client_close: Option<(u64, crate::types::MonotonicInstant)> = None;
 
@@ -166,7 +194,16 @@ pub async fn run(init: IoReactorInit) {
         });
     }
 
+    let handles = SharedHandles {
+        auth_stack: &auth_stack,
+        order_gate: &order_gate,
+        bus_back_ref: &bus_back_ref,
+        state_mirrors: &state_mirrors,
+        upgrade_tx: &upgrade_tx,
+        connect_id_allocator: &connect_id_allocator,
+    };
     let mut last_liveness_epoch = registry.liveness_epoch();
+    let mut last_timer_owner = WsUrl::Auth;
     loop {
         let Some(bus) = bus_back_ref.upgrade() else {
             tracing::debug!(target: "kraken_sdk::io_reactor", "bus dropped; reactor exiting");
@@ -176,6 +213,8 @@ pub async fn run(init: IoReactorInit) {
         bus.flush_pending_teardowns_leaving(reserve);
         drop(bus);
 
+        last_timer_owner = reconcile_token_timer(&mut conns, &auth_stack, last_timer_owner);
+
         // Liveness-epoch sync: re-derive the cached auth hints here, exactly once,
         // after ANY registry-liveness mutation.
         if registry.liveness_epoch() != last_liveness_epoch {
@@ -184,8 +223,7 @@ pub async fn run(init: IoReactorInit) {
                 &conns,
                 &registry,
                 &auth_stack,
-                &auth_has_subscriptions,
-                &auth_send_ready,
+                &order_gate,
                 &bus_back_ref,
             );
         }
@@ -196,12 +234,13 @@ pub async fn run(init: IoReactorInit) {
             inbound = caller_rx.recv() => {
                 match inbound {
                     // Intercepted here (not handle_inbound): the post-select check fires
-                    // one ClientClosedEvent once BOTH conns reach Closed.
+                    // one ClientClosedEvent once every conn reaches Closed.
                     Some(crate::dispatch::CallerInbound::ClientClose { request_id, initiated_at }) => {
                         pending_client_close = Some((request_id, initiated_at));
                         // ONE marker arms the whole client close; fan CallClose to every
                         // connection so a dropped marker can't leave a half-closed wedge.
-                        for url in [WsUrl::Public, WsUrl::Auth] {
+                        let urls: Vec<WsUrl> = conns.keys().copied().collect();
+                        for url in urls {
                             let per_conn_id = connect_id_allocator.fetch_add(1, Ordering::Relaxed);
                             inbound_dispatch::handle_inbound(
                                 crate::dispatch::CallerInbound::FsmEvent {
@@ -214,12 +253,7 @@ pub async fn run(init: IoReactorInit) {
                                 &mut registry,
                                 &mut handler_registry,
                                 &mut sockets,
-                                &state_mirrors,
-                                &bus_back_ref,
-                                &upgrade_tx,
-                                &connect_id_allocator,
-                                &auth_stack,
-                                &auth_send_ready,
+                                handles,
                                 &mut upgrade_guards,
                             )
                             .await;
@@ -236,12 +270,7 @@ pub async fn run(init: IoReactorInit) {
                         &mut registry,
                         &mut handler_registry,
                         &mut sockets,
-                        &state_mirrors,
-                        &bus_back_ref,
-                        &upgrade_tx,
-                        &connect_id_allocator,
-                        &auth_stack,
-                        &auth_send_ready,
+                        handles,
                         &mut upgrade_guards,
                     ).await,
                     None => {
@@ -267,19 +296,46 @@ pub async fn run(init: IoReactorInit) {
                                 },
                             );
                             write_mirror(&state_mirrors, url, mc.state());
+                            registry.drop_snapshot_opt_outs(url, &mc.take_snapshot_opt_out_written());
 
-                            // Reconnect resubscribe-replay. Gated on has_been_open() so the
-                            // initial-connect Register path (and auth->Authenticating) don't re-sub.
-                            if mc.state() == ConnectionState::Resubscribing
-                                && mc.has_been_open()
+                            // A subscribe queued on the previous socket was only
+                            // `Sent` into that outbox. The socket is gone, so put
+                            // every still-pending entry back on the replay
+                            // set before composing.
+                            if mc.take_pre_open_subscribe_lost() && !mc.has_been_open() {
+                                registry.mark_pending_entries_for_initial_replay(url, mc);
+                            }
+
+                            if !url.requires_ws_token()
+                                && mc.state() == ConnectionState::Resubscribing
+                                && !mc.has_been_open()
+                                && !mc.needs_initial_subscribe_replay()
+                                && !registry.has_pending_entry(url)
                             {
-                                let frames = registry.compose_subscribe_frames_for_url(url);
+                                mc.complete_resubscribe_if_empty();
+                                write_mirror(&state_mirrors, url, mc.state());
+                            }
+
+                            // Replay after a reconnect, or after an initial RegisterBatch
+                            // writer failure that prevented its first wire send.
+                            if mc.state() == ConnectionState::Resubscribing
+                                && (mc.has_been_open() || mc.needs_initial_subscribe_replay())
+                            {
+                                let only_keys = mc.initial_replay_filter();
+                                let batches = if url == WsUrl::UnifiedPublic {
+                                    registry.compose_unified_public_subscribe_batches(only_keys)
+                                } else {
+                                    registry
+                                        .compose_subscribe_frames_for_url_only(url, only_keys)
+                                        .into_iter()
+                                        .map(|(channel, pair, frame)| {
+                                            (channel, vec![pair], frame)
+                                        })
+                                        .collect()
+                                };
                                 if let Some(socket) = sockets.get(&url) {
-                                    let timeout_ms = bus_back_ref
-                                        .upgrade()
-                                        .map(|bus| bus.knobs().subscribe_ack_timeout_ms.load(Ordering::Relaxed))
-                                        .unwrap_or(5_000);
-                                    for (channel, pair, mut payload) in frames {
+                                    let timeout_ms = subscribe_ack_timeout_ms(&bus_back_ref);
+                                    for (channel, pairs, mut payload) in batches {
                                         // Correlate a per-frame req_id so a channel-less
                                         // reject on replay terminates cleanly.
                                         let req_id = mc.next_subscribe_req_id();
@@ -291,16 +347,38 @@ pub async fn run(init: IoReactorInit) {
                                             opcode: WsOpcode::Text,
                                             payload: payload.to_string().into_bytes(),
                                         };
-                                        match subscribe_send::send_subscribe_frame(
+                                        match subscribe_send::send_subscribe_batch_frame(
                                             socket,
                                             frame,
                                             url,
                                             channel,
-                                            &pair,
+                                            &pairs,
                                             mc,
                                             subscribe_send::SubscribeSend::ResubscribeReplay,
                                         ) {
-                                            subscribe_send::SendOutcome::Sent => {}
+                                            subscribe_send::SendOutcome::Sent => {
+                                                if !url.requires_ws_token() {
+                                                    mc.clear_initial_subscribe_replay(
+                                                        channel,
+                                                        &pairs,
+                                                    );
+                                                    // A pre-upgrade backpressure also armed
+                                                    // per-symbol resends; this frame covers them.
+                                                    for pair in &pairs {
+                                                        mc.cancel_subscribe_resend(channel, pair);
+                                                    }
+                                                    // One venue `book` frame covers both
+                                                    // logical rows. Dropping only the sent
+                                                    // channel leaves the peer key behind
+                                                    // and replays a subscribe that already
+                                                    // went out.
+                                                    if let Some(peer) = channel.book_peer() {
+                                                        mc.clear_initial_subscribe_replay(
+                                                            peer, &pairs,
+                                                        );
+                                                    }
+                                                }
+                                            }
                                             subscribe_send::SendOutcome::Backpressured => {
                                                 // Armed resend owns the retry; stop replaying
                                                 // if the teardown left Resubscribing.
@@ -315,20 +393,23 @@ pub async fn run(init: IoReactorInit) {
                                                 break;
                                             }
                                         }
-                                        let due_at = crate::types::MonotonicInstant(
-                                            mc.clock_now().0
-                                                + std::time::Duration::from_millis(
-                                                    timeout_ms as u64,
-                                                ),
-                                        );
+                                        let due_at = due_after_ms(mc, timeout_ms);
                                         // A book still resyncing needs its liveness timer re-armed,
                                         // else a lost fresh snapshot re-freezes it silently.
-                                        let arm_reseed = channel == ChannelName::Book
-                                            && registry.is_book_resyncing(channel, &pair);
-                                        mc.record_subscribe_req_id(req_id, channel, pair.clone());
-                                        mc.arm_subscribe_ack(channel, pair.clone(), due_at);
-                                        if arm_reseed {
-                                            mc.arm_book_reseed_snapshot(channel, pair, due_at);
+                                        for pair in pairs {
+                                            let arm_reseed = channel == ChannelName::Book
+                                                && registry.is_book_resyncing_for(
+                                                    url, channel, &pair,
+                                                );
+                                            mc.record_subscribe_req_id(
+                                                req_id,
+                                                channel,
+                                                pair.clone(),
+                                            );
+                                            mc.arm_subscribe_ack(channel, pair.clone(), due_at);
+                                            if arm_reseed {
+                                                mc.arm_book_reseed_snapshot(channel, pair, due_at);
+                                            }
                                         }
                                     }
                                 }
@@ -353,7 +434,7 @@ pub async fn run(init: IoReactorInit) {
                             if mc.state() == ConnectionState::Authenticating {
                                 subscribe_send::send_first_signed_subscribe(
                                     url, mc, &registry, &sockets, &auth_stack,
-                                    &auth_send_ready, &bus_back_ref,
+                                    &order_gate, &bus_back_ref,
                                 );
                                 write_mirror(&state_mirrors, url, mc.state());
                             }
@@ -374,18 +455,22 @@ pub async fn run(init: IoReactorInit) {
 
             Some(outcome) = refresh_rx.recv() => {
                 let crate::auth::RefreshOutcome { request_id, result } = outcome;
-                // v1: the token-bearing connection is ALWAYS Auth, so the correlation
-                // event hard-routes there.
-                let url = WsUrl::Auth;
-                if let Some(mc) = conns.get_mut(&url) {
-                    // A proactive tick's outcome (request_id 0) drives the FSM only in
-                    // the drain-bearing states — never a handshake's terminal refresh arms.
-                    let deliver = request_id != 0
-                        || matches!(
-                            mc.state(),
-                            ConnectionState::Open | ConnectionState::Resubscribing
-                        );
+                let timer_owner = token_timer_owner(&conns);
+                for url in WsUrl::ALL.into_iter().filter(|url| url.requires_ws_token()) {
+                    let Some(mc) = conns.get_mut(&url) else {
+                        continue;
+                    };
+                    let deliver = should_deliver_token_refresh(
+                        url,
+                        request_id,
+                        mc.state(),
+                        mc.pending_reactive_token_refresh_id(),
+                        timer_owner,
+                    );
                     if deliver {
+                        if request_id != 0 {
+                            mc.complete_reactive_token_refresh(request_id);
+                        }
                         let fsm_event = match &result {
                             Ok(_) => crate::conn::managed_connection::FsmEvent::BusTokenRefreshed {
                                 request_id,
@@ -404,49 +489,51 @@ pub async fn run(init: IoReactorInit) {
                         if result.is_ok() && mc.authenticating_nothing_in_flight() {
                             subscribe_send::send_first_signed_subscribe(
                                 url, mc, &registry, &sockets, &auth_stack,
-                                &auth_send_ready, &bus_back_ref,
+                                &order_gate, &bus_back_ref,
                             );
                             write_mirror(&state_mirrors, url, mc.state());
                         }
-                    }
-                    // Drain deferred auth subscribes: re-issue each in Open OR Resubscribing.
-                    if result.is_ok()
-                        && matches!(
-                            mc.state(),
-                            ConnectionState::Open | ConnectionState::Resubscribing
-                        )
-                        && !mc.awaiting_token_refresh()
-                    {
-                        let deferred = mc.drain_deferred_open_auth_subscribes();
-                        for (channel, pair, params) in deferred {
-                            // Skip removed/tombstoned keys and in-flight frames. An
-                            // Acked-last-session entry MUST re-issue — its subscription died with the socket.
-                            if registry.params_for(channel, &pair).is_none()
-                                || registry.is_terminated(channel, &pair)
-                                || mc.is_subscribe_ack_armed(channel, pair.clone())
-                            {
-                                continue;
-                            }
-                            subscribe_send::send_single_signed_subscribe(
-                                url, channel, pair, params, mc, &sockets, &auth_stack,
-                                &bus_back_ref,
-                            );
-                            // Stop draining if that send's teardown left the drainable states.
-                            if !matches!(
+                        // Drain deferred auth subscribes: re-issue each in Open OR Resubscribing.
+                        if result.is_ok()
+                            && matches!(
                                 mc.state(),
                                 ConnectionState::Open | ConnectionState::Resubscribing
-                            ) {
-                                break;
+                            )
+                            && !mc.awaiting_token_refresh()
+                        {
+                            let deferred = mc.drain_deferred_open_auth_subscribes();
+                            for (channel, pair, params) in deferred {
+                                // Skip removed/tombstoned keys and in-flight frames. An
+                                // Acked-last-session entry MUST re-issue — its subscription died with the socket.
+                                if registry.params_for_url(url, channel, &pair).is_none()
+                                    || registry.is_terminated_for(url, channel, &pair)
+                                    || mc.is_subscribe_ack_armed(channel, pair.clone())
+                                {
+                                    continue;
+                                }
+                                subscribe_send::send_single_signed_subscribe(
+                                    url, channel, pair, params, mc, &sockets, &auth_stack,
+                                    &bus_back_ref,
+                                );
+                                // Stop draining if that send's teardown left the drainable states.
+                                if !matches!(
+                                    mc.state(),
+                                    ConnectionState::Open | ConnectionState::Resubscribing
+                                ) {
+                                    break;
+                                }
                             }
+                            write_mirror(&state_mirrors, url, mc.state());
                         }
-                        write_mirror(&state_mirrors, url, mc.state());
                     }
                     // Cold-start unblock: recompute + emit send-ready now the lazy first
                     // token fetch landed.
-                    refresh_send_ready(url, mc, &registry, &auth_stack, &auth_send_ready, &bus_back_ref);
+                    refresh_send_ready(url, mc, &registry, &auth_stack, &order_gate, &bus_back_ref);
                     // Only a SUCCESS realigns the proactive timer; a FAILURE must not
                     // (the stale instant is already past — hot refetch loop).
-                    if result.is_ok() || auth_stack.cached_token().is_none() {
+                    if timer_owner == url
+                        && (result.is_ok() || auth_stack.cached_token().is_none())
+                    {
                         rearm_token_refresh(mc, &auth_stack);
                     }
                     match mc.socket() {
@@ -463,20 +550,35 @@ pub async fn run(init: IoReactorInit) {
                     &mut conns,
                     &mut registry,
                     &handler_registry,
-                    &auth_stack,
-                    &auth_send_ready,
-                    &bus_back_ref,
+                    handles,
                     &mut drop_tracker,
                     &mut malformed_warn_tracker,
                     &mut sockets,
-                    &state_mirrors,
                     &mut upgrade_guards,
-                    &upgrade_tx,
                 ).await;
             }
 
             (url, fsm_event) = timer::next_timer_arm(&conns) => {
                 if let Some(mc) = conns.get_mut(&url) {
+                    // The handshake is still in progress, so this ack timer does not
+                    // mean the venue failed to answer. Pop it, then arm it again, or
+                    // a later ack looks unarmed and never marks the row Acked.
+                    if !url.requires_ws_token()
+                        && mc.state() == ConnectionState::Connecting
+                        && let crate::conn::managed_connection::FsmEvent::TimerSubscribeAckTimeout {
+                            channel,
+                            pair,
+                        } = &fsm_event
+                    {
+                        let channel = *channel;
+                        let pair = pair.clone();
+                        timer::pop_timer_for_event(mc, &fsm_event);
+                        let due_at =
+                            due_after_ms(mc, subscribe_ack_timeout_ms(&bus_back_ref).max(1));
+                        mc.arm_subscribe_ack(channel, pair, due_at);
+                        continue;
+                    }
+
                     // Timers MUST be popped BEFORE FSM dispatch: an event with no FSM arm
                     // would otherwise re-fire in a tight loop.
                     timer::pop_timer_for_event(mc, &fsm_event);
@@ -543,10 +645,9 @@ pub async fn run(init: IoReactorInit) {
                     if let crate::conn::managed_connection::FsmEvent::TimerTokenRefreshDue =
                         &fsm_event
                     {
-                        debug_assert_eq!(
-                            url,
-                            WsUrl::Auth,
-                            "proactive token-refresh timer fired on a non-auth MC"
+                        debug_assert!(
+                            url.requires_ws_token(),
+                            "proactive token-refresh timer fired on a non-token MC"
                         );
                         if !matches!(mc.state(), ConnectionState::Closed | ConnectionState::Failed) {
                             auth_stack.proactive_refresh();
@@ -576,40 +677,39 @@ pub async fn run(init: IoReactorInit) {
 
         // Once the ClientClose marker is set AND every conn is == Closed
         // (Failed/Idle don't count), emit one ClientClosedEvent and self-exit.
-        if let Some((request_id, initiated_at)) = pending_client_close {
-            if conns
+        if let Some((request_id, initiated_at)) = pending_client_close
+            && conns
                 .values()
                 .all(|mc| mc.state() == ConnectionState::Closed)
-            {
-                if let Some(bus) = bus_back_ref.upgrade() {
-                    let env = crate::dispatch::EventEnvelope {
-                        event_type: crate::dispatch::EventType::ClientClosedEvent,
-                        event_version: 1,
-                        timestamp_monotonic: bus.clock().now(),
-                        request_id: Some(request_id),
-                        payload: crate::dispatch::EventPayload::ClientClosedEvent {
-                            reason: crate::dispatch::ClientCloseReason::UserClose,
-                            initiated_at_monotonic: initiated_at,
-                        },
-                    };
-                    // Resolve the close() waiter DIRECTLY so its completion never depends
-                    // on the ring drain.
-                    bus.deliver_correlated(&env);
-                    // The broadcast copy carries request_id: None — a Some would re-run
-                    // correlation and latch a dead miss-buffer entry.
-                    bus.publish(crate::dispatch::EventEnvelope {
-                        request_id: None,
-                        ..env
-                    });
-                    bus.close_dispatch_and_drain().await;
-                }
-                tracing::debug!(
-                    target: "kraken_sdk::io_reactor",
-                    request_id,
-                    "client close complete (all connections Closed); reactor self-exiting"
-                );
-                break;
+        {
+            if let Some(bus) = bus_back_ref.upgrade() {
+                let env = crate::dispatch::EventEnvelope {
+                    event_type: crate::dispatch::EventType::ClientClosedEvent,
+                    event_version: 1,
+                    timestamp_monotonic: bus.clock().now(),
+                    request_id: Some(request_id),
+                    payload: crate::dispatch::EventPayload::ClientClosedEvent {
+                        reason: crate::dispatch::ClientCloseReason::UserClose,
+                        initiated_at_monotonic: initiated_at,
+                    },
+                };
+                // Resolve the close() waiter DIRECTLY so its completion never depends
+                // on the ring drain.
+                bus.deliver_correlated(&env);
+                // The broadcast copy carries request_id: None — a Some would re-run
+                // correlation and latch a dead miss-buffer entry.
+                bus.publish(crate::dispatch::EventEnvelope {
+                    request_id: None,
+                    ..env
+                });
+                bus.close_dispatch_and_drain().await;
             }
+            tracing::debug!(
+                target: "kraken_sdk::io_reactor",
+                request_id,
+                "client close complete (all connections Closed); reactor self-exiting"
+            );
+            break;
         }
     }
 
@@ -625,15 +725,73 @@ fn rearm_token_refresh(mc: &mut ManagedConnection, auth_stack: &Arc<crate::auth:
     }
 }
 
-/// Race `recv_frame()` across the fixed two-slot v1 topology (Public + Auth);
-/// an absent socket's arm pends forever.
+/// The one connection whose timer proactively refreshes the shared token: Spot
+/// Auth, unless Auth is inactive while Unified private is live.
+fn token_timer_owner(conns: &HashMap<WsUrl, ManagedConnection>) -> WsUrl {
+    let active = |url: WsUrl| conns.get(&url).is_some_and(connection_active);
+    timer_owner_for(active(WsUrl::Auth), active(WsUrl::UnifiedPrivate))
+}
+
+fn connection_active(mc: &ManagedConnection) -> bool {
+    !matches!(
+        mc.state(),
+        ConnectionState::Idle | ConnectionState::Closed | ConnectionState::Failed
+    )
+}
+
+fn reconcile_token_timer(
+    conns: &mut HashMap<WsUrl, ManagedConnection>,
+    auth_stack: &Arc<crate::auth::AuthStack>,
+    last_owner: WsUrl,
+) -> WsUrl {
+    let owner = token_timer_owner(conns);
+    if owner != last_owner {
+        for url in [last_owner, owner] {
+            if let Some(mc) = conns.get_mut(&url) {
+                mc.disarm_token_refresh();
+            }
+        }
+        if let Some(mc) = conns.get_mut(&owner)
+            && connection_active(mc)
+        {
+            rearm_token_refresh(mc, auth_stack);
+        }
+    }
+    owner
+}
+
+fn timer_owner_for(auth_active: bool, unified_private_active: bool) -> WsUrl {
+    if !auth_active && unified_private_active {
+        WsUrl::UnifiedPrivate
+    } else {
+        WsUrl::Auth
+    }
+}
+
+fn should_deliver_token_refresh(
+    url: WsUrl,
+    request_id: u64,
+    state: ConnectionState,
+    pending_reactive_token_refresh_id: Option<u64>,
+    timer_owner: WsUrl,
+) -> bool {
+    if request_id == 0 {
+        return timer_owner == url
+            && matches!(
+                state,
+                ConnectionState::Open | ConnectionState::Resubscribing
+            );
+    }
+    pending_reactive_token_refresh_id == Some(request_id)
+}
+
+/// Race `recv_frame()` across the fixed four-connection topology. An absent
+/// socket's arm pends forever, preserving lazy connection behavior.
 async fn read_frame_from_any(
     sockets: &HashMap<WsUrl, Arc<dyn WsSocket>>,
 ) -> (WsUrl, Result<WsFrame, TransportError>) {
-    // Adding a WsUrl variant must fail compilation here: the race below polls
-    // exactly these arms, so a new socket key would silently never be read.
-    const _: fn(WsUrl) = |u| match u {
-        WsUrl::Public | WsUrl::Auth => (),
+    const _: fn(WsUrl) = |url| match url {
+        WsUrl::Public | WsUrl::Auth | WsUrl::UnifiedPublic | WsUrl::UnifiedPrivate => (),
     };
     async fn recv_or_pend(
         sockets: &HashMap<WsUrl, Arc<dyn WsSocket>>,
@@ -647,6 +805,8 @@ async fn read_frame_from_any(
     tokio::select! {
         out = recv_or_pend(sockets, WsUrl::Public) => out,
         out = recv_or_pend(sockets, WsUrl::Auth) => out,
+        out = recv_or_pend(sockets, WsUrl::UnifiedPublic) => out,
+        out = recv_or_pend(sockets, WsUrl::UnifiedPrivate) => out,
     }
 }
 

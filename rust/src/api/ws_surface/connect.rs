@@ -14,60 +14,48 @@ impl WsSurface {
     const ENSURE_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Drive `url` to a state the pending order can be sent from.
-    /// Idempotent and multi-order-race safe: only `Idle` triggers the connect.
-    /// No REST fallback — failure surfaces as [`ConnectionError`].
+    /// Idempotent: only `Idle` triggers the connect. No REST fallback; failure surfaces as [`ConnectionError`].
     pub(crate) async fn ensure_order_sendable(&self, url: WsUrl) -> Result<(), ConnectionError> {
-        // Concurrent subscribe + bare order can NotOpen during Authenticating;
-        // NotOpen is retryable. Cold bare-order race closed by ConnectionSendReadyEvent.
-        self.ensure_sendable(url).await
-    }
-
-    /// Bring-up driver. `Authenticating` is a valid completion target when the
-    /// auth registry is empty (bare-order send-point).
-    async fn ensure_sendable(&self, url: WsUrl) -> Result<(), ConnectionError> {
-        // No supervisor (REST-only test path) → typed error, not a panic.
+        // NotOpen during Authenticating is retryable; the cold bare-order race is closed by ConnectionSendReadyEvent.
+        // No supervisor on the REST-only test path: a typed error, not a panic.
         let supervisor = self
             .supervisor
             .as_ref()
             .ok_or_else(ConnectionError::not_open)?;
 
-        // WS op before `ready()`: I/O reactor isn't draining, so Idle connect would
-        // stall to the backstop. Flag flips once; in-flight bring-up still awaits below.
+        // Before `ready()` the I/O reactor is not draining; an Idle connect would stall to the backstop.
         if !self.bus.is_io_reactor_started() {
             return Err(ConnectionError::not_open());
         }
 
-        // `Authenticating` is a send-point only for bare-order (order is the auth probe).
-        // With an auth subscription the order must wait for `Open`.
-        let accept_authenticating = !supervisor.auth_has_subscriptions();
+        // `Authenticating` is a send-point only for a bare order; with an auth subscription the order waits for `Open`.
+        let accept_authenticating = !supervisor.order_gate().has_subscriptions(url);
 
         match supervisor.current_state(url) {
             ConnectionState::Open => return Ok(()),
-            // Bare `Authenticating` is not a short-circuit: token may not be cached yet.
-            // Await `ConnectionSendReadyEvent` instead. Already in flight — not a connect trigger.
+            // Bare `Authenticating` does not short-circuit: the token may not be cached yet.
             ConnectionState::Authenticating if accept_authenticating => {}
-            // Only Idle triggers connect. Queue-full maps to `not_open` (FSM stays Idle).
             ConnectionState::Idle => {
                 supervisor
                     .connect(url)
                     .map_err(|_| ConnectionError::not_open())?;
             }
-            // Bring-up already in flight — do not re-trigger; await the same Open event.
+            // Bring-up already in flight: await the same Open event, do not re-trigger.
             ConnectionState::Connecting
             | ConnectionState::Authenticating
             | ConnectionState::Resubscribing => {}
-            ConnectionState::BackingOff
-            | ConnectionState::Failed
-            | ConnectionState::Closing
-            | ConnectionState::Closed => return Err(ConnectionError::not_open()),
+            ConnectionState::Failed => return Err(self.bus.failed_connection_error(url)),
+            ConnectionState::BackingOff | ConnectionState::Closing | ConnectionState::Closed => {
+                return Err(ConnectionError::not_open());
+            }
         }
 
         self.await_open_by_url(url, Self::ENSURE_OPEN_TIMEOUT, accept_authenticating)
             .await
     }
 
-    /// Await the first URL-matching open (Ok) or failed/closed (Err), bounded by
-    /// `timeout`. URL-keyed so N racing orders resolve on one Open.
+    /// Await the first open (Ok) or failure or close (Err) of `url`, bounded by `timeout`.
+    /// Keyed by URL so racing orders resolve on one Open.
     async fn await_open_by_url(
         &self,
         url: WsUrl,
@@ -77,19 +65,18 @@ impl WsSurface {
         let (tx, rx) = oneshot::channel::<Result<(), ConnectionError>>();
         let tx_cell = Arc::new(std::sync::Mutex::new(Some(tx)));
 
-        // Guard before first subscribe so every exit path tears down subscribers.
+        // Guard first so every exit path tears down subscribers.
         let mut guard = SubscriberGuard::new(self.weak_bus.clone());
 
         let tx_open = Arc::clone(&tx_cell);
         let open_sub = self.bus.subscribe(
             EventType::ConnectionOpenEvent,
             Arc::new(move |env: &EventEnvelope| {
-                if let EventPayload::ConnectionOpenEvent { url: u, .. } = &env.payload {
-                    if *u == url {
-                        if let Some(tx) = tx_open.lock().expect("ensure_open tx lock").take() {
-                            let _ = tx.send(Ok(()));
-                        }
-                    }
+                if let EventPayload::ConnectionOpenEvent { url: u, .. } = &env.payload
+                    && *u == url
+                    && let Some(tx) = tx_open.lock().expect("ensure_open tx lock").take()
+                {
+                    let _ = tx.send(Ok(()));
                 }
             }),
             1,
@@ -99,47 +86,52 @@ impl WsSurface {
         let fail_sub = self.bus.subscribe(
             EventType::ConnectionFailedEvent,
             Arc::new(move |env: &EventEnvelope| {
-                if let EventPayload::ConnectionFailedEvent { url: u, .. } = &env.payload {
-                    if *u == url {
-                        if let Some(tx) = tx_fail.lock().expect("ensure_open tx lock").take() {
-                            let _ = tx.send(Err(ConnectionError::not_open()));
-                        }
-                    }
+                if let EventPayload::ConnectionFailedEvent {
+                    url: u,
+                    last_error,
+                    non_transient_class,
+                    ..
+                } = &env.payload
+                    && *u == url
+                    && let Some(tx) = tx_fail.lock().expect("ensure_open tx lock").take()
+                {
+                    let _ = tx.send(Err(ConnectionError::connection_failed(
+                        *non_transient_class,
+                        last_error,
+                    )));
                 }
             }),
             1,
         );
         guard.push(fail_sub);
 
-        // Concurrent close emits only ConnectionClosedEvent — resolve not_open immediately.
+        // A concurrent close emits only ConnectionClosedEvent; resolve `not_open` at once.
         let tx_closed = Arc::clone(&tx_cell);
         let closed_sub = self.bus.subscribe(
             EventType::ConnectionClosedEvent,
             Arc::new(move |env: &EventEnvelope| {
-                if let EventPayload::ConnectionClosedEvent { url: u, .. } = &env.payload {
-                    if *u == url {
-                        if let Some(tx) = tx_closed.lock().expect("ensure_open tx lock").take() {
-                            let _ = tx.send(Err(ConnectionError::not_open()));
-                        }
-                    }
+                if let EventPayload::ConnectionClosedEvent { url: u, .. } = &env.payload
+                    && *u == url
+                    && let Some(tx) = tx_closed.lock().expect("ensure_open tx lock").take()
+                {
+                    let _ = tx.send(Err(ConnectionError::not_open()));
                 }
             }),
             1,
         );
         guard.push(closed_sub);
 
-        // Send-ready subscriber (order path only); same oneshot as Open — both mean Ok.
+        // Bare-order path only: send-ready (token cached) resolves Ok, like Open.
         if accept_authenticating {
             let tx_ready = Arc::clone(&tx_cell);
             let send_ready_sub = self.bus.subscribe(
                 EventType::ConnectionSendReadyEvent,
                 Arc::new(move |env: &EventEnvelope| {
-                    if let EventPayload::ConnectionSendReadyEvent { url: u, .. } = &env.payload {
-                        if *u == url {
-                            if let Some(tx) = tx_ready.lock().expect("ensure_open tx lock").take() {
-                                let _ = tx.send(Ok(()));
-                            }
-                        }
+                    if let EventPayload::ConnectionSendReadyEvent { url: u, .. } = &env.payload
+                        && *u == url
+                        && let Some(tx) = tx_ready.lock().expect("ensure_open tx lock").take()
+                    {
+                        let _ = tx.send(Ok(()));
                     }
                 }),
                 1,
@@ -147,22 +139,22 @@ impl WsSurface {
             guard.push(send_ready_sub);
         }
 
-        // Re-check after subscribe to close the snapshot↔subscribe race.
+        // Re-check after subscribe to close the snapshot/subscribe race.
         if let Some(sup) = self.supervisor.as_ref() {
             match sup.current_state(url) {
                 ConnectionState::Open => {
                     return Ok(());
                 }
-                // Level-check auth_send_ready(): true recovers a missed edge; else fall through.
                 ConnectionState::Authenticating if accept_authenticating => {
-                    if sup.auth_send_ready() {
+                    // A level check recovers a send-ready edge missed before the subscribe.
+                    if sup.order_gate().send_ready(url) {
                         return Ok(());
                     }
                 }
-                ConnectionState::Failed | ConnectionState::Closing | ConnectionState::Closed => {
+                ConnectionState::Failed => return Err(self.bus.failed_connection_error(url)),
+                ConnectionState::Closing | ConnectionState::Closed => {
                     return Err(ConnectionError::not_open());
                 }
-                // Transient — await; do not re-trigger (Idle's connect already fired).
                 ConnectionState::Idle
                 | ConnectionState::Connecting
                 | ConnectionState::Authenticating
@@ -171,7 +163,7 @@ impl WsSurface {
             }
         }
 
-        // Race oneshot against the backstop. Only send-ready (token cached) unblocks bare order.
+        // Only send-ready (token cached) unblocks a bare order.
         let outcome = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ConnectionError::not_open()),
@@ -244,23 +236,25 @@ mod tests {
 
     #[tokio::test]
     async fn await_open_resolves_via_level_check_when_already_send_ready() {
-        let (surface, bus, supervisor, auth_mirror) = make_surface_with_supervisor();
-        auth_mirror.store(ConnectionState::Authenticating.as_u8(), Ordering::Release);
-        supervisor
-            .auth_send_ready_flag()
-            .store(true, Ordering::Release);
-        assert_eq!(bus.subscriber_count(EventType::ConnectionSendReadyEvent), 0);
+        let (surface, bus, supervisor, _auth_mirror) = make_surface_with_supervisor();
+        let mirrors = supervisor.state_mirror_clones();
+        for url in [WsUrl::Auth, WsUrl::UnifiedPrivate] {
+            mirrors[&url].store(ConnectionState::Authenticating.as_u8(), Ordering::Release);
+            supervisor.order_gate().set_send_ready(url, true);
+            assert_eq!(bus.subscriber_count(EventType::ConnectionSendReadyEvent), 0);
 
-        let res = tokio::time::timeout(
-            TEST_BUDGET,
-            surface.await_open_by_url(WsUrl::Auth, TEST_BUDGET, true),
-        )
-        .await
-        .expect("level check must resolve immediately — NO hang");
-        assert!(
-            res.is_ok(),
-            "send-ready level flag true → Ok via level check"
-        );
+            let res = tokio::time::timeout(
+                TEST_BUDGET,
+                surface.await_open_by_url(url, TEST_BUDGET, true),
+            )
+            .await
+            .expect("level check must resolve immediately — NO hang");
+            assert!(
+                res.is_ok(),
+                "{url:?}: send-ready level flag true → Ok via level check"
+            );
+            supervisor.order_gate().set_send_ready(url, false);
+        }
 
         assert_eq!(
             bus.subscriber_count(EventType::ConnectionSendReadyEvent),

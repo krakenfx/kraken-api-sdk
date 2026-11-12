@@ -1,9 +1,13 @@
-//! `TradeNamespace` — Spot private REST/WS trading. Every order method returns
+//! `TradeNamespace` — Spot private REST/WS trading, and Futures trading via
+//! [`TradeNamespace::futures`]. Every order method returns
 //! a [`PendingTrade<Req, Resp>`]; the wire call fires on `.await`. Defaults to WS v2.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crate::api::SystemStatus;
+use crate::dispatch::dispatch_table::Product;
 use crate::dispatch::{Op, Transport, WsOp};
 use crate::error::ConnectionError;
 use crate::rest::RestSurface;
@@ -12,6 +16,7 @@ use crate::types::ClOrdId;
 mod error;
 mod events;
 mod executors;
+mod futures;
 mod pending;
 mod snap;
 mod types;
@@ -21,14 +26,16 @@ mod ws_compose;
 mod tests;
 
 pub use error::{OrderError, TradeError};
+pub use futures::FuturesTradeNamespace;
 pub use pending::PendingTrade;
 pub use types::{
     AddOrderBatchRequest, AddOrderBatchResponse, AddOrderDescr, AddOrderResponse, AmendId,
     AmendOrderResponse, BatchOrderEntry, BatchOrderResult, BatchResult, CancelAllRequest,
     CancelAllResponse, CancelBatchRequest, CancelBatchResponse, CancelOrderResponse, CancelRequest,
-    CloseOrderType, ConditionalClose, DeadlineSpec, DeadmanRequest, DeadmanResponse, OFlag,
-    OrderAmendRequest, OrderRequest, OrderType, Price, PriceUnit, Side, StpType, TimeInForce,
-    TimeSpec, TriggerKind,
+    CloseOrderType, ConditionalClose, DeadlineSpec, DeadmanRequest, DeadmanResponse, FuturesOrder,
+    FuturesOrderAmendRequest, FuturesOrderBatchRequest, FuturesOrderRef, FuturesOrderRequest,
+    OFlag, OrderAmendRequest, OrderRequest, OrderType, Price, PriceUnit, Side, StpType,
+    TimeInForce, TimeSpec, TriggerKind,
 };
 
 #[cfg(test)]
@@ -63,24 +70,30 @@ use executors::{
     deadman_exec, order_batch_exec,
 };
 
-/// Typed reject for an explicit `.via(...)` naming a transport with no
-/// dispatch entry for this op.
 pub(crate) fn unsupported_transport(
     op: crate::dispatch::Op,
+    product: Product,
     dispatch: &crate::dispatch::dispatch_table::DispatchTable,
     t: Transport,
 ) -> TradeError {
-    use crate::dispatch::dispatch_table::Product;
-    const BOTH: &[Transport] = &[Transport::Rest, Transport::WsV2Auth];
-    const REST_ONLY: &[Transport] = &[Transport::Rest];
-    const WS_ONLY: &[Transport] = &[Transport::WsV2Auth];
-    let ok = |tr| dispatch.resolve(op, Product::Spot, tr).is_ok();
-    let legal = match (ok(Transport::Rest), ok(Transport::WsV2Auth)) {
-        (true, true) => BOTH,
-        (true, false) => REST_ONLY,
-        (false, true) => WS_ONLY,
-        // Every seeded trade op has at least one leg; REST is the floor.
-        (false, false) => REST_ONLY,
+    const BY_ROUTES: [&[Transport]; 8] = [
+        &[],
+        &[Transport::Rest],
+        &[Transport::WsV2Auth],
+        &[Transport::Rest, Transport::WsV2Auth],
+        &[Transport::FuturesWs],
+        &[Transport::Rest, Transport::FuturesWs],
+        &[Transport::WsV2Auth, Transport::FuturesWs],
+        &[Transport::Rest, Transport::WsV2Auth, Transport::FuturesWs],
+    ];
+    let routed = |tr| usize::from(dispatch.resolve(op, product, tr).is_ok());
+    let routes = routed(Transport::Rest)
+        | (routed(Transport::WsV2Auth) << 1)
+        | (routed(Transport::FuturesWs) << 2);
+    let legal = match (routes, product) {
+        (0, Product::Spot) => BY_ROUTES[1],
+        (0, Product::Futures) => BY_ROUTES[4],
+        (routes, _) => BY_ROUTES[routes],
     };
     TradeError::UnsupportedTransport {
         transport: t,
@@ -88,27 +101,41 @@ pub(crate) fn unsupported_transport(
     }
 }
 
-/// Error when no `WsSurface` was wired — typed, never a panic.
 pub(crate) fn ws_surface_unavailable() -> TradeError {
     TradeError::WsSurfaceUnavailable
 }
 
-/// Map a WS-path connection failure into a [`TradeError`]. The SDK never
-/// auto-retries an `add_order`; `retryable` tells the caller if re-issuing is safe.
+/// Maps a WS connection failure to a [`TradeError`]; an `add_order` is never auto-retried.
 pub(crate) fn ws_conn_error_to_trade(e: ConnectionError) -> TradeError {
-    // Full caller→I/O queue → not sent → QueueFull (retryable).
+    if e.is_session_token_unavailable() {
+        return TradeError::SessionExpired { request_id: None };
+    }
+    ws_conn_error_to_transport(e)
+}
+
+/// [`ws_conn_error_to_trade`] without the session-token case; the close-time dead-man
+/// disarm uses it so an unsendable disarm still reports as `Transport`, not `SessionExpired`.
+pub(crate) fn ws_conn_error_to_transport(e: ConnectionError) -> TradeError {
     if e.is_queue_full() {
         return TradeError::QueueFull { request_id: None };
     }
+    if e.is_permission_denied() {
+        return TradeError::PermissionDenied { request_id: None };
+    }
+    if let Some(cause) = e.authentication_failure() {
+        return TradeError::AuthenticationFailed {
+            kraken_message: cause.to_owned(),
+            request_id: None,
+        };
+    }
     if e.is_response_timeout() {
-        // Deadline timeout is sent-ambiguous → never auto-retry.
+        // Sent-ambiguous: never auto-retried.
         return TradeError::Transport {
             kind: crate::transport::TransportErrorKind::RequestSentNoResponse,
             transient: true,
             request_id: None,
         };
     }
-    // Down/not-open WS is retryable; send-ambiguity is handled by the executor.
     TradeError::Transport {
         kind: crate::transport::TransportErrorKind::Other(e.to_string()),
         transient: true,
@@ -116,15 +143,34 @@ pub(crate) fn ws_conn_error_to_trade(e: ConnectionError) -> TradeError {
     }
 }
 
-/// Caller-side SystemStatus pre-flight gate. Fast-fail only — wire rejection
-/// stays authoritative; no auto-retry.
+/// Maps a WS error that arrived after the frame was written. A dropped placement, amend or
+/// batch may have reached the venue, so it is sent-ambiguous and not retryable; every other
+/// op, and any error that proves nothing was sent, keeps [`ws_conn_error_to_trade`].
+pub(crate) fn ws_sent_error_to_trade(
+    op: crate::dispatch::OrderOp,
+    e: ConnectionError,
+) -> TradeError {
+    if !crate::dispatch::WsOp::from(op).is_placement()
+        || e.is_definitely_not_sent()
+        || e.is_response_timeout()
+    {
+        return ws_conn_error_to_trade(e);
+    }
+    TradeError::Transport {
+        kind: crate::transport::TransportErrorKind::RequestSentNoResponse,
+        transient: true,
+        request_id: None,
+    }
+}
+
+/// Fast-fail pre-flight gate; the wire rejection stays authoritative.
 pub(crate) fn gate_system_status(status: &SystemStatus, op: WsOp) -> Result<(), TradeError> {
     let norm = status.status.to_ascii_lowercase().replace('-', "_");
     let online = norm == "online";
     let cancel_or_post = matches!(norm.as_str(), "cancel_only" | "post_only");
     let allowed = match op {
         WsOp::AddOrder | WsOp::AmendOrder | WsOp::BatchAdd => online,
-        WsOp::CancelOrder | WsOp::CancelAll | WsOp::CancelAllOrdersAfter => {
+        WsOp::CancelOrder | WsOp::BatchCancel | WsOp::CancelAll | WsOp::CancelAllOrdersAfter => {
             online || cancel_or_post
         }
     };
@@ -146,55 +192,79 @@ fn suppress_auto_cl_ord_id(userref: &Option<i32>, has_conditional_close: bool) -
     userref.is_some() || has_conditional_close
 }
 
-/// Spot private trading namespace (REST + auth WS v2). Accessed via `client.trade()`.
-pub struct TradeNamespace {
+/// Wiring shared by the Spot and Futures trade namespaces.
+#[derive(Clone)]
+struct TradeCore {
     rest: Arc<RestSurface>,
-    /// Internal WS facade for the `.via(Transport::WsV2Auth)` branch.
-    /// `None` in REST-only construction — returns a typed error, never a panic.
+    /// `None` in REST-only construction; WS methods then return a typed error.
     ws: Option<Arc<crate::api::ws_surface::WsSurface>>,
-    /// Shared knob holder handed to each `PendingTrade`.
     knobs: Arc<crate::build::knobs::Knobs>,
-    /// Frozen dispatch table handed to each `PendingTrade`.
     dispatch: Arc<crate::dispatch::dispatch_table::DispatchTable>,
+    /// Whether this client has armed a Futures dead-man's switch that `close()` must disarm.
+    futures_deadman_armed: Arc<DeadmanFlag>,
+    spot_deadman_armed: Arc<DeadmanFlag>,
+    futures_in_flight: Option<Arc<tokio::sync::Semaphore>>,
 }
 
-impl std::fmt::Debug for TradeNamespace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TradeNamespace").finish_non_exhaustive()
+#[derive(Default)]
+struct DeadmanFlag(AtomicU64);
+
+impl DeadmanFlag {
+    const fn armed_next(s: u64) -> u64 {
+        (((s >> 1) + 1) << 1) | 1
     }
-}
 
-impl TradeNamespace {
-    /// REST-only constructor for unit tests. No WS surface → typed error on WS.
-    #[cfg(test)]
-    pub(crate) fn new(rest: Arc<RestSurface>) -> Self {
-        Self {
-            rest,
-            ws: None,
-            knobs: Arc::new(crate::build::knobs::Knobs::defaults()),
-            dispatch: Arc::new(
-                crate::dispatch::dispatch_table::DispatchTable::with_default_spot_table(),
-            ),
+    fn cas_update(&self, f: impl Fn(u64) -> Option<u64>) -> Result<u64, u64> {
+        let mut cur = self.0.load(Ordering::SeqCst);
+        loop {
+            let Some(next) = f(cur) else {
+                return Err(cur);
+            };
+            match self
+                .0
+                .compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(prev) => return Ok(prev),
+                Err(seen) => cur = seen,
+            }
         }
     }
 
-    /// Full constructor — wires the WS facade for the auth-WS order path.
-    pub(crate) fn new_with_ws(
-        rest: Arc<RestSurface>,
-        ws: Arc<crate::api::ws_surface::WsSurface>,
-        knobs: Arc<crate::build::knobs::Knobs>,
-        dispatch: Arc<crate::dispatch::dispatch_table::DispatchTable>,
-    ) -> Self {
-        Self {
-            rest,
-            ws: Some(ws),
-            knobs,
-            dispatch,
-        }
+    fn arm(&self) -> u64 {
+        let (Ok(prev) | Err(prev)) = self.cas_update(|s| Some(Self::armed_next(s)));
+        Self::armed_next(prev)
     }
 
-    /// SystemStatus snapshot for the pre-flight gate. v1 returns a permissive
-    /// `Online` placeholder; wire rejection stays authoritative.
+    fn seen(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    fn clear_if_unchanged(&self, seen: u64) {
+        self.0
+            .compare_exchange(seen, seen & !1, Ordering::AcqRel, Ordering::Acquire)
+            .ok();
+    }
+
+    fn rearm_if_latest(&self, mine: u64) {
+        self.cas_update(|s| (s >> 1 == mine >> 1).then_some(s | 1))
+            .ok();
+    }
+
+    fn take(&self) -> bool {
+        fence(Ordering::SeqCst);
+        self.0.fetch_and(!1, Ordering::SeqCst) & 1 != 0
+    }
+}
+
+fn in_flight_slots(knobs: &crate::build::knobs::Knobs) -> Option<Arc<tokio::sync::Semaphore>> {
+    knobs
+        .futures_max_in_flight
+        .filter(|&n| n > 0)
+        .map(|n| Arc::new(tokio::sync::Semaphore::new(n as usize)))
+}
+
+impl TradeCore {
+    /// Permissive `Online` placeholder; the wire rejection stays authoritative.
     fn system_status_snapshot(&self) -> crate::api::SystemStatus {
         crate::api::SystemStatus {
             status: "online".to_string(),
@@ -202,9 +272,9 @@ impl TradeNamespace {
         }
     }
 
-    /// Private constructor for a [`PendingTrade`].
     fn make_pending<Req, Resp>(
         &self,
+        product: Product,
         req: Req,
         op: Op,
         cl_ord_id: Option<ClOrdId>,
@@ -216,14 +286,133 @@ impl TradeNamespace {
             self.ws.clone(),
             self.system_status_snapshot(),
             Arc::clone(&self.knobs),
+            self.futures_in_flight.clone(),
             op,
+            product,
             Arc::clone(&self.dispatch),
             cl_ord_id,
             exec,
         )
     }
 
-    /// Place an order (`POST /0/private/AddOrder`).
+    fn deadman_armed(&self, product: Product) -> &Arc<DeadmanFlag> {
+        match product {
+            Product::Spot => &self.spot_deadman_armed,
+            Product::Futures => &self.futures_deadman_armed,
+        }
+    }
+
+    fn cancel_all_orders_after(
+        &self,
+        product: Product,
+        timeout: u32,
+    ) -> PendingTrade<DeadmanRequest, DeadmanResponse> {
+        let armed = Arc::clone(self.deadman_armed(product));
+        self.make_pending(
+            product,
+            DeadmanRequest::new(timeout),
+            Op::TradeOrderCancelAllAfter,
+            None,
+            Box::new(move |req, rest, transport, ctx| {
+                let arming = req.timeout_secs > 0;
+                let seen = if arming { armed.arm() } else { armed.seen() };
+                let closing = arming && {
+                    fence(Ordering::SeqCst);
+                    ctx.ws.as_ref().is_some_and(|ws| ws.is_shutting_down())
+                };
+                let run = deadman_exec(req, rest, transport, ctx);
+                Box::pin(async move {
+                    if closing {
+                        return Err(TradeError::ClientClosed);
+                    }
+                    let response = run.await?;
+                    if response.trigger_time.is_none() {
+                        armed.clear_if_unchanged(seen);
+                    } else if arming {
+                        armed.rearm_if_latest(seen);
+                    }
+                    Ok(response)
+                })
+            }),
+        )
+    }
+
+    fn take_deadman_armed(&self, product: Product) -> bool {
+        self.deadman_armed(product).take()
+    }
+}
+
+/// Spot private trading namespace (REST + auth WS v2); Futures orders via [`Self::futures`].
+/// Accessed via `client.trade()`.
+pub struct TradeNamespace {
+    core: TradeCore,
+    futures: FuturesTradeNamespace,
+}
+
+impl std::fmt::Debug for TradeNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TradeNamespace").finish_non_exhaustive()
+    }
+}
+
+impl TradeNamespace {
+    fn with_core(core: TradeCore) -> Self {
+        Self {
+            futures: FuturesTradeNamespace::new(core.clone()),
+            core,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(rest: Arc<RestSurface>) -> Self {
+        Self::with_core(TradeCore {
+            rest,
+            ws: None,
+            knobs: Arc::new(crate::build::knobs::Knobs::defaults()),
+            dispatch: Arc::new(
+                crate::dispatch::dispatch_table::DispatchTable::with_default_table(),
+            ),
+            futures_deadman_armed: Arc::default(),
+            spot_deadman_armed: Arc::default(),
+            futures_in_flight: None,
+        })
+    }
+
+    pub(crate) fn new_with_ws(
+        rest: Arc<RestSurface>,
+        ws: Arc<crate::api::ws_surface::WsSurface>,
+        knobs: Arc<crate::build::knobs::Knobs>,
+        dispatch: Arc<crate::dispatch::dispatch_table::DispatchTable>,
+    ) -> Self {
+        let futures_in_flight = in_flight_slots(&knobs);
+        Self::with_core(TradeCore {
+            rest,
+            ws: Some(ws),
+            knobs,
+            dispatch,
+            futures_deadman_armed: Arc::default(),
+            spot_deadman_armed: Arc::default(),
+            futures_in_flight,
+        })
+    }
+
+    /// The Futures trade namespace.
+    pub fn futures(&self) -> &FuturesTradeNamespace {
+        &self.futures
+    }
+
+    fn make_pending<Req, Resp>(
+        &self,
+        req: Req,
+        op: Op,
+        cl_ord_id: Option<ClOrdId>,
+        exec: pending::ExecFn<Req, Resp>,
+    ) -> PendingTrade<Req, Resp> {
+        self.core
+            .make_pending(Product::Spot, req, op, cl_ord_id, exec)
+    }
+
+    /// Place a Spot order.
     pub fn order(&self, mut req: OrderRequest) -> PendingTrade<OrderRequest, AddOrderResponse> {
         if req.cl_ord_id.is_none()
             && !suppress_auto_cl_ord_id(&req.userref, req.conditional_close.is_some())
@@ -234,8 +423,9 @@ impl TradeNamespace {
         self.make_pending(req, Op::TradeOrder, cl, Box::new(add_order_exec))
     }
 
-    /// Atomically amend an order in-place (`POST /0/private/AmendOrder`).
-    /// Preserves order identity + queue priority (not the deprecated `EditOrder`).
+    /// Atomically amend a Spot order in place by `cl_ord_id`; identity and queue priority are kept.
+    ///
+    /// Spot sends the `amend_order` WebSocket request by default, or `POST /0/private/AmendOrder` over REST.
     ///
     /// # Errors
     /// Surfaced on `.await`:
@@ -244,7 +434,9 @@ impl TradeNamespace {
     /// - [`TradeError::NoAmendableParameters`] — the amend was a no-op (every new value matched the current, e.g. a sub-tick price move).
     /// - [`TradeError::InvalidOrder`] — Kraken rejected the amend (`EOrder:*` / invalid arguments).
     /// - [`TradeError::RateLimited`] — Kraken's throttle family or the SDK's pre-send trading tracker rejected the call; retryable.
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
     pub fn order_amend(
         &self,
         req: OrderAmendRequest,
@@ -255,14 +447,16 @@ impl TradeNamespace {
 
     /// Cancel a single order by `cl_ord_id`.
     ///
-    /// Hits `POST /0/private/CancelOrder`.
+    /// Spot sends the `cancel_order` WebSocket request by default, or `POST /0/private/CancelOrder` over REST.
     ///
     /// # Errors
     /// Surfaced on `.await`:
     /// - [`TradeError::UnknownOrder`] — no open order matches `cl_ord_id`.
     /// - [`TradeError::InvalidOrder`] — Kraken rejected the cancel; `EOrder:Invalid order` covers both an already-gone order and a garbage id.
     /// - [`TradeError::RateLimited`] — Kraken's throttle family or the SDK's pre-send trading tracker rejected the call; retryable.
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
     pub fn cancel(&self, cl_ord_id: ClOrdId) -> PendingTrade<CancelRequest, CancelOrderResponse> {
         let req = CancelRequest::new(cl_ord_id.clone());
         self.make_pending(
@@ -273,9 +467,8 @@ impl TradeNamespace {
         )
     }
 
-    /// Cancel N orders by `cl_ord_id`. Fans out N concurrent single `/CancelOrder`
-    /// calls (unbounded by design); each line's result is independent — one failing
-    /// never fails the others. See docs/guides/placing-orders.md.
+    /// Cancel N orders by `cl_ord_id` as N concurrent single `/CancelOrder` calls; each
+    /// row's result is independent and one failure never fails the others.
     ///
     /// # Errors
     /// Per-order failures land in the response rows as [`BatchResult::Err`] —
@@ -296,13 +489,16 @@ impl TradeNamespace {
     }
 
     /// Cancel ALL of the account's open orders across ALL pairs
-    /// (`POST /0/private/CancelAll`). Returns total count cancelled.
+    /// (the `cancel_all` WebSocket request by default, or `POST /0/private/CancelAll` over
+    /// REST). Returns total count cancelled.
     ///
     /// # Errors
     /// Surfaced on `.await`:
     /// - [`TradeError::RateLimited`] — Kraken's throttle family rejected the call; retryable (the SDK's own pre-send charge never blocks a cancel-all).
     /// - [`TradeError::InvalidOrder`] — Kraken rejected the request (`EOrder:*` / invalid arguments).
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
     pub fn cancel_all(&self) -> PendingTrade<CancelAllRequest, CancelAllResponse> {
         self.make_pending(
             CancelAllRequest,
@@ -313,40 +509,52 @@ impl TradeNamespace {
     }
 
     /// Dead-man's-switch — auto-cancel all orders after `timeout` seconds of
-    /// inactivity (`POST /0/private/CancelAllOrdersAfter`). Each call resets the
+    /// inactivity (the `cancel_all_orders_after` WebSocket request by default, or
+    /// `POST /0/private/CancelAllOrdersAfter` over REST). Each call resets the
     /// timer; pass `0` to disarm.
+    ///
+    /// The timer covers every Spot order on the account. `Client::close()` disarms it only if
+    /// this client requested an arm no later confirmed disarm cleared; the timer is
+    /// account-wide, so that disarm also clears a switch another client set.
     ///
     /// # Errors
     /// Surfaced on `.await`:
     /// - [`TradeError::InvalidOrder`] — Kraken rejected the request (`EOrder:*` / invalid arguments).
     /// - [`TradeError::RateLimited`] — Kraken's throttle family rejected the call; retryable.
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
+    /// - [`TradeError::ClientClosed`] — arming once `close()` has begun; nothing was sent.
     pub fn cancel_all_orders_after(
         &self,
         timeout: u32,
     ) -> PendingTrade<DeadmanRequest, DeadmanResponse> {
-        let req = DeadmanRequest::new(timeout);
-        self.make_pending(
-            req,
-            Op::TradeOrderCancelAllAfter,
-            None,
-            Box::new(deadman_exec),
-        )
+        self.core.cancel_all_orders_after(Product::Spot, timeout)
     }
 
-    /// Place 2-15 orders; each row returns its own result (`txid` or `error`) —
-    /// a rejected entry never fails placed siblings. WS `batch_add` by default or
-    /// REST via `.via(Transport::Rest)`. See docs/guides/placing-orders.md.
+    pub(crate) fn begin_close_disarm(
+        &self,
+    ) -> Option<impl Future<Output = Option<TradeError>> + Send + 'static> {
+        if !self.core.take_deadman_armed(Product::Spot) {
+            return None;
+        }
+        let disarm = self.cancel_all_orders_after(0).via(Transport::Rest);
+        Some(async move { disarm.await.err() })
+    }
+
+    /// Place 2-15 orders; each row returns its own result (`txid` or `error`) and a
+    /// rejected row never fails the others.
     ///
     /// # Errors
-    /// A per-row rejection populates that row's `error`, never a whole-batch
-    /// failure. Surfaced on `.await`:
+    /// Per-row rejections populate that row's `error`. Surfaced on `.await`:
     /// - [`TradeError::BatchSizeOutOfRange`] — fewer than 2 or more than 15 entries; nothing was sent.
     /// - [`TradeError::SettlePositionRequiresLeverage`] / [`TradeError::ReduceOnlyRequiresLeverage`] — an entry failed the field-consistency gates; nothing was sent.
     /// - [`TradeError::InvalidOrder`] — pre-send validation failure (un-placeable transport mix, malformed trailing/close leg, `fok` on a non-limit type, `deadline` set) or a whole-batch Kraken rejection (`EOrder:*`).
     /// - [`TradeError::WsUnsupportedOrderField`] / [`TradeError::RestUnsupportedOrderField`] — an entry carries a field the resolved transport cannot express; route with `.via(...)`.
     /// - [`TradeError::RateLimited`] — Kraken's throttle family or the SDK's pre-send trading tracker rejected the call; retryable.
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
     pub fn order_batch(
         &self,
         mut req: AddOrderBatchRequest,
@@ -370,11 +578,13 @@ impl TradeNamespace {
     /// `OrderType::Market` (`POST /0/private/AddOrder`, `ordertype=market`).
     ///
     /// # Errors
-    /// Surfaced on `.await` (the request is SDK-composed, so `order`'s client-side validation variants cannot fire):
+    /// Surfaced on `.await`:
     /// - [`TradeError::InsufficientFunds`] — the account balance cannot cover the order.
     /// - [`TradeError::InvalidOrder`] — Kraken rejected the order (`EOrder:*`, e.g. volume below the pair minimum).
     /// - [`TradeError::RateLimited`] — Kraken's throttle family or the SDK's pre-send trading tracker rejected the call; retryable.
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
     pub fn market_buy(
         &self,
         pair: crate::types::Symbol,
@@ -387,11 +597,13 @@ impl TradeNamespace {
     /// `OrderType::Market` (`POST /0/private/AddOrder`, `ordertype=market`).
     ///
     /// # Errors
-    /// Surfaced on `.await` (the request is SDK-composed, so `order`'s client-side validation variants cannot fire):
+    /// Surfaced on `.await`:
     /// - [`TradeError::InsufficientFunds`] — the account balance cannot cover the order.
     /// - [`TradeError::InvalidOrder`] — Kraken rejected the order (`EOrder:*`, e.g. volume below the pair minimum).
     /// - [`TradeError::RateLimited`] — Kraken's throttle family or the SDK's pre-send trading tracker rejected the call; retryable.
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
     pub fn market_sell(
         &self,
         pair: crate::types::Symbol,
@@ -404,11 +616,13 @@ impl TradeNamespace {
     /// `OrderType::Limit` + `price` (`POST /0/private/AddOrder`, `ordertype=limit`).
     ///
     /// # Errors
-    /// Surfaced on `.await` (the request is SDK-composed, so `order`'s client-side validation variants cannot fire):
+    /// Surfaced on `.await`:
     /// - [`TradeError::InsufficientFunds`] — the account balance cannot cover the order.
     /// - [`TradeError::InvalidOrder`] — Kraken rejected the order (`EOrder:*`, e.g. a price off the pair's tick or volume below the minimum).
     /// - [`TradeError::RateLimited`] — Kraken's throttle family or the SDK's pre-send trading tracker rejected the call; retryable.
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
     pub fn limit_buy(
         &self,
         pair: crate::types::Symbol,
@@ -424,11 +638,13 @@ impl TradeNamespace {
     /// `OrderType::Limit` + `price` (`POST /0/private/AddOrder`, `ordertype=limit`).
     ///
     /// # Errors
-    /// Surfaced on `.await` (the request is SDK-composed, so `order`'s client-side validation variants cannot fire):
+    /// Surfaced on `.await`:
     /// - [`TradeError::InsufficientFunds`] — the account balance cannot cover the order.
     /// - [`TradeError::InvalidOrder`] — Kraken rejected the order (`EOrder:*`, e.g. a price off the pair's tick or volume below the minimum).
     /// - [`TradeError::RateLimited`] — Kraken's throttle family or the SDK's pre-send trading tracker rejected the call; retryable.
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
     pub fn limit_sell(
         &self,
         pair: crate::types::Symbol,
@@ -445,11 +661,13 @@ impl TradeNamespace {
     /// trigger (`POST /0/private/AddOrder`, `ordertype=stop-loss`).
     ///
     /// # Errors
-    /// Surfaced on `.await` (the request is SDK-composed, so `order`'s client-side validation variants cannot fire):
+    /// Surfaced on `.await`:
     /// - [`TradeError::InsufficientFunds`] — the account balance cannot cover the order.
     /// - [`TradeError::InvalidOrder`] — Kraken rejected the order (`EOrder:*`, e.g. a trigger the engine refuses or volume below the minimum).
     /// - [`TradeError::RateLimited`] — Kraken's throttle family or the SDK's pre-send trading tracker rejected the call; retryable.
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
     pub fn stop_loss_buy(
         &self,
         pair: crate::types::Symbol,
@@ -466,11 +684,13 @@ impl TradeNamespace {
     /// `ordertype=stop-loss`).
     ///
     /// # Errors
-    /// Surfaced on `.await` (the request is SDK-composed, so `order`'s client-side validation variants cannot fire):
+    /// Surfaced on `.await`:
     /// - [`TradeError::InsufficientFunds`] — the account balance cannot cover the order.
     /// - [`TradeError::InvalidOrder`] — Kraken rejected the order (`EOrder:*`, e.g. a trigger the engine refuses or volume below the minimum).
     /// - [`TradeError::RateLimited`] — Kraken's throttle family or the SDK's pre-send trading tracker rejected the call; retryable.
-    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, auth-layer failures carry `AUTH`.
+    /// - [`TradeError::SessionExpired`] — the venue rejected the session token or none was held; nothing is resent. Rebuild the client once the connection has failed.
+    /// - [`TradeError::PermissionDenied`] / [`TradeError::AuthenticationFailed`] — the key lacks a permission, or the connection could not authenticate; nothing was sent.
+    /// - [`TradeError::Transport`] / [`TradeError::QueueFull`] / [`TradeError::LoopDead`] / [`TradeError::MalformedResponse`] / [`TradeError::Unknown`] — connection failure, full send queue, dead reactor, undecodable reply; unmapped Kraken strings degrade to `Unknown`, a local signing failure carries `AUTH`.
     pub fn stop_loss_sell(
         &self,
         pair: crate::types::Symbol,

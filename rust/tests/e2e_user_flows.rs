@@ -80,7 +80,7 @@ static REAL_ORDER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 /// Fetches the COMPLETE public catalogs and asserts every entry decodes, so a
 /// field only a minority omit fails here instead of slipping past a BTC/USD check.
 #[tokio::test]
-#[ignore = "live full-decode guard; set KRAKEN_REST_BASE_URL (e.g. UAT) and run with --ignored"]
+#[ignore = "live full-decode guard; set KRAKEN_REST_BASE_URL and run with --ignored"]
 async fn public_rest_full_response_decodes() {
     let base = match env_cred("KRAKEN_REST_BASE_URL") {
         Some(b) => b,
@@ -264,28 +264,34 @@ async fn public_ws_streaming_survives_staleness() {
         let early = early_ticks.clone();
         let late = late_ticks.clone();
         let t0 = start;
-        client.market().on_ticker(move |_t: &TickerUpdate| {
-            let elapsed = t0.elapsed();
-            if elapsed < Duration::from_secs(30) {
-                early.fetch_add(1, Ordering::Relaxed);
-            } else if elapsed > Duration::from_secs(40) {
-                late.fetch_add(1, Ordering::Relaxed);
-            }
-        })
+        client
+            .market()
+            .on_ticker(move |_t: &TickerUpdate| {
+                let elapsed = t0.elapsed();
+                if elapsed < Duration::from_secs(30) {
+                    early.fetch_add(1, Ordering::Relaxed);
+                } else if elapsed > Duration::from_secs(40) {
+                    late.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .expect("register ticker handler")
     };
 
     let _h_trade = {
         let early = early_ticks.clone();
         let late = late_ticks.clone();
         let t0 = start;
-        client.market().on_trade(move |_t: &TradeUpdate| {
-            let elapsed = t0.elapsed();
-            if elapsed < Duration::from_secs(30) {
-                early.fetch_add(1, Ordering::Relaxed);
-            } else if elapsed > Duration::from_secs(40) {
-                late.fetch_add(1, Ordering::Relaxed);
-            }
-        })
+        client
+            .market()
+            .on_trade(move |_t: &TradeUpdate| {
+                let elapsed = t0.elapsed();
+                if elapsed < Duration::from_secs(30) {
+                    early.fetch_add(1, Ordering::Relaxed);
+                } else if elapsed > Duration::from_secs(40) {
+                    late.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .expect("register trade handler")
     };
 
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -396,17 +402,23 @@ async fn account_ws_streaming() {
 
     let _h_bal = {
         let n = balance_snapshots.clone();
-        client.account().on_balances(move |_u: &BalanceUpdate| {
-            n.fetch_add(1, Ordering::Relaxed);
-        })
+        client
+            .account()
+            .on_balances(move |_u: &BalanceUpdate| {
+                n.fetch_add(1, Ordering::Relaxed);
+            })
+            .expect("register balances handler")
     };
 
     let exec_events = Arc::new(AtomicUsize::new(0));
     let _h_exec = {
         let n = exec_events.clone();
-        client.account().on_executions(move |_u: &ExecutionUpdate| {
-            n.fetch_add(1, Ordering::Relaxed);
-        })
+        client
+            .account()
+            .on_executions(move |_u: &ExecutionUpdate| {
+                n.fetch_add(1, Ordering::Relaxed);
+            })
+            .expect("register executions handler")
     };
 
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1433,21 +1445,27 @@ async fn public_ws_book_streaming() {
     let _h_book = {
         let n = book_updates.clone();
         let last = last_book.clone();
-        client.market().on_book(move |b: &OrderBookUpdate| {
-            n.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut guard) = last.try_lock() {
-                *guard = Some((b.bids.len(), b.asks.len()));
-            }
-        })
+        client
+            .market()
+            .on_book(move |b: &OrderBookUpdate| {
+                n.fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut guard) = last.try_lock() {
+                    *guard = Some((b.bids.len(), b.asks.len()));
+                }
+            })
+            .expect("register book handler")
     };
 
     let raw_updates = Arc::new(AtomicUsize::new(0));
 
     let _h_raw = {
         let n = raw_updates.clone();
-        client.market().on_book_raw(move |_d: &BookDelta| {
-            n.fetch_add(1, Ordering::Relaxed);
-        })
+        client
+            .market()
+            .on_book_raw(move |_d: &BookDelta| {
+                n.fetch_add(1, Ordering::Relaxed);
+            })
+            .expect("register book raw handler")
     };
 
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1510,14 +1528,18 @@ async fn public_ws_combiners_and_ohlc_status() {
             .on_system_status(move |_s: &SystemStatusUpdate| {
                 n.fetch_add(1, Ordering::Relaxed);
             })
+            .expect("register system status handler")
     };
 
     let ohlc_count = Arc::new(AtomicUsize::new(0));
     let _h_ohlc = {
         let n = ohlc_count.clone();
-        client.market().on_ohlc(move |_c: &OhlcUpdate| {
-            n.fetch_add(1, Ordering::Relaxed);
-        })
+        client
+            .market()
+            .on_ohlc(move |_c: &OhlcUpdate| {
+                n.fetch_add(1, Ordering::Relaxed);
+            })
+            .expect("register ohlc handler")
     };
 
     client.ready().await.expect("client ready");
@@ -1778,14 +1800,28 @@ async fn public_subscription_lifecycle() {
 
     let _h_book = client
         .market()
-        .on_book(|_: &kraken_sdk::OrderBookUpdate| {});
-    let _h_braw = client.market().on_book_raw(|_: &kraken_sdk::BookDelta| {});
-    let _h_ohlc = client.market().on_ohlc(|_: &kraken_sdk::OhlcUpdate| {});
+        .on_book(|_: &kraken_sdk::OrderBookUpdate| {})
+        .expect("register book handler");
+    let _h_braw = client
+        .market()
+        .on_book_raw(|_: &kraken_sdk::BookDelta| {})
+        .expect("register book raw handler");
+    let _h_ohlc = client
+        .market()
+        .on_ohlc(|_: &kraken_sdk::OhlcUpdate| {})
+        .expect("register ohlc handler");
     let _h_status = client
         .market()
-        .on_system_status(|_: &kraken_sdk::SystemStatusUpdate| {});
-    let _h_ticker = client.market().on_ticker(|_: &kraken_sdk::TickerUpdate| {});
-    let _h_trade = client.market().on_trade(|_: &kraken_sdk::TradeUpdate| {});
+        .on_system_status(|_: &kraken_sdk::SystemStatusUpdate| {})
+        .expect("register system status handler");
+    let _h_ticker = client
+        .market()
+        .on_ticker(|_: &kraken_sdk::TickerUpdate| {})
+        .expect("register ticker handler");
+    let _h_trade = client
+        .market()
+        .on_trade(|_: &kraken_sdk::TradeUpdate| {})
+        .expect("register trade handler");
 
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -1960,10 +1996,12 @@ async fn account_subscription_unsubscribe() {
 
     let _h_exec = client
         .account()
-        .on_executions(|_: &kraken_sdk::ExecutionUpdate| {});
+        .on_executions(|_: &kraken_sdk::ExecutionUpdate| {})
+        .expect("register executions handler");
     let _h_bal = client
         .account()
-        .on_balances(|_: &kraken_sdk::BalanceUpdate| {});
+        .on_balances(|_: &kraken_sdk::BalanceUpdate| {})
+        .expect("register balances handler");
 
     tokio::time::sleep(Duration::from_millis(400)).await;
 

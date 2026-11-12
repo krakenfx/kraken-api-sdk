@@ -28,8 +28,8 @@ Embedding apps can attribute REST traffic via `.with_headers(HeaderMap)` — a
   `trades` (takes `TradesRequest::new(pair)`), `ohlc` (takes
   `OhlcRequest::new(pair, interval)`), `spreads`, `assets` (`Option<&[&str]>`),
   `pairs`, `server_time`, `status`.
-  WebSocket callbacks (sync; the bare `on_*` forms return a handle, the
-  `*_for` combiners return `Result<SubscriptionGuard, _>`):
+  WebSocket callbacks (sync; the bare `on_*` forms return
+  `Result<HandlerHandle, _>`, the `*_for` combiners `Result<SubscriptionGuard, _>`):
   `on_ticker[_for]`, `on_book[_raw][_for]`, `on_trade[_for]`, `on_ohlc[_for]`,
   `on_system_status`.
 - `client.account()` — private reads (async): `balance`, `extended_balance`,
@@ -48,6 +48,14 @@ Embedding apps can attribute REST traffic via `.with_headers(HeaderMap)` — a
   `unsubscribe_*` (ticker, book, book_raw, trade, ohlc, system_status,
   executions, balances), plus bulk `unsubscribe_all` / `unsubscribe_channel`
   and the read models `list_active` / `find_by_channel` / `status_summary`.
+- `client.market().futures()` / `client.account().futures()` /
+  `client.subscription().futures()` — Unified Futures streams, WebSocket only.
+  Symbols are native wire strings (`"PI_XBTUSD"`), not `Symbol`. `on_*` /
+  `on_*_for` register handlers (account channels need credentials) and return
+  `Result`; `subscribe_*` / `unsubscribe_*` manage them. Method list:
+  `docs/features.md` → "Futures streams".
+- `client.trade().futures()` — Futures orders on the Unified private socket,
+  same `PendingTrade` shape. Method list: `docs/features.md` → "Futures methods".
 - `client.events()` / `client.bus()` — lifecycle event bus
   (`on(EventType, cb)`): connection state, rate-limit warnings, order-book gaps,
   queue-depth samples, slow-callback warnings.
@@ -82,7 +90,7 @@ Embedding apps can attribute REST traffic via `.with_headers(HeaderMap)` — a
    when retaining the payload. Slow / saturated delivery behaviour (and the
    dual-loop model) is defined in
    [`docs/architecture.md`](docs/architecture.md#dual-loop).
-   A subscription is two parts: register the callback (`on_ticker(...)`) **and**
+   A subscription is two parts: register the callback (`on_ticker(...)?`) **and**
    subscribe (`subscription().subscribe_ticker(vec![pair], None, None)?`).
 7. **Credentials come from the environment or a secrets manager — never
    hard-code them**, never log them, never commit them. Pass via
@@ -104,7 +112,7 @@ if let Some(t) = tickers.get(&pair) {
 
 Stream a channel (register callback, then subscribe):
 ```rust
-let _h = client.market().on_trade(|tr| { /* fast, non-blocking */ });
+let _h = client.market().on_trade(|tr| { /* fast, non-blocking */ })?;
 client.subscription().subscribe_trade(vec![Symbol::new("BTC/USD")?], None)?;
 ```
 
@@ -123,7 +131,7 @@ Maintained order book (CRC-validated, gap-recovered):
 ```rust
 let _h = client.market().on_book(|book| {
     // book.bids / book.asks are the current top-N, already validated
-});
+})?;
 client.subscription().subscribe_book(vec![Symbol::new("BTC/USD")?], kraken_sdk::BookDepth::D10)?;
 ```
 

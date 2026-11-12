@@ -1,36 +1,60 @@
-//! WS composition/decoding layer for the trade namespace: `compose_*_params`
-//! request builders, `decode_ws_*` reply parsers, and WS error classification.
+//! WS request composition and reply decoding for the trade namespace.
 
 use crate::conn::managed_connection::WsResponse;
 use crate::dispatch::OrderSubmitStatus;
 use crate::error::ApiError;
 use crate::rest::RestError;
-use crate::types::ClOrdId;
+use crate::types::{ClOrdId, WsUrl};
 
-use super::error::{TradeError, classify_kraken_error_string};
+use super::error::{TradeError, classify_futures_ws_error, classify_kraken_error_string};
 use super::types::{
     AddOrderDescr, AddOrderResponse, AmendId, AmendOrderResponse, CancelAllResponse,
-    CancelOrderResponse, DeadmanResponse, OFlag, OrderAmendRequest, OrderType, Price, StpType,
+    CancelOrderResponse, DeadmanResponse, FuturesOrder, FuturesOrderAmendRequest,
+    FuturesOrderBatchRequest, FuturesOrderRef, OFlag, OrderAmendRequest, OrderType, Price, StpType,
     TimeInForce, TimeSpec, TriggerKind, stp_type_ws,
 };
 
-/// Map a definitive `RestError` (wire accept-then-reject or malformed envelope)
-/// to a `WireError` code via `TradeError`. The payload `code` is the
-/// `ApiError::code()` string, not an enum.
 pub(crate) fn wire_error_status(err: RestError) -> OrderSubmitStatus {
     let code = TradeError::from(err).code().to_string();
     OrderSubmitStatus::WireError { code }
 }
 
-/// Classify a definitive `WS` failure (`resp.success == false`) into a
-/// `WireError` code via the same `classify_ws_error` → `code()` path REST uses.
-pub(crate) fn ws_wire_error_status(error: Option<String>) -> OrderSubmitStatus {
-    let code = classify_ws_error(error).code().to_string();
+pub(crate) fn ws_wire_error_status(url: WsUrl, resp: &WsResponse) -> OrderSubmitStatus {
+    let code = classify_ws_failure(url, resp.error.clone(), resp.retry_after_ms)
+        .code()
+        .to_string();
     OrderSubmitStatus::WireError { code }
 }
 
-/// Convert a `Decimal` to a JSON number (not string) for the WS wire, parsing
-/// the exact decimal string so no f64 precision is lost.
+pub(crate) fn classify_ws_failure(
+    url: WsUrl,
+    error: Option<String>,
+    retry_after_ms: Option<u64>,
+) -> TradeError {
+    if !url.is_unified() {
+        return classify_ws_error(error);
+    }
+    match classify_futures_ws_error(error.unwrap_or_else(|| "WS request rejected".to_string())) {
+        TradeError::RateLimited {
+            retry_after_ts,
+            request_id,
+        } => TradeError::RateLimited {
+            retry_after_ts: retry_after_ms
+                .and_then(|ms| {
+                    crate::rest::surface::unix_now_ms().map(|now| retry_after_ts_at(now, ms))
+                })
+                .or(retry_after_ts),
+            request_id,
+        },
+        other => other,
+    }
+}
+
+pub(crate) fn retry_after_ts_at(now_ms: u64, retry_after_ms: u64) -> u64 {
+    now_ms.saturating_add(retry_after_ms).div_ceil(1000)
+}
+
+/// Parses the exact decimal string so no f64 precision is lost.
 pub(crate) fn decimal_to_json(d: &rust_decimal::Decimal) -> serde_json::Value {
     let s = d.to_string();
     match s.parse::<serde_json::Number>() {
@@ -39,9 +63,7 @@ pub(crate) fn decimal_to_json(d: &rust_decimal::Decimal) -> serde_json::Value {
     }
 }
 
-/// Returns `Some(field)` for an order the WS `add_order` path cannot faithfully
-/// represent (leverage; a relative conditional-close price) → caller must use
-/// `.via(Transport::Rest)`. See docs/guides/placing-orders.md.
+/// Returns the field WS `add_order` cannot represent (leverage; relative conditional-close price); callers use REST.
 pub(crate) fn ws_unrepresentable_field(
     has_leverage: bool,
     close_price: Option<&Price>,
@@ -59,22 +81,19 @@ pub(crate) fn ws_unrepresentable_field(
     None
 }
 
-/// Returns `Some(field)` for an order the REST `add_order` path cannot faithfully
-/// represent (`margin`, the WS-native max-leverage toggle) → caller must use
-/// `.via(Transport::WsV2Auth)`. See docs/guides/placing-orders.md.
+/// Returns the field REST `add_order` cannot represent (`margin`); callers use WS.
 pub(crate) fn rest_unrepresentable_field(has_margin: bool) -> Option<&'static str> {
     has_margin.then_some("margin")
 }
 
 pub(crate) struct AddOrderWsView<'a> {
     pub(crate) side: &'a str,
-    pub(crate) pair: &'a crate::types::Symbol,
+    pub(crate) symbol: &'a str,
     pub(crate) volume: &'a rust_decimal::Decimal,
     pub(crate) order_type: OrderType,
     pub(crate) price: &'a Option<Price>,
     pub(crate) price2: &'a Option<Price>,
     pub(crate) oflags: &'a [OFlag],
-    /// WS-native margin toggle → `margin:true`. REST-rejected upstream.
     pub(crate) margin: bool,
     pub(crate) reduce_only: &'a Option<bool>,
     pub(crate) stp_type: &'a Option<StpType>,
@@ -84,8 +103,7 @@ pub(crate) struct AddOrderWsView<'a> {
     pub(crate) start_time: &'a Option<TimeSpec>,
     pub(crate) expire_time: &'a Option<TimeSpec>,
     pub(crate) userref: &'a Option<i32>,
-    /// `None` when auto-allocation was suppressed (userref / conditional-close);
-    /// Kraken rejects `cl_ord_id` together with `userref`.
+    /// `None` when suppressed: Kraken rejects `cl_ord_id` together with `userref`.
     pub(crate) cl_ord_id: &'a Option<ClOrdId>,
     pub(crate) close_ordertype: &'a Option<OrderType>,
     pub(crate) close_price: &'a Option<Price>,
@@ -93,10 +111,45 @@ pub(crate) struct AddOrderWsView<'a> {
     pub(crate) validate: bool,
 }
 
-/// Compose the token-free `add_order` params from an `AddOrderWsView`.
-/// The reactor injects the token after this returns. `deadline` is skipped
-/// (naive now() causes clock-skew rejects).
+impl<'a> AddOrderWsView<'a> {
+    pub(crate) fn new(
+        side: &'a str,
+        symbol: &'a str,
+        volume: &'a rust_decimal::Decimal,
+        order_type: OrderType,
+    ) -> Self {
+        Self {
+            side,
+            symbol,
+            volume,
+            order_type,
+            price: &None,
+            price2: &None,
+            oflags: &[],
+            margin: false,
+            reduce_only: &None,
+            stp_type: &None,
+            trigger: &None,
+            time_in_force: &None,
+            display_vol: &None,
+            start_time: &None,
+            expire_time: &None,
+            userref: &None,
+            cl_ord_id: &None,
+            close_ordertype: &None,
+            close_price: &None,
+            close_price2: &None,
+            validate: false,
+        }
+    }
+}
+
+/// The reactor injects the token; `deadline` is skipped (naive now() causes clock-skew rejects).
 pub(crate) fn compose_add_order_params(view: AddOrderWsView<'_>) -> serde_json::Value {
+    serde_json::Value::Object(add_order_map(view))
+}
+
+fn add_order_map(view: AddOrderWsView<'_>) -> serde_json::Map<String, serde_json::Value> {
     let mut p = serde_json::Map::new();
 
     p.insert(
@@ -110,7 +163,7 @@ pub(crate) fn compose_add_order_params(view: AddOrderWsView<'_>) -> serde_json::
     p.insert("order_qty".to_string(), decimal_to_json(view.volume));
     p.insert(
         "symbol".to_string(),
-        serde_json::Value::String(view.pair.as_str().to_string()),
+        serde_json::Value::String(view.symbol.to_string()),
     );
     if let Some(c) = view.cl_ord_id {
         p.insert(
@@ -167,15 +220,13 @@ pub(crate) fn compose_add_order_params(view: AddOrderWsView<'_>) -> serde_json::
             }
             p.insert("triggers".to_string(), serde_json::Value::Object(trig));
 
-            if limit_leg {
-                if let Some(p2) = view.price2 {
-                    let (value, price_type) = p2.to_ws();
-                    p.insert("limit_price".to_string(), decimal_to_json(&value));
-                    p.insert(
-                        "limit_price_type".to_string(),
-                        serde_json::Value::String(price_type.to_string()),
-                    );
-                }
+            if limit_leg && let Some(p2) = view.price2 {
+                let (value, price_type) = p2.to_ws();
+                p.insert("limit_price".to_string(), decimal_to_json(&value));
+                p.insert(
+                    "limit_price_type".to_string(),
+                    serde_json::Value::String(price_type.to_string()),
+                );
             }
         }
     }
@@ -212,7 +263,7 @@ pub(crate) fn compose_add_order_params(view: AddOrderWsView<'_>) -> serde_json::
         p.insert("reduce_only".to_string(), serde_json::Value::Bool(true));
     }
 
-    // stp_type: WS uses underscore spelling, not the REST Display (hyphen).
+    // WS spells `stp_type` with underscores, not the REST hyphens.
     if let Some(s) = view.stp_type {
         p.insert(
             "stp_type".to_string(),
@@ -244,8 +295,6 @@ pub(crate) fn compose_add_order_params(view: AddOrderWsView<'_>) -> serde_json::
             serde_json::Value::String(e.to_ws()),
         );
     }
-
-    // deadline skipped — naive now() causes clock-skew rejects.
 
     if let Some(u) = view.userref {
         p.insert(
@@ -288,17 +337,15 @@ pub(crate) fn compose_add_order_params(view: AddOrderWsView<'_>) -> serde_json::
         p.insert("conditional".to_string(), serde_json::Value::Object(cond));
     }
 
-    // Emit validate only when true — omitting it would place a live order.
+    // Emit validate only when true: omitting it would place a live order.
     if view.validate {
         p.insert("validate".to_string(), serde_json::Value::Bool(true));
     }
 
-    serde_json::Value::Object(p)
+    p
 }
 
-/// Compose the token-free `batch_add` params. Each entry reuses
-/// [`compose_add_order_params`] with `symbol` hoisted batch-level and `validate`
-/// set batch-wide; an entry WS can't represent is rejected for REST fallback.
+/// Entries WS cannot represent are rejected for REST fallback.
 pub(crate) fn compose_batch_add_params(
     req: &super::types::AddOrderBatchRequest,
 ) -> Result<serde_json::Value, super::TradeError> {
@@ -314,9 +361,9 @@ pub(crate) fn compose_batch_add_params(
             return Err(super::TradeError::WsUnsupportedOrderField { field });
         }
         let oflags: &[OFlag] = e.oflags.as_deref().unwrap_or(&[]);
-        let mut obj = compose_add_order_params(AddOrderWsView {
+        let obj = add_order_map(AddOrderWsView {
             side: <&str>::from(e.side),
-            pair: &req.pair,
+            symbol: req.pair.as_str(),
             volume: &e.volume,
             order_type: e.ordertype,
             price: &e.price,
@@ -337,35 +384,129 @@ pub(crate) fn compose_batch_add_params(
             close_price2: &close_price2,
             validate: false, // batch-level (below), not per-order
         });
-        if let serde_json::Value::Object(ref mut m) = obj {
-            m.remove("symbol");
-        }
-        orders.push(obj);
+        orders.push(without_symbol(obj));
     }
+    Ok(batch_add_envelope(req.pair.as_str(), orders, req.validate))
+}
+
+fn without_symbol(mut order: serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    order.remove("symbol");
+    serde_json::Value::Object(order)
+}
+
+pub(crate) fn compose_futures_order_params(
+    symbol: &str,
+    order: &FuturesOrder,
+    validate: bool,
+) -> serde_json::Value {
+    serde_json::Value::Object(futures_order_map(symbol, order, validate))
+}
+
+fn futures_order_map(
+    symbol: &str,
+    order: &FuturesOrder,
+    validate: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut params = add_order_map(AddOrderWsView {
+        price: &order.price,
+        price2: &order.price2,
+        oflags: if order.post_only { &[OFlag::Post] } else { &[] },
+        reduce_only: &order.reduce_only,
+        stp_type: &order.stp_type,
+        trigger: &order.trigger,
+        time_in_force: &order.time_in_force,
+        cl_ord_id: &order.cl_ord_id,
+        validate,
+        ..AddOrderWsView::new(order.side.as_ref(), symbol, &order.volume, order.order_type)
+    });
+    if let Some(broker) = &order.broker {
+        params.insert("broker".to_string(), broker.clone().into());
+    }
+    if let Some(deadline) = order.deadline {
+        params.insert("deadline".to_string(), deadline.to_ws().into());
+    }
+    params
+}
+
+pub(crate) fn compose_futures_batch_params(req: &FuturesOrderBatchRequest) -> serde_json::Value {
+    let orders = req
+        .orders
+        .iter()
+        .map(|order| without_symbol(futures_order_map(&req.symbol, order, false)))
+        .collect();
+    batch_add_envelope(&req.symbol, orders, req.validate)
+}
+
+fn batch_add_envelope(
+    symbol: &str,
+    orders: Vec<serde_json::Value>,
+    validate: bool,
+) -> serde_json::Value {
     let mut params = serde_json::Map::new();
     params.insert(
         "symbol".to_string(),
-        serde_json::Value::String(req.pair.as_str().to_string()),
+        serde_json::Value::String(symbol.to_string()),
     );
     params.insert("orders".to_string(), serde_json::Value::Array(orders));
-    if req.validate {
+    if validate {
         params.insert("validate".to_string(), serde_json::Value::Bool(true));
     }
-    Ok(serde_json::Value::Object(params))
+    serde_json::Value::Object(params)
 }
 
-/// Compose the token-free `amend_order` params. `cl_ord_id` is a scalar
-/// (cancel uses an array).
+/// `cl_ord_id` is a scalar here (cancel uses an array).
 pub(crate) fn compose_amend_order_params(req: &OrderAmendRequest) -> serde_json::Value {
     let mut p = serde_json::Map::new();
     p.insert(
         "cl_ord_id".to_string(),
         serde_json::Value::String(req.cl_ord_id.as_str().to_string()),
     );
-    if let Some(v) = &req.order_volume {
+    insert_amend_fields(
+        &mut p,
+        &req.order_volume,
+        &req.limit_price,
+        req.post_only,
+        &req.trigger_price,
+    );
+    serde_json::Value::Object(p)
+}
+
+pub(crate) fn compose_futures_amend_params(req: &FuturesOrderAmendRequest) -> serde_json::Value {
+    let mut p = serde_json::Map::new();
+    let (key, id) = req.order.wire();
+    p.insert(key.to_string(), serde_json::Value::String(id.to_string()));
+    insert_amend_fields(
+        &mut p,
+        &req.order_volume,
+        &req.limit_price,
+        req.post_only,
+        &req.trigger_price,
+    );
+    if let Some(deadline) = req.deadline {
+        p.insert(
+            "deadline".to_string(),
+            serde_json::Value::String(deadline.to_ws()),
+        );
+    }
+    serde_json::Value::Object(p)
+}
+
+pub(crate) fn compose_futures_cancel_params(order: &FuturesOrderRef) -> serde_json::Value {
+    let (key, id) = order.wire();
+    serde_json::json!({ key: [id] })
+}
+
+fn insert_amend_fields(
+    p: &mut serde_json::Map<String, serde_json::Value>,
+    order_volume: &Option<rust_decimal::Decimal>,
+    limit_price: &Option<Price>,
+    post_only: Option<bool>,
+    trigger_price: &Option<Price>,
+) {
+    if let Some(v) = order_volume {
         p.insert("order_qty".to_string(), decimal_to_json(v));
     }
-    if let Some(price) = &req.limit_price {
+    if let Some(price) = limit_price {
         let (value, price_type) = price.to_ws();
         p.insert("limit_price".to_string(), decimal_to_json(&value));
         p.insert(
@@ -373,11 +514,11 @@ pub(crate) fn compose_amend_order_params(req: &OrderAmendRequest) -> serde_json:
             serde_json::Value::String(price_type.to_string()),
         );
     }
-    if let Some(po) = req.post_only {
+    if let Some(po) = post_only {
         p.insert("post_only".to_string(), serde_json::Value::Bool(po));
     }
-    if let Some(tp) = &req.trigger_price {
-        // Amend uses flat trigger keys (not the add_order `triggers` object).
+    if let Some(tp) = trigger_price {
+        // Amend uses flat trigger keys, not the `triggers` object.
         let (value, price_type) = tp.to_ws();
         p.insert("trigger_price".to_string(), decimal_to_json(&value));
         p.insert(
@@ -385,18 +526,15 @@ pub(crate) fn compose_amend_order_params(req: &OrderAmendRequest) -> serde_json:
             serde_json::Value::String(price_type.to_string()),
         );
     }
-    serde_json::Value::Object(p)
 }
 
-/// Compose the token-free `cancel_order` params. `cl_ord_id` is an array on the wire.
 pub(crate) fn compose_cancel_order_params(req: &super::types::CancelRequest) -> serde_json::Value {
     serde_json::json!({
         "cl_ord_id": [req.cl_ord_id.as_str()],
     })
 }
 
-/// Decode a WS `batch_add` reply. A per-row array is `Ok` even when top-level
-/// `success` is false (placed siblings stay live); null `result` is `Err`.
+/// A per-row array is `Ok` even when top-level `success` is false (placed siblings stay live); null `result` is `Err`.
 pub(crate) fn decode_ws_batch_add(
     resp: WsResponse,
 ) -> Result<super::types::AddOrderBatchResponse, TradeError> {
@@ -425,19 +563,20 @@ pub(crate) fn decode_ws_batch_add(
             .collect();
         return Ok(super::types::AddOrderBatchResponse { orders });
     }
+    if resp.success {
+        return Err(TradeError::malformed(
+            "batch_add reply carried no row array".into(),
+        ));
+    }
     Err(classify_ws_error(resp.error))
 }
 
-/// Decode a WS `add_order` reply. Order id is `order_id` (not `txid`);
-/// `descr` is `None` (WS omits it).
+/// Order id is `order_id` (not `txid`); `descr` is `None`.
 pub(crate) fn decode_ws_add_order(
     resp: WsResponse,
     fallback_cl_ord_id: Option<ClOrdId>,
 ) -> Result<AddOrderResponse, TradeError> {
-    if !resp.success {
-        return Err(classify_ws_error(resp.error));
-    }
-    // Validate-mode replies carry empty `order_id` — treat as absent.
+    // Validate-mode replies carry an empty `order_id`: treated as absent.
     let txid = resp
         .result
         .get("order_id")
@@ -460,36 +599,34 @@ pub(crate) fn decode_ws_add_order(
     })
 }
 
-/// Decode a WS `amend_order` reply into the shared [`AmendOrderResponse`].
-/// `result.amend_id` → `AmendId`. Never unwraps.
-pub(crate) fn decode_ws_amend_order(resp: WsResponse) -> Result<AmendOrderResponse, TradeError> {
-    if !resp.success {
-        return Err(classify_ws_error(resp.error));
-    }
+/// The Futures venue assigns no amend id: an empty or absent `amend_id` on Unified decodes to an
+/// empty id.
+pub(crate) fn decode_ws_amend_order(
+    url: WsUrl,
+    resp: WsResponse,
+) -> Result<AmendOrderResponse, TradeError> {
     let amend_id = resp
         .result
         .get("amend_id")
         .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
+        .or(url.is_unified().then_some(""))
+        .filter(|s| url.is_unified() || !s.is_empty())
         .ok_or_else(|| TradeError::malformed("ws amend response missing amend_id".to_string()))?;
     Ok(AmendOrderResponse {
         amend_id: AmendId::from(amend_id.to_string()),
     })
 }
 
-/// Decode a WS `cancel_order` reply into the shared [`CancelOrderResponse`].
-/// The reply carries only `cl_ord_id`; absent → `MalformedResponse`. Derives
-/// `count:1, pending:false`. See docs/guides/placing-orders.md. Never unwraps.
-pub(crate) fn decode_ws_cancel_order(resp: WsResponse) -> Result<CancelOrderResponse, TradeError> {
-    if !resp.success {
-        return Err(classify_ws_error(resp.error));
-    }
-    let _cl_ord_id = resp
-        .result
-        .get("cl_ord_id")
+/// The reply carries only `cl_ord_id` (absent is `MalformedResponse`); derives `count:1, pending:false`.
+pub(crate) fn decode_ws_cancel_order(
+    identity_key: &'static str,
+    resp: WsResponse,
+) -> Result<CancelOrderResponse, TradeError> {
+    resp.result
+        .get(identity_key)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
-            TradeError::malformed("ws cancel_order success missing cl_ord_id".to_string())
+            TradeError::malformed(format!("ws cancel_order success missing {identity_key}"))
         })?;
     Ok(CancelOrderResponse {
         count: 1,
@@ -497,12 +634,8 @@ pub(crate) fn decode_ws_cancel_order(resp: WsResponse) -> Result<CancelOrderResp
     })
 }
 
-/// Decode a WS `cancel_all` reply. Missing/non-integer `count` → `MalformedResponse`
-/// (never fabricate `0`).
+/// Missing or non-integer `count` is `MalformedResponse`; never fabricates 0.
 pub(crate) fn decode_ws_cancel_all(resp: WsResponse) -> Result<CancelAllResponse, TradeError> {
-    if !resp.success {
-        return Err(classify_ws_error(resp.error));
-    }
     let count = resp
         .result
         .get("count")
@@ -513,13 +646,8 @@ pub(crate) fn decode_ws_cancel_all(resp: WsResponse) -> Result<CancelAllResponse
     Ok(CancelAllResponse { count })
 }
 
-/// Decode a WS `cancel_all_orders_after` reply into the shared
-/// [`DeadmanResponse`]. Maps `currentTime`/`triggerTime`; `"0"`/absent
-/// triggerTime → disarmed → `None`.
+/// `"0"` or absent `triggerTime` means disarmed: `None`.
 pub(crate) fn decode_ws_deadman(resp: WsResponse) -> Result<DeadmanResponse, TradeError> {
-    if !resp.success {
-        return Err(classify_ws_error(resp.error));
-    }
     let current_time = resp
         .result
         .get("currentTime")
@@ -543,10 +671,11 @@ pub(crate) fn decode_ws_deadman(resp: WsResponse) -> Result<DeadmanResponse, Tra
     })
 }
 
-/// Classify a WS failure `error` string into a [`TradeError`]. WS carries a
-/// single top-level `error` string (not an array); reuses the REST substring
-/// families. Unmapped or absent strings degrade to `Unknown`.
+/// WS carries one top-level `error` string; unmapped or absent degrades to `Unknown`.
 pub(crate) fn classify_ws_error(error: Option<String>) -> TradeError {
     let msg = error.unwrap_or_else(|| "WS request rejected".to_string());
+    if crate::error::is_token_stale_reject(WsUrl::Auth, &msg) {
+        return TradeError::SessionExpired { request_id: None };
+    }
     classify_kraken_error_string(msg)
 }

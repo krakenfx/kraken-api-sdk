@@ -15,8 +15,7 @@ fn is_limit_price_bearing(order_type: OrderType) -> bool {
     )
 }
 
-/// A `/AddOrder.deadline` offset from "now". The server-clock wire render is
-/// deferred, so v1 rejects any set `deadline` at `validate()`. See docs/guides/placing-orders.md.
+/// A `/AddOrder.deadline` offset from now; `validate()` rejects any set deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadlineSpec {
     #[allow(dead_code)]
@@ -30,8 +29,7 @@ impl DeadlineSpec {
     }
 }
 
-/// An absolute instant as Unix epoch seconds; each transport renders its own
-/// wire form. See docs/guides/wire-quirks.md.
+/// An absolute instant as Unix epoch seconds; each transport renders its own wire form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeSpec(i64);
 
@@ -62,8 +60,7 @@ impl TimeSpec {
     }
 }
 
-/// Render Unix epoch seconds as `YYYY-MM-DDThh:mm:ssZ` (UTC) via Howard Hinnant's
-/// `civil_from_days` (public domain) — no datetime dependency needed.
+/// Renders epoch seconds as `YYYY-MM-DDThh:mm:ssZ` (UTC) via `civil_from_days`; no datetime dependency.
 fn unix_secs_to_rfc3339_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400);
@@ -83,7 +80,6 @@ fn unix_secs_to_rfc3339_utc(secs: i64) -> String {
 }
 
 /// A price-field value: absolute, or a relative offset from the reference price.
-/// Wire encoding is per-transport: docs/guides/wire-quirks.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Price {
     /// Absolute price. REST: plain number (`"30000"`); WS: `price_type = "static"`.
@@ -177,8 +173,7 @@ pub struct OrderRequest {
     pub validate: bool,
 }
 
-/// Shared `to_form` body for the two AddOrder request types; `side` is supplied
-/// by the namespace method. Omits every `None`/empty field.
+/// Shared `to_form` body for the two AddOrder request types; omits every `None`/empty field.
 #[allow(clippy::too_many_arguments)]
 fn add_order_to_form(
     pair: &crate::types::Symbol,
@@ -249,11 +244,10 @@ fn add_order_to_form(
     if validate {
         form.push(("validate".into(), "true".into()));
     }
-    // deadline → SKIP: server-clock render deferred.
+    // `deadline` is never emitted; `validate()` rejects it.
     form
 }
 
-/// Toggle [`OFlag::Post`] in an `oflags` set — shared by the buy/sell `post_only` sugar.
 fn set_post_only(oflags: &mut Vec<OFlag>, on: bool) {
     if on {
         if !oflags.contains(&OFlag::Post) {
@@ -264,9 +258,7 @@ fn set_post_only(oflags: &mut Vec<OFlag>, on: bool) {
     }
 }
 
-/// Stamp the chainable setters onto the two field-identical AddOrder requests so
-/// the buy/sell surface can't drift. `post_only` (hand-written `oflags` sugar) and
-/// `deadline` (rejected by `validate()` in v1) are excluded.
+/// Stamps the chainable setters onto both AddOrder request types; `post_only` and `deadline` are excluded.
 macro_rules! add_order_setters {
     ($t:ty) => {
         impl $t {
@@ -469,8 +461,7 @@ impl OrderRequest {
     }
 }
 
-/// Shared trailing-price guard: trailing orders need a positive relative trigger
-/// offset (direction is automatic from side). See docs/guides/placing-orders.md.
+/// Trailing orders need a positive relative trigger offset; direction comes from the side.
 fn validate_trailing_price(
     order_type: OrderType,
     price: Option<&Price>,
@@ -486,60 +477,48 @@ fn validate_trailing_price(
     match price {
         Some(Price::Offset { value, .. }) if *value > Decimal::ZERO => {}
         Some(Price::Offset { .. }) => {
-            return Err(TradeError::InvalidOrder {
-                request_id: None,
-                detail: "trailing-stop price offset must be positive; direction is automatic \
-                         from the order side"
-                    .to_string(),
-            });
+            return Err(TradeError::invalid_order(
+                "trailing-stop price offset must be positive; direction is automatic \
+                         from the order side",
+            ));
         }
         Some(Price::Absolute(_)) => {
-            return Err(TradeError::InvalidOrder {
-                request_id: None,
-                detail: "trailing-stop price must be a relative offset, not an absolute price"
-                    .to_string(),
-            });
+            return Err(TradeError::invalid_order(
+                "trailing-stop price must be a relative offset, not an absolute price",
+            ));
         }
         None => {
-            return Err(TradeError::InvalidOrder {
-                request_id: None,
-                detail: "trailing-stop requires a relative price offset".to_string(),
-            });
+            return Err(TradeError::invalid_order(
+                "trailing-stop requires a relative price offset",
+            ));
         }
     }
     if order_type == OrderType::TrailingStopLimit && price2.is_none() {
-        return Err(TradeError::InvalidOrder {
-            request_id: None,
-            detail: "trailing-stop-limit requires a relative price2 (limit leg)".to_string(),
-        });
+        return Err(TradeError::invalid_order(
+            "trailing-stop-limit requires a relative price2 (limit leg)",
+        ));
     }
     if let Some(Price::Absolute(_)) = price2 {
-        return Err(TradeError::InvalidOrder {
-            request_id: None,
-            detail: "trailing-stop-limit price2 must be a relative offset, not an absolute price"
-                .to_string(),
-        });
+        return Err(TradeError::invalid_order(
+            "trailing-stop-limit price2 must be a relative offset, not an absolute price",
+        ));
     }
     Ok(())
 }
 
-/// Reject a caller-set `deadline`: its wire render needs a server-corrected clock
-/// that isn't wired yet, so v1 rejects rather than silently dropping.
+/// Rejects a caller-set `deadline`; its wire render is not supported.
 fn reject_unsupported_deadline(
     deadline: Option<&DeadlineSpec>,
 ) -> Result<(), super::super::error::TradeError> {
     if deadline.is_some() {
-        return Err(super::super::error::TradeError::InvalidOrder {
-            request_id: None,
-            detail: "the `deadline` order parameter is not yet supported in v1 \
-                     (server-clock rendering is deferred); omit it"
-                .to_string(),
-        });
+        return Err(super::super::error::TradeError::invalid_order(
+            "the `deadline` order parameter is not yet supported in v1 \
+                     (server-clock rendering is deferred); omit it",
+        ));
     }
     Ok(())
 }
 
-/// Shared AddOrder validator.
 #[allow(clippy::too_many_arguments)]
 fn validate_add_order(
     has_userref: bool,
@@ -568,13 +547,10 @@ fn validate_add_order(
             close_price2.as_ref(),
         ),
     ) {
-        return Err(TradeError::InvalidOrder {
-            request_id: None,
-            detail: format!(
-                "order is un-placeable: `{rf}` can only be sent on WS while `{wf}` can only be \
+        return Err(TradeError::invalid_order(format!(
+            "order is un-placeable: `{rf}` can only be sent on WS while `{wf}` can only be \
                  sent on REST — no single transport supports both. Drop one."
-            ),
-        });
+        )));
     }
     validate_order_gates(order_type, leverage, margin, reduce_only, time_in_force)?;
     validate_trailing_price(order_type, price, price2)?;
@@ -598,10 +574,9 @@ fn validate_order_gates(
 ) -> Result<(), super::super::error::TradeError> {
     use super::super::error::TradeError;
     if matches!(order_type, OrderType::Unknown) {
-        return Err(TradeError::InvalidOrder {
-            request_id: None,
-            detail: "`OrderType::Unknown` is decode-only and cannot be placed".to_string(),
-        });
+        return Err(TradeError::invalid_order(
+            "`OrderType::Unknown` is decode-only and cannot be placed",
+        ));
     }
     if order_type == OrderType::SettlePosition && leverage.is_none_or(|l| l == 0) {
         return Err(TradeError::SettlePositionRequiresLeverage);
@@ -611,18 +586,17 @@ fn validate_order_gates(
         return Err(TradeError::ReduceOnlyRequiresLeverage);
     }
     if time_in_force == Some(TimeInForce::Fok) && !is_limit_price_bearing(order_type) {
-        return Err(TradeError::InvalidOrder {
-            request_id: None,
-            detail: "fill-or-kill (fok) time-in-force is only valid on limit order types \
-                     (limit, iceberg, stop-loss-limit, take-profit-limit, trailing-stop-limit)"
-                .to_string(),
-        });
+        return Err(TradeError::invalid_order(
+            "fill-or-kill (fok) time-in-force is only valid on limit order types \
+                     (limit, iceberg, stop-loss-limit, take-profit-limit, trailing-stop-limit)",
+        ));
     }
     Ok(())
 }
 
-/// `/0/private/AmendOrder` request. Identity is `cl_ord_id`; at least one
-/// mutable field must be set. `display_qty` is REST-only.
+/// Amend one Spot order by `cl_ord_id` (WS `amend_order` by default, REST `AmendOrder`).
+/// At least one mutable field must be set; `display_qty` is REST-only.
+/// [`FuturesOrderAmendRequest`](super::FuturesOrderAmendRequest).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct OrderAmendRequest {
@@ -725,7 +699,9 @@ impl OrderAmendRequest {
     }
 }
 
-/// `/0/private/CancelOrder` request by `cl_ord_id`.
+/// Cancel one Spot order by `cl_ord_id`, over the `cancel_order` WebSocket request by
+/// default or `/0/private/CancelOrder` over REST. Futures cancels take a
+/// [`FuturesOrderRef`](super::FuturesOrderRef).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct CancelRequest {
@@ -745,8 +721,8 @@ impl CancelRequest {
     }
 }
 
-/// `/0/private/CancelAll` request — unit-equivalent. No params beyond auth;
-/// carried as a struct for `PendingTrade<Req, Resp>` parity.
+/// Cancel every open order: Spot over WS by default or REST `/0/private/CancelAll`;
+/// Futures over the Unified private socket. Carries no params.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct CancelAllRequest;
@@ -758,7 +734,8 @@ impl CancelAllRequest {
     }
 }
 
-/// `/0/private/CancelAllOrdersAfter` dead-man's-switch request.
+/// Dead-man's-switch request: Spot uses WS by default, REST `/0/private/CancelAllOrdersAfter`
+/// via `prefer_rest_for_orders` or `.via(Transport::Rest)`; Futures uses the Unified private socket.
 /// `timeout_secs == 0` disarms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1059,6 +1036,9 @@ pub struct AddOrderBatchRequest {
 }
 
 impl AddOrderBatchRequest {
+    /// Smallest and largest batch `AddOrderBatch` accepts.
+    const SIZE: std::ops::RangeInclusive<usize> = 2..=15;
+
     /// Construct from the one shared pair and its entries; `validate` off.
     pub fn new(pair: crate::types::Symbol, orders: Vec<BatchOrderEntry>) -> Self {
         Self {
@@ -1077,14 +1057,10 @@ impl AddOrderBatchRequest {
     }
 
     /// Client-side batch validator: the 2–15 size bound plus per-entry gates.
-    /// Rules: docs/guides/placing-orders.md.
     pub fn validate(&self) -> Result<(), super::super::error::TradeError> {
         use super::super::error::TradeError;
         reject_unsupported_deadline(self.deadline.as_ref())?;
-        let n = self.orders.len() as u32;
-        if !(2..=15).contains(&n) {
-            return Err(TradeError::BatchSizeOutOfRange { min: 2, max: 15 });
-        }
+        TradeError::check_batch_size(self.orders.len(), Self::SIZE)?;
         // A batch places on ONE transport: if any entry needs `margin` (WS-only) AND
         // any needs `leverage`/relative-close (REST-only), no transport can send it.
         let rest_blocked = self
@@ -1096,13 +1072,10 @@ impl AddOrderBatchRequest {
             ws_unrepresentable_field(e.leverage.is_some(), cp.as_ref(), cp2.as_ref())
         });
         if let (Some(rf), Some(wf)) = (rest_blocked, ws_blocked) {
-            return Err(TradeError::InvalidOrder {
-                request_id: None,
-                detail: format!(
-                    "batch is un-placeable: `{rf}` can only be sent on WS while `{wf}` can only \
+            return Err(TradeError::invalid_order(format!(
+                "batch is un-placeable: `{rf}` can only be sent on WS while `{wf}` can only \
                      be sent on REST — a batch places on a single transport. Use one across the batch."
-                ),
-            });
+            )));
         }
         for e in &self.orders {
             validate_trailing_price(e.ordertype, e.price.as_ref(), e.price2.as_ref())?;
@@ -1166,10 +1139,10 @@ impl AddOrderBatchRequest {
             if let Some(u) = &e.userref {
                 form.push((p("userref"), u.to_string()));
             }
-            if let Some(of) = &e.oflags {
-                if let Some(csv) = oflags_to_wire(of) {
-                    form.push((p("oflags"), csv));
-                }
+            if let Some(of) = &e.oflags
+                && let Some(csv) = oflags_to_wire(of)
+            {
+                form.push((p("oflags"), csv));
             }
             if let Some(tif) = &e.time_in_force {
                 form.push((p("timeinforce"), tif.to_string()));
@@ -1181,7 +1154,7 @@ impl AddOrderBatchRequest {
         if self.validate {
             form.push(("validate".into(), "true".into()));
         }
-        // deadline → SKIP: server-clock render deferred.
+        // `deadline` is never emitted; `validate()` rejects it.
         form
     }
 }

@@ -24,6 +24,8 @@ pub trait ApiError {
 | `Client` | SDK state |
 | `RateLimit` | Rate limit exceeded |
 
+`Auth` comes from `AccountError::PermissionDenied`, `AuthError`, `TradeError::PermissionDenied`, `TradeError::AuthenticationFailed` and `TradeError::SessionExpired`. `AuthenticationFailed` (non-retryable) means a private WebSocket connection could not authenticate; nothing was sent, so fix the key and rebuild the client. A connection that failed for a missing permission reports `PermissionDenied`. Any other credential failure on an order is `Unknown` with category `Exchange`: its `kraken_code` is `AUTH` for a local signing failure, and the Kraken error class (`EAPI`, `EGeneral`) when the venue rejects the key or signature.
+
 ## Per-namespace enums
 
 | Namespace | Error type |
@@ -79,7 +81,7 @@ Unrecognised pair wire: `EQuery:Unknown asset pair`. Symbol-taking market method
 use kraken_sdk::TradeError;
 
 match client.trade().limit_buy(pair, vol, price).await {
-    Err(TradeError::InvalidOrder { detail }) => {
+    Err(TradeError::InvalidOrder { detail, .. }) => {
         eprintln!("order rejected: {detail}");
     }
     Err(TradeError::Transport { kind, .. }) => {
@@ -112,6 +114,29 @@ Same wire string for already-gone (cancelled/filled) and never-valid ids.
 
 - Cancel: `TradeError::InvalidOrder` (`INVALID_ORDER`, `Client`, non-retryable) on REST and WS. Not a successful cancel. Not auto-retried.
 - Lookup of a bad ledger/order id (e.g. `query_ledgers`): `AccountError::Unknown`. Query ids from a prior list (`ledgers()`).
+
+## Futures order errors
+
+Futures order replies carry `Other:<CODE>` or bare parameter messages. Same `TradeError` taxonomy:
+
+| Venue text | `code()` |
+|---|---|
+| `ORDER_FOR_EDIT_NOT_FOUND`, `ORDER_FOR_CANCELLATION_NOT_FOUND` | `ORDER_NOT_FOUND` |
+| `EDIT_HAS_NO_EFFECT` | `NON_AMENDABLE_FIELD` |
+| `INSUFFICIENT_MARGIN` | `INSUFFICIENT_MARGIN`: the account's margin cannot cover the order |
+| `CLIENT_ORDER_ID_IN_USE`, `VIOLATES_REDUCE_ONLY`, `POST_WOULD_EXECUTE`, `IOC_WOULD_ENTER_BOOK`, `Bad request`, `Unknown asset`, parameter errors | `INVALID_ORDER` |
+| `Rate limit exceeded` | `RATE_LIMIT_EXCEEDED` |
+| `Permission denied` | `PERMISSION_DENIED` (category `Auth`, not retryable): the key lacks the permission. The connection stays up |
+| `Invalid session`, `Token(s) not found`, `Token field must be a string`, `Missing or invalid 'params.token'` | `SESSION_EXPIRED` (category `Auth`, retryable): the venue answered the request with a session-token rejection, see [Authentication and token errors](#authentication-and-token-errors) |
+
+In `order_batch`, a failed row carries its own `error`; the call stays `Ok`. A whole-batch rejection is `INVALID_ORDER`, or `SESSION_EXPIRED` for a rejected session token.
+
+Errors raised by the SDK before or around the send:
+
+- A Spot pair, or any non-Futures symbol: `INVALID_ORDER`, nothing sent.
+- No free `futures_max_in_flight` slot: refused (retryable), nothing sent. Error and slot rules: [Configuration](configuration.md).
+- The private connection could not authenticate: `AUTHENTICATION_FAILED` (category `Auth`, not retryable), nothing sent. Fix the key and rebuild the client.
+- No reply by `ws_order_response_deadline_ms`: `CONNECTION_ERROR` (not retryable), and the order may still exist. Reconcile before resubmitting: [Placing orders → Idempotency](placing-orders.md#idempotency-and-reconciliation).
 
 ## ConfigError on build
 
@@ -146,27 +171,29 @@ if let Err(e) = client.subscription().subscribe_ticker(pairs.clone(), None, None
     }
 }
 
-let _handle = client.market().on_ticker(|update| { /* ... */ });
+let _handle = client.market().on_ticker(|update| { /* ... */ })?;
 client.subscription().subscribe_ticker(pairs, None, None)?;
 ```
 
 Or use `on_*_for`.
 
-## QueueFull and LoopDead
+## QueueFull, InFlightLimitReached and LoopDead
 
-- **`QueueFull`** (`QUEUE_FULL`) — caller→I/O full, not sent. The only retryable `Client` error. SDK does not auto-retry.
+- **`QueueFull`** (`QUEUE_FULL`) — caller→I/O full, not sent. Retryable. SDK does not auto-retry.
+- **`InFlightLimitReached`** (`IN_FLIGHT_LIMIT_REACHED`) — Futures `futures_max_in_flight` reached, not sent. Retryable once a pending placement is answered, its deadline passes, or its await is dropped (the venue may still hold a dropped order). SDK does not auto-retry.
 - **`LoopDead`** (`LOOP_DEAD`) — reactor died. Not retryable. New WS ops rejected; REST stays up.
 
 ## Cancelled order await
 
-Save `cl_ord_id` before `.await`. Listen for `OrderCancellationAttempted` / `OrderPlacementAmbiguousEvent`. Reconcile with `find_order_by_cl_ord_id`. [Placing orders → Idempotency](placing-orders.md#idempotency-and-reconciliation).
+Save `cl_ord_id` before `.await`. Listen for `OrderCancellationAttempted` / `OrderPlacementAmbiguousEvent`. Reconcile with `find_order_by_cl_ord_id` (Spot) or the Futures executions snapshot. [Placing orders → Idempotency](placing-orders.md#idempotency-and-reconciliation).
 
 ## Authentication and token errors
 
 | Wire string | Meaning | Recoverable? |
 |---|---|---|
-| `EAPI:Invalid token` | session token stale | yes — refresh + resend |
-| `ESession:Invalid session` | invalid session (no `token` in the text) | yes — refresh + resend |
+| `EAPI:Invalid token` | session token stale | the SDK refreshes the token; a subscription is replayed; a WebSocket order is never resent: it fails `SESSION_EXPIRED` (the venue answered it with a token rejection), and the caller retries once the token is refreshed (while the connection is live; after `RetryCapExhausted` the client must be rebuilt) |
+| `ESession:Invalid session` | invalid session (no `token` in the text) | the SDK refreshes the token; a subscription is replayed; a WebSocket order is never resent: it fails `SESSION_EXPIRED` (same outcome as `EAPI:Invalid token`) |
+| `Invalid session`, `Token(s) not found`, `Token field must be a string`, `Missing or invalid 'params.token'` (Unified private only) | token rejected | the SDK refreshes the token for the next request while the connection is live (after `RetryCapExhausted` rebuild the client); an order is never resent: it fails `SESSION_EXPIRED`. The venue answered the request, so no `OrderPlacementAmbiguousEvent` fires and `OrderSubmittedEvent` reports `WireError` `SESSION_EXPIRED` |
 | `EAPI:Invalid key` | bad API key | no |
 | `EAPI:Invalid signature` | bad signature | no |
 | `EAuth:*` | credential failure | no |
@@ -174,9 +201,11 @@ Save `cl_ord_id` before `.await`. Listen for `OrderCancellationAttempted` / `Ord
 
 Text containing `token` plus a stale/expired/invalid marker is treated as a stale token.
 
+If the open connection holds no valid token when a request is composed (for example the cached token expired), the SDK starts a refresh and fails the request `SESSION_EXPIRED` without sending it: nothing was placed, no event fires, and a retry once the token is refreshed is safe.
+
 `GetWebSocketsToken` transport maps to `AuthError::TokenRefreshTransient` or `TokenRefreshFailed`, category `Network`. Transient is retryable; failed is not. Event: [CredentialRefreshFailedEvent](../events.md#credentialrefreshfailedevent).
 
-Auth WS has no dedicated handshake response. Authentication is the ack of the first signed request (subscribe or order). An order-level reject (e.g. insufficient funds) does not drop the session. Mid-session `EAPI:Invalid token` does not close the socket; the SDK refreshes in the background; the in-flight order is retryable.
+Auth WS has no dedicated handshake response. Authentication is the ack of the first signed request (subscribe or order). An order-level reject (e.g. insufficient funds) does not drop the session. Mid-session `EAPI:Invalid token` does not close the socket; the SDK refreshes in the background, and the order that drew the rejection fails `SESSION_EXPIRED` and is not resent. If the handshake retry cap is exhausted instead, the connection fails (`AuthenticationFailedEvent`, `RetryCapExhausted`), no refresh follows and the client must be rebuilt.
 
 Handshake: token-stale stays in authenticating and re-presents a fresh token (bounded; Nth failure → terminal + `AuthenticationFailedEvent` / `RetryCapExhausted`). Transient: back off and reconnect, not bounded by that cap.
 

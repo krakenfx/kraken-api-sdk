@@ -1,0 +1,50 @@
+[
+  {
+    "channel": "executions",
+    "asset_class": "derivatives",
+    "type": "snapshot",
+    "data": [
+      {
+        "exec_type": "new",
+        "order_status": "new",
+        "order_id": "<redacted>",
+        "symbol": "PF_XBTUSD",
+        "side": "buy",
+        "order_type": "stop-loss",
+        "order_qty": 0.0001,
+        "limit_price": 0,
+        "triggers": {
+          "reference": "last",
+          "price": 146552,
+          "price_type": "static",
+          "status": "untriggered"
+        },
+        "timestamp": "2026-11-10T18:45:22.902499273Z"
+      }
+    ]
+  },
+  {
+    "channel": "executions",
+    "asset_class": "derivatives",
+    "type": "update",
+    "data": [
+      {
+        "exec_type": "new",
+        "order_status": "new",
+        "order_id": "<redacted>",
+        "symbol": "PF_XBTUSD",
+        "side": "buy",
+        "order_type": "stop-loss",
+        "order_qty": 0.0001,
+        "limit_price": 0,
+        "triggers": {
+          "reference": "last",
+          "price": 146552,
+          "price_type": "static",
+          "status": "untriggered"
+        },
+        "timestamp": "2026-11-10T18:45:22.902499273Z"
+      }
+    ]
+  }
+]

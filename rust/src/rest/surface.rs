@@ -21,7 +21,7 @@ use crate::rate_limit::{
 };
 use crate::rest::retry::{RetryDecision, RetryEngine, RetryPolicy, RetryReason};
 use crate::transport::HttpTransport;
-use crate::types::{ApiKey, AuthProfile, ClOrdId, MonotonicInstant, Symbol, TxId};
+use crate::types::{ApiKey, AuthProfile, ClOrdId, MonotonicInstant, Symbol, TxId, WsUrl};
 
 /// Per-endpoint rate-limit cost; `None` bypasses both trackers.
 #[derive(Debug, Clone, PartialEq)]
@@ -260,15 +260,15 @@ impl RestSurface {
         let result = parse_kraken_envelope(response);
 
         // Reactive API-counter snap. TradingPair/TradingDomain snap in the executor.
-        if let Err(RestError::Kraken(ref codes)) = result {
-            if let Some(key) = self.auth.api_key() {
-                let now = self.clock.now();
-                for code in codes {
-                    if let Some(SnapTarget::Api) = classify_rate_limit_snap(code) {
-                        self.api_rate_limit
-                            .snap_to_cap(Scope::ApiKey(key.clone()), code, now);
-                        break;
-                    }
+        if let Err(RestError::Kraken(ref codes)) = result
+            && let Some(key) = self.auth.api_key()
+        {
+            let now = self.clock.now();
+            for code in codes {
+                if let Some(SnapTarget::Api) = classify_rate_limit_snap(code) {
+                    self.api_rate_limit
+                        .snap_to_cap(Scope::ApiKey(key.clone()), code, now);
+                    break;
                 }
             }
         }
@@ -342,26 +342,25 @@ impl RestSurface {
         match reason {
             // Defer until API counter has headroom. Trading snap is executor-owned.
             RetryReason::RateLimitExceeded => {
-                if let RateLimitCost::Api { cost: units } = cost {
-                    if let Some(key) = self.auth.api_key() {
-                        if let Some(t2h) = self.api_rate_limit.time_until_headroom(
-                            Scope::ApiKey(key.clone()),
-                            *units,
-                            self.clock.now(),
-                        ) {
-                            return base.max(t2h);
-                        }
-                    }
+                if let RateLimitCost::Api { cost: units } = cost
+                    && let Some(key) = self.auth.api_key()
+                    && let Some(t2h) = self.api_rate_limit.time_until_headroom(
+                        Scope::ApiKey(key.clone()),
+                        *units,
+                        self.clock.now(),
+                    )
+                {
+                    return base.max(t2h);
                 }
                 base
             }
             // Honour EService:Throttled retry-after, bounded by the backoff ceiling.
             RetryReason::ServiceThrottled => {
-                if let RestError::Kraken(codes) = err {
-                    if let Some(ts) = parse_throttle_until(codes) {
-                        let wait = wall_seconds_until(ts).min(self.retry_engine.backoff_ceiling());
-                        return base.max(wait);
-                    }
+                if let RestError::Kraken(codes) = err
+                    && let Some(ts) = parse_throttle_until(codes)
+                {
+                    let wait = wall_seconds_until(ts).min(self.retry_engine.backoff_ceiling());
+                    return base.max(wait);
                 }
                 base
             }
@@ -490,6 +489,7 @@ impl RestSurface {
     /// Emit `OrderSubmittedEvent` on a definitive wire response.
     pub(crate) fn emit_order_submitted(
         &self,
+        url: WsUrl,
         cl_ord_id: ClOrdId,
         amend_id: Option<AmendId>,
         op: OrderOp,
@@ -502,6 +502,7 @@ impl RestSurface {
                 cl_ord_id,
                 amend_id,
                 op,
+                url,
                 status,
                 request_id,
             },
@@ -512,6 +513,7 @@ impl RestSurface {
     /// `AddOrder`/`AmendOrder` (never for cancel).
     pub(crate) fn emit_placement_ambiguous(
         &self,
+        url: WsUrl,
         cl_ord_id: ClOrdId,
         amend_id: Option<AmendId>,
         op: OrderOp,
@@ -524,6 +526,7 @@ impl RestSurface {
                 cl_ord_id,
                 amend_id,
                 op,
+                url,
                 sent_at_monotonic,
                 request_id,
             },
@@ -601,20 +604,20 @@ pub(crate) fn mint_request_id() -> String {
 
 /// Parse the Kraken `{ error, result }` envelope into `result` or a [`RestError`].
 fn parse_kraken_envelope(json: Value) -> Result<Value, RestError> {
-    if let Some(errors) = json.get("error").and_then(Value::as_array) {
-        if !errors.is_empty() {
-            let strs: Vec<String> = errors
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            if strs.is_empty() {
-                // Empty Kraken(vec![]) would degrade to an uninformative Unknown.
-                return Err(RestError::UnexpectedShape(format!(
-                    "kraken error array contained no string elements: {errors:?}"
-                )));
-            }
-            return Err(RestError::Kraken(strs));
+    if let Some(errors) = json.get("error").and_then(Value::as_array)
+        && !errors.is_empty()
+    {
+        let strs: Vec<String> = errors
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        if strs.is_empty() {
+            // Empty Kraken(vec![]) would degrade to an uninformative Unknown.
+            return Err(RestError::UnexpectedShape(format!(
+                "kraken error array contained no string elements: {errors:?}"
+            )));
         }
+        return Err(RestError::Kraken(strs));
     }
 
     json.get("result")
@@ -629,14 +632,25 @@ fn parse_throttle_until(codes: &[String]) -> Option<u64> {
         .find_map(|code| crate::error::parse_throttle_until(code))
 }
 
-/// Wall-clock seconds until absolute Unix-seconds `ts`, clamped at zero
-/// (`SystemTime` because the throttle timestamp is wall-clock).
+/// Wall-clock seconds until absolute Unix-seconds `ts`, clamped at zero.
 fn wall_seconds_until(ts: u64) -> Duration {
+    unix_now_secs().map_or(Duration::ZERO, |now| {
+        Duration::from_secs(ts.saturating_sub(now))
+    })
+}
+
+pub(crate) fn unix_now_secs() -> Option<u64> {
+    unix_now_ms().map(|ms| ms / 1000)
+}
+
+/// Wall-clock Unix milliseconds (`SystemTime` because throttle timestamps are wall-clock);
+/// `None` before the epoch.
+pub(crate) fn unix_now_ms() -> Option<u64> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(now) => Duration::from_secs(ts.saturating_sub(now.as_secs())),
-        Err(_) => Duration::ZERO,
-    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|now| u64::try_from(now.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Errors from `RestSurface`. No `Eq` (`RateLimitExceeded` carries `f64`);
@@ -914,13 +928,7 @@ mod tests {
         }
     }
 
-    /// Clock pinned at T=0 (no headroom decay flake).
-    struct FixedClock(std::time::Duration);
-    impl crate::clock::Clock for FixedClock {
-        fn now(&self) -> crate::types::MonotonicInstant {
-            crate::types::MonotonicInstant(self.0)
-        }
-    }
+    use crate::clock::FixedClock;
 
     fn build_rest_with_canned(
         canned: Value,

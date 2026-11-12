@@ -25,7 +25,7 @@ pub enum CallerInbound {
 
     /// Client-level graceful-close marker posted ONCE by `Client::close()` with
     /// the client-level `request_id` + close instant. Fires one `ClientClosedEvent`
-    /// after BOTH WS reach closed.
+    /// after all four WS connections reach closed.
     ClientClose {
         request_id: u64,
         initiated_at: MonotonicInstant,
@@ -38,11 +38,20 @@ pub enum CallerInbound {
         mutation: RegistryMutationOp,
     },
 
-    /// Handler register / deregister. Keyed by `ChannelName`
-    /// (handler storage is per-channel, not per-`WsUrl`).
+    /// Handler register / deregister, scoped to the receiving socket URL.
     HandlerMutation {
+        url: WsUrl,
         channel: ChannelName,
         op: HandlerMutationOp,
+    },
+
+    /// Atomically register an unsolicited-channel handler and start its socket.
+    /// Used by Unified Public status, which has no wire subscribe operation.
+    RegisterHandlerAndConnect {
+        url: WsUrl,
+        channel: ChannelName,
+        id: HandlerId,
+        callback: crate::dispatch::handler_registry::HandlerCallback,
     },
 
     /// Composite drop posted by `SubscriptionGuard::Drop`: handler id + every
@@ -50,14 +59,17 @@ pub enum CallerInbound {
     /// each refcount (empty `symbols` = channel-wide) with no partial-teardown leak.
     SubscriptionGuardDrop {
         handler_id: HandlerId,
+        url: WsUrl,
         channel: ChannelName,
-        symbols: Vec<crate::types::Symbol>,
+        symbols: Vec<crate::types::StreamSymbol>,
     },
 
     /// WS request/reply frame. The reactor applies the open gate, records by
     /// `req_id`, injects the token reactor-side (`params` arrive token-free) and
-    /// sends on the auth socket.
+    /// sends on `url`'s private socket.
     WsRequestFrame {
+        /// Private connection the request is sent on and its reply read from.
+        url: WsUrl,
         req_id: u64,
         method: String,
         op: crate::dispatch::WsOp,
@@ -98,25 +110,41 @@ impl std::fmt::Debug for CallerInbound {
                 .field("url", url)
                 .field("mutation", mutation)
                 .finish(),
-            CallerInbound::HandlerMutation { channel, op } => f
+            CallerInbound::HandlerMutation { url, channel, op } => f
                 .debug_struct("HandlerMutation")
+                .field("url", url)
                 .field("channel", channel)
                 .field("op", op)
                 .finish(),
+            CallerInbound::RegisterHandlerAndConnect {
+                url, channel, id, ..
+            } => f
+                .debug_struct("RegisterHandlerAndConnect")
+                .field("url", url)
+                .field("channel", channel)
+                .field("id", id)
+                .finish(),
             CallerInbound::SubscriptionGuardDrop {
                 handler_id,
+                url,
                 channel,
                 symbols,
             } => f
                 .debug_struct("SubscriptionGuardDrop")
                 .field("handler_id", handler_id)
+                .field("url", url)
                 .field("channel", channel)
                 .field("symbols", symbols)
                 .finish(),
             CallerInbound::WsRequestFrame {
-                req_id, method, op, ..
+                url,
+                req_id,
+                method,
+                op,
+                ..
             } => f
                 .debug_struct("WsRequestFrame")
+                .field("url", url)
                 .field("req_id", req_id)
                 .field("method", method)
                 .field("op", op)
@@ -178,14 +206,14 @@ pub enum RegistryMutationOp {
     /// channel-wide entry. Idempotent.
     Deregister {
         channel: ChannelName,
-        pair: Option<crate::types::Symbol>,
+        pair: Option<crate::types::StreamSymbol>,
     },
     /// Atomic N-pair deregister for one channel — teardown mirror of
     /// `RegisterBatch`. One post: all N decrements land or the post is rejected
     /// whole, so a mid-batch `QueueFull` can't leave a wire sub alive with no guard.
     DeregisterBatch {
         channel: ChannelName,
-        pairs: Vec<crate::types::Symbol>,
+        pairs: Vec<crate::types::StreamSymbol>,
     },
     /// Forced deregister of every entry (`channel = None`) or one channel's,
     /// ignoring refcounts — backs `unsubscribe_all` / `unsubscribe_channel`.

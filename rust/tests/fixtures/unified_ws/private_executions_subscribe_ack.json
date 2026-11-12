@@ -1,0 +1,11 @@
+{
+  "method": "subscribe",
+  "req_id": 21,
+  "result": {
+    "asset_class": "derivatives",
+    "channel": "executions"
+  },
+  "success": true,
+  "time_in": "2026-09-05T11:53:25.318793Z",
+  "time_out": "2026-09-05T11:53:25.318888Z"
+}

@@ -72,7 +72,7 @@ WS `TickerUpdate` uses short names (`last`, `volume`). REST `Ticker` uses `last_
 ```rust
 let _handle = client.market().on_ticker(|update: &TickerUpdate| {
     println!("{} last={}", update.symbol.as_str(), update.last);
-});
+})?;
 client.ready().await?;
 client
     .subscription()
@@ -81,8 +81,49 @@ client
 
 No handler: `SubscriptionError::NoHandlerRegistered`. Handler lifetime: [Streaming](streaming.md).
 
+## Futures
+
+`client.market().futures().on_ticker_for` is the Futures combiner. Symbols are native wire strings (`Vec<String>`), not `Symbol`. There is no REST ticker for Futures.
+
+```rust
+use kraken_sdk::FuturesTickerUpdate;
+
+client.ready().await?;
+
+let _guard = client.market().futures().on_ticker_for(
+    vec!["PF_XBTUSD".to_owned(), "PF_ETHUSD".to_owned()],
+    None, // snapshot
+    |update: &FuturesTickerUpdate| {
+        if let FuturesTickerUpdate::Perpetual(p) = update {
+            println!(
+                "{} last={:?} bid={:?} ask={:?} funding_rate={}",
+                p.symbol, p.last, p.bid, p.ask, p.funding_rate
+            );
+        }
+    },
+)?;
+```
+
+`snapshot: Some(false)` skips the opening snapshot. `None` keeps Kraken's default. There is no `event_trigger`.
+
+`FuturesTickerUpdate` is an enum by symbol prefix. Match the variant:
+
+| Variant | Symbols | Payload |
+|---------|---------|---------|
+| `Perpetual` | `PI_`, `PF_` | `FuturesPerpetualTickerUpdate` |
+| `ExpiringFixed` | `FF_` | `FuturesExpiringTickerUpdate` |
+| `ExpiringInverse` | `FI_` | `FuturesExpiringTickerUpdate` |
+
+- All variants: `symbol`, `timestamp` (RFC 3339), `suspended`, `trades` (`u64`), `index`, `mark`, `open_interest`, `premium`, `volume`, `volume_quote` (`Decimal`).
+- Window fields are `Option<Decimal>`, `None` when the venue omits them (no trades in the window, or an empty book side): `ask`, `ask_qty`, `bid`, `bid_qty`, `change`, `change_pct`, `high`, `last`, `low`, `open`, `vwap`.
+- `Perpetual` only: `next_funding_rate_time`, `funding_rate`, `funding_rate_prediction`, `relative_funding_rate`, `relative_funding_rate_prediction`.
+- `update.symbol()` returns the wire symbol on every variant.
+
+Handler then subscribe works as on Spot: `on_ticker(cb)`, then `subscription().futures().subscribe_ticker(symbols, snapshot)`. No handler: `SubscriptionError::NoHandlerRegistered`.
+
 ## Related
 
 - [Streaming](streaming.md)
+- [Market data → Unified Futures tickers](market-data.md#unified-futures-tickers)
 - [Error handling](error-handling.md)
 - [`examples/live_streams.rs`](../../examples/live_streams.rs)

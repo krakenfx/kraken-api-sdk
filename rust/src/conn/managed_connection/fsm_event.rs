@@ -1,7 +1,7 @@
 use crate::auth::AuthError;
 use crate::conn::SubscribeErrorKind;
 use crate::transport::{TransportError, TransportErrorKind};
-use crate::types::{ChannelName, Symbol};
+use crate::types::{ChannelName, StreamSymbol};
 
 /// Closed enum of every event that drives the per-`ManagedConnection` FSM.
 #[derive(Debug)]
@@ -49,12 +49,12 @@ pub enum FsmEvent {
     },
     WireSubscribeAck {
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
         last: bool,
     },
     WireSubscribeFailed {
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
         error: SubscribeErrorKind,
     },
 
@@ -64,20 +64,20 @@ pub enum FsmEvent {
     TimerCloseTimeout,
     TimerSubscribeAckTimeout {
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
     },
     TimerRateBudgetWindowAdvanced,
     /// Per-entry subscribe resend timer. Armed when a subscribe send fails with
     /// `Backpressure`. MUST be non-zero delay to avoid a hot-loop.
     TimerSubscribeResendDue {
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
     },
     /// Per-`(Book, symbol)` reseed snapshot-liveness timer. Consecutive timeouts
     /// degrade to PassThrough. Single-shot.
     TimerBookReseedSnapshot {
         channel: ChannelName,
-        pair: Option<Symbol>,
+        pair: Option<StreamSymbol>,
     },
     /// Proactive WS-token refresh tick (TTL × 0.5). Reactor-side, not a state change.
     TimerTokenRefreshDue,

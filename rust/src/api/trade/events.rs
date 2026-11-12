@@ -8,7 +8,7 @@ use crate::dispatch::{
     DispatchEventBus, EventEnvelope, EventPayload, EventType, OrderOp, OrderSubmitStatus,
 };
 use crate::rest::RestError;
-use crate::types::{ClOrdId, MonotonicInstant, TxId};
+use crate::types::{ClOrdId, MonotonicInstant, TxId, WsUrl};
 
 use super::types::AmendId;
 use super::ws_compose::wire_error_status;
@@ -25,12 +25,14 @@ pub(crate) fn emit_rest_submit_outcome(
     sent_at: MonotonicInstant,
     request_id: &str,
 ) {
+    let url = WsUrl::Auth;
     match result {
         Ok(value) => match op {
             // Amend success mints no txid → WireAccepted with the reply's amend_id.
             OrderOp::AmendOrder => {
                 let amend_id = amend_id_in_result(value).or(amend_id);
                 rest.emit_order_submitted(
+                    url,
                     cl_ord_id,
                     amend_id,
                     op,
@@ -41,6 +43,7 @@ pub(crate) fn emit_rest_submit_outcome(
             // Cancel success → WireAccepted; never an amend_id.
             OrderOp::CancelOrder => {
                 rest.emit_order_submitted(
+                    url,
                     cl_ord_id,
                     None,
                     op,
@@ -53,6 +56,7 @@ pub(crate) fn emit_rest_submit_outcome(
                 // → no event (no fabricated placeholder).
                 if let Some(txid) = first_txid_in_rest_result(value) {
                     rest.emit_order_submitted(
+                        url,
                         cl_ord_id,
                         amend_id,
                         op,
@@ -64,6 +68,7 @@ pub(crate) fn emit_rest_submit_outcome(
         },
         Err(err @ (RestError::Kraken(_) | RestError::UnexpectedShape(_))) => {
             rest.emit_order_submitted(
+                url,
                 cl_ord_id,
                 amend_id,
                 op,
@@ -74,6 +79,7 @@ pub(crate) fn emit_rest_submit_outcome(
         Err(RestError::Transport { kind, .. }) => {
             if op_emits_ambiguous(op) && kind.is_sent_ambiguous() {
                 rest.emit_placement_ambiguous(
+                    url,
                     cl_ord_id,
                     amend_id,
                     op,
@@ -155,6 +161,7 @@ pub(crate) struct CancelEmitGuard {
     pub(crate) cl_ord_id: ClOrdId,
     /// Add/Amend/CancelOrder only — never CancelAll/CancelAllOrdersAfter.
     pub(crate) op: OrderOp,
+    pub(crate) url: WsUrl,
     pub(crate) bus: Option<Weak<DispatchEventBus>>,
     pub(crate) clock: Arc<dyn Clock>,
     /// Per-dispatch correlation id, payload-carried on the drop emit.
@@ -165,6 +172,7 @@ impl CancelEmitGuard {
     /// Build an armed guard for an add/amend/cancel_order executor.
     pub(crate) fn armed(
         rest: &Arc<crate::rest::RestSurface>,
+        url: WsUrl,
         cl_ord_id: ClOrdId,
         op: OrderOp,
         request_id: Option<String>,
@@ -173,6 +181,7 @@ impl CancelEmitGuard {
             armed: true,
             cl_ord_id,
             op,
+            url,
             bus: rest.bus_weak(),
             clock: rest.clock_arc(),
             request_id,
@@ -205,6 +214,7 @@ impl Drop for CancelEmitGuard {
             payload: EventPayload::OrderCancellationAttempted {
                 cl_ord_id: self.cl_ord_id.clone(),
                 op: self.op,
+                url: self.url,
                 request_id: self.request_id.clone(),
             },
         });

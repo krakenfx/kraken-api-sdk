@@ -1,0 +1,8 @@
+{
+  "method": "cancel_all_orders_after",
+  "result": {
+    "currentTime": "2026-10-29T09:58:17Z",
+    "triggerTime": "2026-10-29T09:59:17Z"
+  },
+  "success": true
+}

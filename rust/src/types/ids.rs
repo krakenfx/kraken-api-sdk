@@ -204,8 +204,8 @@ impl ClOrdId {
         Err(ClOrdIdError::InvalidFormat)
     }
 
-    /// Wire-form string, sent as `cl_ord_id` on order requests and echoed back
-    /// in responses.
+    /// Wire-form string, sent as `cl_ord_id` on order requests. Spot echoes it as sent; Futures
+    /// may normalise it (see [`crate::FuturesExecutionUpdate::cl_ord_id`]).
     pub fn as_str(&self) -> &str {
         &self.0
     }

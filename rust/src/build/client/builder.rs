@@ -9,14 +9,14 @@ use crate::auth::{
     AuthSigner, AuthStack, NonceSource, SpotRestHmacSha512Signer, SystemClockNonceSource,
 };
 use crate::build::config_resolver::ConfigResolver;
-use crate::build::knobs::KnobValue;
+use crate::build::knobs::{KnobValue, Knobs};
 use crate::clock::{Clock, SystemClock};
 use crate::conn::ConnectionSupervisor;
 use crate::dispatch::{DispatchEventBus, DispatchEventBusConfig};
 use crate::jitter::{JitterSource, SplitMix64Jitter};
 use crate::rate_limit::ClOrdIdPairIndex;
 use crate::rest::RestSurface;
-use crate::transport::{HttpTransport, ReqwestHttpTransport, WsSocketFactory};
+use crate::transport::{HttpTransport, ReqwestHttpTransport, WsSocketFactory, WsSocketFactoryLike};
 use crate::types::{ApiKey, ApiSecret, AuthProfile, Otp};
 
 use super::{Client, ClientBuilder, ConfigError};
@@ -148,6 +148,8 @@ impl ClientBuilder {
     /// # Errors
     /// - [`ConfigError::InvalidCredentials`] — [`Self::with_api_key`] was given a secret that is not valid base64.
     /// - [`ConfigError::InsecureEndpointScheme`] — a non-TLS endpoint URL.
+    /// - [`ConfigError::UntrustedEndpointHost`] — an endpoint host outside `kraken.com` / `kraken.zone`.
+    /// - [`ConfigError::InvalidConfig`] — an unreadable or empty `tls_extra_root_certs_file`.
     /// - [`ConfigError::HeadersRequireSdkTransport`] — custom headers combined with an injected transport.
     /// - [`ConfigError::ReservedHeaderName`] — a custom header used an SDK-owned protocol name.
     /// - [`ConfigError::Unknown`] — unreadable/invalid config file or knob.
@@ -158,10 +160,11 @@ impl ClientBuilder {
         let (resolved_knobs, source_map) = self.config_resolver.resolve()?;
 
         // Refuse non-TLS endpoints so creds never go cleartext.
-        crate::build::config_resolver::validate_endpoint_schemes(
+        crate::build::config_resolver::validate_endpoint_urls(
             &resolved_knobs,
             self.transport.is_none(),
         )?;
+        let tls = crate::transport::tls::client_config(&resolved_knobs.tls_extra_root_certs_file)?;
 
         let knobs = Arc::new(resolved_knobs);
 
@@ -185,6 +188,7 @@ impl ClientBuilder {
                 knobs.rest_base_url.clone(),
                 knobs.request_timeout(),
                 &headers,
+                &tls,
             ))
         });
 
@@ -262,11 +266,8 @@ impl ClientBuilder {
 
         rest.set_bus(Arc::clone(&bus));
 
-        let ws_factory = Arc::new(WsSocketFactory::new_with_urls(
-            Arc::clone(&bus),
-            knobs.ws_public_url.clone(),
-            knobs.ws_auth_url.clone(),
-        ));
+        let ws_factory: Arc<dyn WsSocketFactoryLike> =
+            Arc::new(ws_socket_factory(&bus, &knobs, tls));
         let supervisor = Arc::new(ConnectionSupervisor::new_with_knobs(
             Arc::clone(&bus),
             &knobs,
@@ -290,7 +291,7 @@ impl ClientBuilder {
         let subscription = SubscriptionNamespace::new(Arc::clone(&ws_surface));
 
         let dispatch =
-            Arc::new(crate::dispatch::dispatch_table::DispatchTable::with_default_spot_table());
+            Arc::new(crate::dispatch::dispatch_table::DispatchTable::with_default_table());
 
         let account = AccountNamespace::new(
             Arc::clone(&rest),
@@ -342,5 +343,51 @@ impl ClientBuilder {
         });
 
         Ok(client)
+    }
+}
+
+fn ws_socket_factory(
+    bus: &Arc<DispatchEventBus>,
+    knobs: &Knobs,
+    tls: Arc<rustls::ClientConfig>,
+) -> WsSocketFactory {
+    WsSocketFactory::new_with_urls(
+        Arc::clone(bus),
+        knobs.ws_public_url.clone(),
+        knobs.ws_auth_url.clone(),
+        knobs.unified_ws_public_url.clone(),
+        knobs.unified_ws_private_url.clone(),
+        tls,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::WsUrl;
+
+    #[test]
+    fn socket_factory_maps_each_endpoint_knob_to_its_own_connection() {
+        let mut knobs = Knobs::defaults();
+        knobs.ws_public_url = "wss://spot-public.test".to_owned();
+        knobs.ws_auth_url = "wss://spot-auth.test".to_owned();
+        knobs.unified_ws_public_url = "wss://unified-public.test".to_owned();
+        knobs.unified_ws_private_url = "wss://unified-private.test".to_owned();
+        let bus = Arc::new(DispatchEventBus::new(
+            DispatchEventBusConfig::defaults(),
+            Arc::new(SystemClock),
+        ));
+
+        let factory =
+            ws_socket_factory(&bus, &knobs, crate::transport::tls::default_client_config());
+
+        for (url, expected) in [
+            (WsUrl::Public, "wss://spot-public.test"),
+            (WsUrl::Auth, "wss://spot-auth.test"),
+            (WsUrl::UnifiedPublic, "wss://unified-public.test"),
+            (WsUrl::UnifiedPrivate, "wss://unified-private.test"),
+        ] {
+            assert_eq!(factory.endpoint_for(url), expected, "{url:?}");
+        }
     }
 }

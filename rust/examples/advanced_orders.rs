@@ -140,7 +140,7 @@ async fn main() -> ExitCode {
         client.trade().order(r).await,
     );
 
-    if env("KRAKEN_PLACE_REAL").is_none() {
+    if env("KRAKEN_PLACE_REAL").as_deref() != Some("1") {
         println!(
             "\n── Section 2 — SKIPPED (set KRAKEN_PLACE_REAL=1 to place ONE real \
              far-from-market order, confirm it rests, then cancel it) ──"

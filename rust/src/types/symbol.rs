@@ -1,11 +1,13 @@
 //! Wire-form trading pair identifiers.
 
+use std::sync::Arc;
+
 use serde::Serialize;
 /// Wire-form trading pair, e.g. `"BTC/USD"` — the modern `BASE/QUOTE` form.
 /// Legacy aliases (`XBT`, `XXBT`/`ZUSD` forms) are rejected at construction;
 /// `Ord` is lexicographic over the wire string for a stable resubscription sort.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Symbol(String);
+pub struct Symbol(Arc<str>);
 
 impl Symbol {
     /// Construct from a wire-form string, validating shape only (modern
@@ -24,7 +26,12 @@ impl Symbol {
         Self::validate_leg(base)?;
         Self::validate_leg(quote)?;
         // Uppercase to match Kraken's uppercase pair echo (ack routing). See docs/guides/wire-quirks.md.
-        Ok(Self(s.to_ascii_uppercase()))
+        let upper = if s.bytes().any(|b| b.is_ascii_lowercase()) {
+            s.to_ascii_uppercase()
+        } else {
+            s
+        };
+        Ok(Self(upper.into()))
     }
 
     /// Validate one leg: non-empty, alphanumeric, non-legacy. Digits allowed
@@ -109,6 +116,27 @@ mod tests {
         assert_eq!(Symbol::new("btc/usd").unwrap().as_str(), "BTC/USD");
         assert_eq!(Symbol::new("Eth/Usd").unwrap().as_str(), "ETH/USD");
         assert_eq!(Symbol::new("1inch/usd").unwrap().as_str(), "1INCH/USD");
+    }
+
+    #[test]
+    fn symbol_clone_shares_wire_storage() {
+        let symbol = Symbol::new("BTC/USD").unwrap();
+        let clone = symbol.clone();
+
+        assert!(Arc::ptr_eq(&symbol.0, &clone.0));
+    }
+
+    #[test]
+    fn symbol_clone_preserves_public_value_semantics() {
+        use std::collections::HashSet;
+
+        let symbol = Symbol::new("BTC/USD").unwrap();
+        let clone = symbol.clone();
+
+        assert_eq!(clone, symbol);
+        assert_eq!(clone.cmp(&symbol), std::cmp::Ordering::Equal);
+        assert_eq!(serde_json::to_string(&clone).unwrap(), "\"BTC/USD\"");
+        assert_eq!(HashSet::from([symbol, clone]).len(), 1);
     }
 
     #[test]

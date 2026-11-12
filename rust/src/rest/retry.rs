@@ -146,14 +146,12 @@ impl RetryEngine {
     pub fn classify(&self, err: &RestError, policy: &RetryPolicy) -> RetryDecision {
         if !policy.transient {
             // Validate-mode alone may take the single fresh-nonce re-sign.
-            if policy.nonce_heal {
-                if let RestError::Kraken(codes) = err {
-                    if classify_kraken(codes.first().map(String::as_str))
-                        == RetryDecision::Retry(RetryReason::InvalidNonce)
-                    {
-                        return RetryDecision::Retry(RetryReason::InvalidNonce);
-                    }
-                }
+            if policy.nonce_heal
+                && let RestError::Kraken(codes) = err
+                && classify_kraken(codes.first().map(String::as_str))
+                    == RetryDecision::Retry(RetryReason::InvalidNonce)
+            {
+                return RetryDecision::Retry(RetryReason::InvalidNonce);
             }
             return RetryDecision::NonTransient;
         }

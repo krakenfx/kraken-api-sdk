@@ -1,0 +1,104 @@
+{
+  "executions": {
+    "channel": "executions",
+    "asset_class": "derivatives",
+    "type": "update",
+    "data": [
+      {
+        "exec_type": "trade",
+        "order_status": "filled",
+        "order_id": "<redacted>",
+        "trade_id": "<redacted>",
+        "sequence_id": "<redacted>",
+        "symbol": "PF_XBTUSD",
+        "side": "buy",
+        "order_type": "market",
+        "order_qty": 0.0001,
+        "cum_qty": 0.0001,
+        "last_qty": 0.0001,
+        "last_price": "80262.0",
+        "remaining_qty": 0,
+        "fee": "0.1"
+      }
+    ]
+  },
+  "positions": {
+    "channel": "positions",
+    "type": "update",
+    "data": {
+      "time": "2026-10-27T15:10:15.492860422Z",
+      "futures": [
+        {
+          "tradeable": "PF_XBTUSD",
+          "size": "0.0001",
+          "entry_price": "80262.00000000000000000000",
+          "fill_time": "2026-10-27T15:10:15.492860422Z"
+        }
+      ],
+      "options": []
+    }
+  },
+  "margin": {
+    "channel": "margin",
+    "type": "multi_collateral",
+    "data": {
+      "available_margin": "12.5",
+      "balance_value": "13.0",
+      "collateral_value": "12.5",
+      "cross": {
+        "available_margin": "12.5",
+        "effective_leverage": "2.0"
+      },
+      "initial_margin": "0",
+      "initial_margin_without_orders": "0",
+      "isolated": [],
+      "maintenance_margin": "0",
+      "margin_equity": "12.5",
+      "pnl": "0",
+      "portfolio_value": "13.0",
+      "time": "2026-10-27T15:10:13.497831731Z",
+      "total_unrealized": "0",
+      "total_unrealized_as_margin": "0",
+      "unrealized_funding": "0"
+    }
+  },
+  "balances": {
+    "channel": "balances",
+    "type": "snapshot",
+    "data": [
+      {
+        "asset": "USD",
+        "asset_class": "currency",
+        "balance": 1.5,
+        "wallets": [
+          {
+            "type": "spot",
+            "id": "<redacted>",
+            "balance": 1.5
+          }
+        ]
+      }
+    ],
+    "sequence": 1
+  },
+  "balances_update": {
+    "channel": "balances",
+    "type": "update",
+    "data": [
+      {
+        "ledger_id": "<redacted>",
+        "ref_id": "<redacted>",
+        "timestamp": "2026-10-28T13:44:20.130163Z",
+        "type": "derivativesfuturestrade",
+        "asset": "USD",
+        "asset_class": "currency",
+        "wallet_type": "spot",
+        "wallet_id": "<redacted>",
+        "amount": 0.0,
+        "fee": 0.001,
+        "balance": 100.5
+      }
+    ],
+    "sequence": 2
+  }
+}

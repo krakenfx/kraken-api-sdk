@@ -1,0 +1,16 @@
+{
+  "channel": "ticker",
+  "type": "snapshot",
+  "data": [{
+    "symbol": "FI_XBTUSD_260925",
+    "timestamp": "2026-11-05T14:08:45.002300553Z",
+    "volume": 0,
+    "volume_quote": 0.00000000000,
+    "suspended": true,
+    "mark": 83979.8,
+    "index": 79476.3,
+    "premium": 0.000000,
+    "open_interest": 97080.00000000000,
+    "trades": 0
+  }]
+}

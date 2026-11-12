@@ -1,0 +1,33 @@
+{
+  "channel": "margin",
+  "type": "single_collateral",
+  "data": {
+    "time": "2023-10-16T13:20:01.442310555Z",
+    "wallets": [
+      {
+        "base_currency": "XBT",
+        "quote_currency": "USD",
+        "unit": "XBT",
+        "balance": "0.1219368845",
+        "portfolio_value": "0.1231447102",
+        "initial_margin": "0.0048100000",
+        "maintenance_margin": "0.0024050000",
+        "available": "0.1183347102",
+        "unrealized_funding": "0.0000418257",
+        "pnl": "0.0011660000"
+      },
+      {
+        "base_currency": "ETH",
+        "quote_currency": "EUR",
+        "unit": "ETH",
+        "balance": "1.8714395862",
+        "portfolio_value": "1.8714395862",
+        "initial_margin": "0.0000000000",
+        "maintenance_margin": "0.0000000000",
+        "available": "1.8714395862",
+        "unrealized_funding": "0.0000000000",
+        "pnl": "0.0000000000"
+      }
+    ]
+  }
+}

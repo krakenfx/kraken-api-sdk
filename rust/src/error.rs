@@ -8,8 +8,6 @@ pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
-/// Boilerplate `ApiError` tail (`request_id`/`message`/`kraken_code`) for
-/// namespaced enums with an `Unknown` variant.
 macro_rules! api_error_tail {
     () => {
         fn request_id(&self) -> Option<&str> {
@@ -25,7 +23,6 @@ macro_rules! api_error_tail {
             }
         }
     };
-    // `carried`: enum hand-writes `request_id()`; emit shared message/kraken_code only.
     (carried) => {
         fn message(&self) -> String {
             self.to_string()
@@ -40,11 +37,9 @@ macro_rules! api_error_tail {
 }
 pub(crate) use api_error_tail;
 
-/// Stamp per-dispatch correlation id onto listed request-scoped variants.
 macro_rules! impl_with_request_id {
     ($enum:ident: $($variant:ident),+ $(,)?) => {
         impl $enum {
-            /// Stamp correlation id onto a request-scoped variant (first stamp wins).
             pub(crate) fn with_request_id(mut self, id: &str) -> Self {
                 match &mut self {
                     $( $enum::$variant { request_id, .. } )|+
@@ -61,11 +56,9 @@ macro_rules! impl_with_request_id {
 }
 pub(crate) use impl_with_request_id;
 
-/// Shared constructor + dispatch-miss conversion for namespaced error enums.
 macro_rules! impl_error_common {
     ($enum:ident) => {
         impl $enum {
-            /// Construct a `MalformedResponse` from a detail string.
             pub(crate) fn malformed(detail: String) -> Self {
                 Self::MalformedResponse {
                     detail,
@@ -87,7 +80,6 @@ macro_rules! impl_error_common {
 }
 pub(crate) use impl_error_common;
 
-/// Shared `From<RestError>` for Market/Account (optional namespace-specific arm).
 macro_rules! impl_from_rest_error {
     ($enum:ident $(, $extra_pat:literal => $extra:expr)?) => {
         impl From<crate::rest::RestError> for $enum {
@@ -139,7 +131,6 @@ macro_rules! impl_from_rest_error {
 }
 pub(crate) use impl_from_rest_error;
 
-/// Shared `From<RestError>` taxonomy tests per namespaced enum.
 #[cfg(test)]
 macro_rules! from_rest_taxonomy_tests {
     ($enum:ident) => {
@@ -323,13 +314,14 @@ impl ApiError for EventsError {
 #[error("{kind}")]
 pub struct ConnectionError {
     kind: ConnectionErrorKind,
+    detail: Option<String>,
 }
 
 /// Cause of a [`ConnectionError`]. Closed set; stable cross-binding messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConnectionErrorKind {
-    /// Auth connection not open at compose time; nothing was sent.
+    /// Private connection not open at compose time; nothing was sent.
     #[error("Connection is not open; the request was not sent.")]
     NotOpen,
     /// Connection dropped while the request was in flight.
@@ -344,46 +336,91 @@ pub enum ConnectionErrorKind {
     /// `caller_to_io` full at post — definitely-not-sent (distinct from `NotOpen`).
     #[error("The operation queue is full; the request was rejected.")]
     QueueFull,
+    /// The connection is open but holds no valid session token at compose time;
+    /// definitely-not-sent (distinct from `NotOpen`).
+    #[error("No valid session token is available; the request was not sent.")]
+    SessionTokenUnavailable,
     /// Response deadline elapsed. SENT-AMBIGUOUS — may have reached the wire.
     #[error("The request deadline elapsed before a response was received.")]
     ResponseTimeout,
+    /// The connection failed to authenticate; nothing was sent.
+    #[error("The connection could not authenticate; the request was not sent.")]
+    AuthenticationFailed,
+    /// The key lacks a permission and the connection failed; nothing was sent.
+    #[error("The API key lacks a required permission; the request was not sent.")]
+    PermissionDenied,
 }
 
+pub(crate) const AUTH_REFRESH_FAILED_PREFIX: &str = "AuthRefreshFailed: ";
+
 impl ConnectionError {
+    fn of(kind: ConnectionErrorKind) -> Self {
+        Self { kind, detail: None }
+    }
+
     pub(crate) fn not_open() -> Self {
-        Self {
-            kind: ConnectionErrorKind::NotOpen,
-        }
+        Self::of(ConnectionErrorKind::NotOpen)
     }
 
     pub(crate) fn request_in_flight_when_dropped() -> Self {
-        Self {
-            kind: ConnectionErrorKind::RequestInFlightWhenDropped,
-        }
+        Self::of(ConnectionErrorKind::RequestInFlightWhenDropped)
     }
 
     pub(crate) fn client_closed() -> Self {
-        Self {
-            kind: ConnectionErrorKind::ClientClosed,
-        }
+        Self::of(ConnectionErrorKind::ClientClosed)
     }
 
     pub(crate) fn loop_closed() -> Self {
-        Self {
-            kind: ConnectionErrorKind::LoopClosed,
-        }
+        Self::of(ConnectionErrorKind::LoopClosed)
     }
 
     pub(crate) fn queue_full() -> Self {
-        Self {
-            kind: ConnectionErrorKind::QueueFull,
-        }
+        Self::of(ConnectionErrorKind::QueueFull)
     }
 
     pub(crate) fn response_timeout() -> Self {
+        Self::of(ConnectionErrorKind::ResponseTimeout)
+    }
+
+    pub(crate) fn session_token_unavailable() -> Self {
+        Self::of(ConnectionErrorKind::SessionTokenUnavailable)
+    }
+
+    pub(crate) fn authentication_failed(message: String) -> Self {
         Self {
-            kind: ConnectionErrorKind::ResponseTimeout,
+            kind: ConnectionErrorKind::AuthenticationFailed,
+            detail: Some(message),
         }
+    }
+
+    pub(crate) fn connection_failed(
+        class: Option<crate::dispatch::NonTransientClass>,
+        last_error: &str,
+    ) -> Self {
+        use crate::dispatch::NonTransientClass::{
+            BadCreds, ClientError, PermissionDenied, RetryCapExhausted,
+        };
+        match class {
+            Some(PermissionDenied) => Self::of(ConnectionErrorKind::PermissionDenied),
+            Some(BadCreds) => {
+                Self::authentication_failed("Invalid API key or signature".to_owned())
+            }
+            Some(ClientError) => Self::authentication_failed(
+                last_error
+                    .strip_prefix(AUTH_REFRESH_FAILED_PREFIX)
+                    .unwrap_or(last_error)
+                    .to_owned(),
+            ),
+            Some(RetryCapExhausted) | None => Self::not_open(),
+        }
+    }
+
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        matches!(self.kind, ConnectionErrorKind::PermissionDenied)
+    }
+
+    pub(crate) fn authentication_failure(&self) -> Option<&str> {
+        self.detail.as_deref()
     }
 
     #[cfg(test)]
@@ -391,38 +428,63 @@ impl ConnectionError {
         self.kind
     }
 
-    /// Definitely not sent (`NotOpen` or `QueueFull`).
     pub(crate) fn is_definitely_not_sent(&self) -> bool {
         matches!(
             self.kind,
-            ConnectionErrorKind::NotOpen | ConnectionErrorKind::QueueFull
+            ConnectionErrorKind::NotOpen
+                | ConnectionErrorKind::QueueFull
+                | ConnectionErrorKind::SessionTokenUnavailable
+                | ConnectionErrorKind::AuthenticationFailed
+                | ConnectionErrorKind::PermissionDenied
         )
     }
 
-    /// Full `caller_to_io` queue rejection.
+    pub(crate) fn is_session_token_unavailable(&self) -> bool {
+        matches!(self.kind, ConnectionErrorKind::SessionTokenUnavailable)
+    }
+
     pub(crate) fn is_queue_full(&self) -> bool {
         matches!(self.kind, ConnectionErrorKind::QueueFull)
     }
 
-    /// Per-request response-deadline timeout.
     pub(crate) fn is_response_timeout(&self) -> bool {
         matches!(self.kind, ConnectionErrorKind::ResponseTimeout)
     }
 }
 
-/// `EClass` token from `EClass:Detail`; whole string if no `:`.
 pub(crate) fn kraken_eclass_code(msg: &str) -> String {
     msg.split_once(':')
         .map_or_else(|| msg.to_string(), |(eclass, _)| eclass.to_string())
 }
 
-/// Trailing Unix-seconds from `EService:Throttled: <ts>`, else `None`.
 pub(crate) fn parse_throttle_until(code: &str) -> Option<u64> {
     code.strip_prefix("EService:Throttled:")
         .and_then(|suffix| suffix.trim().parse::<u64>().ok())
 }
 
-/// Canonical rate-limit / throttle substring check (shared by all classifiers).
+fn is_unified_token_reject(msg: &str) -> bool {
+    [
+        "Invalid session",
+        "Missing or invalid 'params.token'",
+        "Token(s) not found",
+        "Token field must be a string",
+    ]
+    .iter()
+    .any(|reject| msg.contains(reject))
+}
+
+/// Whether a WS rejection means the session token is stale or invalid.
+pub(crate) fn is_token_stale_reject(url: crate::types::WsUrl, msg: &str) -> bool {
+    (url.is_unified() && is_unified_token_reject(msg))
+        || msg.contains("EAPI:Invalid token")
+        || msg.contains("ESession:Invalid session")
+        || (msg.contains("token")
+            && (msg.contains("stale")
+                || msg.contains("expir")
+                || msg.contains("Invalid")
+                || msg.contains("invalid")))
+}
+
 pub(crate) fn is_kraken_rate_limit(msg: &str) -> bool {
     msg.contains("Rate limit") || msg.contains("Throttled") || msg.contains("Too many requests")
 }
@@ -457,6 +519,23 @@ mod tests {
     }
 
     #[test]
+    fn connection_error_kind_messages_are_stable() {
+        for (kind, message) in [
+            (
+                ConnectionErrorKind::AuthenticationFailed,
+                "The connection could not authenticate; the request was not sent.",
+            ),
+            (
+                ConnectionErrorKind::PermissionDenied,
+                "The API key lacks a required permission; the request was not sent.",
+            ),
+        ] {
+            assert_eq!(kind.to_string(), message);
+            assert_eq!(ConnectionError::of(kind).to_string(), message);
+        }
+    }
+
+    #[test]
     fn kraken_eclass_code_splits_on_first_colon() {
         assert_eq!(kraken_eclass_code("EOrder:Insufficient funds"), "EOrder");
         assert_eq!(
@@ -468,7 +547,6 @@ mod tests {
     }
 }
 
-/// Golden-vector `message()` quality contract across the `ApiError` surface.
 #[cfg(test)]
 mod golden_vectors {
     use super::{ApiError, ErrorCategory, EventsError};
@@ -497,9 +575,7 @@ mod golden_vectors {
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Class {
-        /// SDK-composed message held to the quality contract.
         Contract,
-        /// Passthrough / Debug-dump / foreign-lib text the SDK does not own.
         Excluded,
     }
 
@@ -640,7 +716,9 @@ mod golden_vectors {
         use SubscriptionError::*;
         match e {
             Unknown { .. } => Class::Excluded,
-            NoHandlerRegistered { .. }
+            InvalidArguments { .. }
+            | UnsupportedFuturesSymbol { .. }
+            | NoHandlerRegistered { .. }
             | QueueFull
             | ClientClosed
             | LoopDead
@@ -651,7 +729,7 @@ mod golden_vectors {
     fn trade_class(e: &TradeError) -> Class {
         use TradeError::*;
         match e {
-            Transport { .. } | Unknown { .. } => Class::Excluded,
+            Transport { .. } | AuthenticationFailed { .. } | Unknown { .. } => Class::Excluded,
             InsufficientFunds { .. }
             | InsufficientMargin { .. }
             | InvalidOrder { .. }
@@ -667,10 +745,13 @@ mod golden_vectors {
             | MalformedResponse { .. }
             | ClientClosed
             | LoopDead
+            | InFlightLimitReached { .. }
             | WsUnsupportedOrderField { .. }
             | RestUnsupportedOrderField { .. }
             | UnsupportedTransport { .. }
             | WsSurfaceUnavailable
+            | SessionExpired { .. }
+            | PermissionDenied { .. }
             | QueueFull { .. } => Class::Contract,
         }
     }
@@ -713,6 +794,7 @@ mod golden_vectors {
             | FeatureDisabled { .. }
             | EmptyAmendRequest
             | InsecureEndpointScheme { .. }
+            | UntrustedEndpointHost { .. }
             | HeadersRequireSdkTransport
             | ReservedHeaderName { .. }
             | InvalidConfig { .. }
@@ -830,6 +912,12 @@ mod golden_vectors {
         }
 
         for e in [
+            SubscriptionError::InvalidArguments {
+                detail: "symbols cannot be empty".into(),
+            },
+            SubscriptionError::UnsupportedFuturesSymbol {
+                symbol: "OF_XBTUSD_261225_120000_C".into(),
+            },
             SubscriptionError::NoHandlerRegistered {
                 channel: ChannelName::Ticker,
             },
@@ -907,8 +995,19 @@ mod golden_vectors {
                 transport: crate::dispatch::Transport::WsV2Auth,
                 legal: &[crate::dispatch::Transport::Rest],
             },
+            TradeError::UnsupportedTransport {
+                transport: crate::dispatch::Transport::Rest,
+                legal: &[crate::dispatch::Transport::FuturesWs],
+            },
             TradeError::WsSurfaceUnavailable,
             TradeError::QueueFull { request_id: None },
+            TradeError::InFlightLimitReached { request_id: None },
+            TradeError::SessionExpired { request_id: None },
+            TradeError::PermissionDenied { request_id: None },
+            TradeError::AuthenticationFailed {
+                request_id: None,
+                kraken_message: km.clone(),
+            },
             TradeError::Unknown {
                 request_id: None,
                 kraken_code: kc.clone(),
@@ -1007,6 +1106,9 @@ mod golden_vectors {
                 knob: "rest_base_url".into(),
                 scheme: "https".into(),
             },
+            ConfigError::UntrustedEndpointHost {
+                knob: "ws_public_url".into(),
+            },
             ConfigError::HeadersRequireSdkTransport,
             ConfigError::ReservedHeaderName {
                 name: "api-key".into(),
@@ -1038,11 +1140,9 @@ mod golden_vectors {
     #[test]
     fn message_quality_contract_holds_across_apierror_surface() {
         let vectors = all_vectors();
-        // Exact variant count of the full ApiError surface — a dropped or
-        // un-pinned addition trips this.
         assert_eq!(
             vectors.len(),
-            94,
+            102,
             "ApiError surface variant count changed — add the new variant's instance to all_vectors() and pin its message"
         );
         check(&vectors);
@@ -1050,21 +1150,15 @@ mod golden_vectors {
 
     #[test]
     fn symbol_display_renders_wire_string() {
-        // Symbol::Display renders the bare wire string (no Debug wrapper) — a
-        // cross-binding surface used inside error messages.
         assert_eq!(Symbol::new("BTC/USD").unwrap().to_string(), "BTC/USD");
     }
 
-    /// The byte-identical cross-binding reference: every rendered Contract-class
-    /// `message()` is pinned here; the Phase-2 ports MUST reproduce these strings
-    /// exactly. A diff is a contract change, not a test fix.
+    /// Byte-identical cross-binding reference: every Contract-class `message()` is pinned; a diff is a contract change.
     #[test]
     fn contract_message_set_is_byte_pinned() {
         use std::collections::BTreeSet;
 
-        // Pin the (code, message) PAIR, not just the message, so a variant
-        // remapped onto another's code/string is caught. Residual: this is a SET,
-        // so remaps onto intentionally-shared pairs (CLIENT_CLOSED, MALFORMED_RESPONSE) dedup.
+        // Pins the (code, message) pair so a remapped variant is caught; intentionally shared pairs dedup in the set.
         let expected: BTreeSet<(&str, &str)> = [
             ("AUTH_REFRESH_FAILED", "Token refresh failed."),
             ("AUTH_REFRESH_FAILED", "Token stale; refresh required."),
@@ -1118,6 +1212,11 @@ mod golden_vectors {
             ),
             ("INVALID_ARGUMENTS", "Invalid arguments: bad ofs."),
             ("INVALID_ARGUMENTS", "Invalid arguments: bad pair."),
+            ("INVALID_ARGUMENTS", "Invalid arguments: symbols cannot be empty."),
+            (
+                "INVALID_ARGUMENTS",
+                "Unsupported Futures symbol: OF_XBTUSD_261225_120000_C.",
+            ),
             ("INVALID_ARGUMENTS", "Invalid event type: frobnicate."),
             (
                 "INVALID_ARGUMENTS",
@@ -1138,11 +1237,15 @@ mod golden_vectors {
             ("INVALID_ARGUMENTS", "Symbol not found: BTC/USD."),
             (
                 "INVALID_ARGUMENTS",
-                "Transport WsV2Public cannot serve this spot order operation; use `.via(Transport::Rest)` or `.via(Transport::WsV2Auth)`.",
+                "Transport WsV2Public cannot serve this order operation; use `.via(Transport::Rest)` or `.via(Transport::WsV2Auth)`.",
             ),
             (
                 "INVALID_ARGUMENTS",
-                "Transport WsV2Auth cannot serve this spot order operation; use `.via(Transport::Rest)`.",
+                "Transport WsV2Auth cannot serve this order operation; use `.via(Transport::Rest)`.",
+            ),
+            (
+                "INVALID_ARGUMENTS",
+                "Transport Rest cannot serve this order operation; use `.via(Transport::FuturesWs)`.",
             ),
             (
                 "INVALID_ARGUMENTS",
@@ -1189,7 +1292,11 @@ mod golden_vectors {
             ),
             (
                 "ORDER_NOT_FOUND",
-                "Order not found; no open order matches the cl_ord_id.",
+                "Order not found; no open order matches the given cl_ord_id or order_id.",
+            ),
+            (
+                "IN_FLIGHT_LIMIT_REACHED",
+                "Futures in-flight placement limit reached; the order was not sent. Wait for a reply or raise futures_max_in_flight.",
             ),
             ("PERMISSION_DENIED", "Permission denied."),
             ("QUEUE_FULL", "Order send queue is full; back off and retry."),
@@ -1210,12 +1317,20 @@ mod golden_vectors {
             ),
             ("SERVICE_THROTTLED", "Service throttled."),
             (
+                "SESSION_EXPIRED",
+                "The session token was rejected and the request was not accepted; retry once the token is refreshed.",
+            ),
+            (
                 "SYSTEM_STATUS_MAINTENANCE",
                 "Operation blocked: exchange system status is \"maintenance\", but this operation requires \"online\" — retry once the status returns to the required level.",
             ),
             (
                 "TEMPORARY_LOCKOUT",
                 "Temporary lockout; too many sequential auth failures — retry after the cooldown (~15 min).",
+            ),
+            (
+                "UNTRUSTED_ENDPOINT_HOST",
+                "`ws_public_url` must name a host under `kraken.com` or `kraken.zone`; other endpoint hosts are refused at build time.",
             ),
         ]
         .into_iter()

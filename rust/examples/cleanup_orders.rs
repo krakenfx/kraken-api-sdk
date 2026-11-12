@@ -1,5 +1,5 @@
-//! One-shot cleanup: cancel ALL open orders on the account, then report the
-//! count. Used to recover after a batch placed orders but the SDK errored on
+//! One-shot cleanup: cancel ALL open Spot orders on the account, then report the
+//! count (Futures orders are not touched). Used to recover after a batch placed orders but the SDK errored on
 //! decode (leaving orders resting). Creds from ~/.env; secret never echoed.
 
 use std::process::ExitCode;
@@ -31,7 +31,7 @@ async fn main() -> ExitCode {
     {
         eprintln!(
             "REFUSING to cancel orders without confirmation.\n\
-             This cancels EVERY open order on the account.\n\
+             This cancels EVERY open Spot order on the account.\n\
              Re-run with KRAKEN_CLEANUP_CONFIRMED=1 to proceed."
         );
         return ExitCode::from(2);

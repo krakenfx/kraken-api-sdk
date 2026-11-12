@@ -10,6 +10,50 @@
 | `client.subscription()` | `&SubscriptionNamespace` | WS subscribe / unsubscribe |
 | `client.events()` | `&EventsNamespace` | SDK lifecycle and operational events |
 
+## Futures streams
+
+`client.market().futures()`, `client.account().futures()` and `client.subscription().futures()` expose the Unified WebSocket Futures streams. Symbols are native wire strings (`PI_XBTUSD`, `PF_ETHUSD`, `FI_XBTUSD_251226`, `FF_SOLUSD_251226`), validated at the call site. The Futures surface has no REST methods; orders go through [`client.trade().futures()`](#futures-methods-clienttradefutures).
+
+### Public handlers (`client.market().futures()`)
+
+| Method | Trigger | Description |
+|--------|---------|-------------|
+| `on_system_status(cb)` | Channel-wide | `FuturesSystemStatusUpdate`. No subscribe call; opens the public socket |
+| `on_instrument(cb)` | Channel-wide | `FuturesInstrumentSnapshot`. Start with `subscription().futures().subscribe_instrument()` |
+| `on_ticker(cb)` | Channel-wide | `FuturesTickerUpdate` |
+| `on_ticker_for(symbols, snapshot, cb)` | Register + subscribe | Returns `SubscriptionGuard` |
+| `on_trade(cb)` | Channel-wide | `FuturesTradeUpdate`, one per print; `trade_id` is `None` when the venue omits it |
+| `on_trade_for(symbols, snapshot, cb)` | Register + subscribe | Returns `SubscriptionGuard` |
+| `on_ohlc(cb)` | Channel-wide | `FuturesOhlcUpdate`, one per trade |
+| `on_ohlc_for(symbols, interval, snapshot, tick_type, cb)` | Register + subscribe | Returns `SubscriptionGuard` |
+| `on_book(cb)` | Channel-wide | `FuturesOrderBookUpdate` (maintained) |
+| `on_book_for(symbols, depth, cb)` | Register + subscribe | Returns `SubscriptionGuard` |
+| `on_book_raw(cb)` | Channel-wide | `FuturesBookDelta` (raw) |
+| `on_book_raw_for(symbols, depth, snapshot, cb)` | Register + subscribe | Returns `SubscriptionGuard` |
+
+### Private handlers (`client.account().futures()`)
+
+Credentials required. All channels are account-wide.
+
+| Method | Trigger | Description |
+|--------|---------|-------------|
+| `on_executions(cb)` | Channel-wide | `FuturesExecutionUpdate` |
+| `on_executions_for(snap_orders, snap_trades, cb)` | Register + subscribe | Returns `SubscriptionGuard` |
+| `on_positions(cb)` | Channel-wide | `FuturesPositionsUpdate` |
+| `on_positions_for(snapshot, cb)` | Register + subscribe | Returns `SubscriptionGuard` |
+| `on_balances(cb)` | Channel-wide | `FuturesBalanceUpdate` |
+| `on_balances_for(snapshot, cb)` | Register + subscribe | Returns `SubscriptionGuard` |
+| `on_margin(cb)` | Channel-wide | `FuturesMarginUpdate` |
+| `on_margin_for(cb)` | Register + subscribe | Returns `SubscriptionGuard` |
+| `on_preferences(cb)` | Channel-wide | `FuturesPreferencesUpdate` |
+| `on_preferences_for(cb)` | Register + subscribe | Returns `SubscriptionGuard` |
+
+`on_*` returns `Result<HandlerHandle, SubscriptionError>`; `on_*_for` returns `Result<SubscriptionGuard, SubscriptionError>`. Guard and handle semantics match Spot: [Streaming](guides/streaming.md#guard-vs-handle). `subscription().futures()` has `subscribe_*` / `unsubscribe_*` for each channel, plus `unsubscribe_channel` and `unsubscribe_all`. `subscribe_*` returns `Err(SubscriptionError::NoHandlerRegistered)` if no handler is registered. The `on_*_for` combiners deduplicate repeated symbols and keep the first input order.
+
+Book policy matches Spot: maintained books validate CRC32 and resubscribe after a gap; raw books do neither. Candles take the interval as a subscribe argument (`OhlcInterval`); the venue pushes an update per trade and the snapshot holds only the current candle. Each symbol, interval and `FuturesOhlcTickType` (`Trade` by default, or `Mark`) is its own subscription. See [Unified Futures candles](guides/market-data.md#unified-futures-candles).
+
+`executions`, `positions` and `balances` open with a snapshot. `snapshot: Option<bool>` (`snap_orders` and `snap_trades` on executions) controls it: `None` keeps Kraken's default, `Some(false)` skips it. Rows carry `is_snapshot`, `true` for snapshot rows. `FuturesBalanceUpdate` also carries the frame `sequence`. `FuturesExecutionUpdate.triggers` (`ExecutionTriggers`) carries the reference, price, units and status of a stop, take-profit or trailing order. `time_in_force`, `reduce_only` and `post_only` are `None` when the venue omits them; a post-only order may instead report `order_type` `"post_only"`. `FuturesTradeUpdate.is_snapshot` is `true` only on a snapshot frame; the venue currently sends none. A private channel keeps its first subscriber's options while live. A reconnect resubscribes `Some(false)` without it, so the default snapshot is sent again; `Some(true)` is kept. Fills made during the outage return only if `snap_trades` was `Some(true)`.
+
 ## market namespace
 
 ### REST methods
@@ -46,9 +90,9 @@
 | `on_ohlc_for(pairs, interval, snapshot, cb)` | Register + subscribe | Returns `SubscriptionGuard` |
 | `on_system_status(cb)` | Channel-wide | `SystemStatusUpdate` on open and status changes |
 
-`on_*` returns `HandlerHandle`. Drop deregisters the callback; the wire subscription stays until `unsubscribe_*`. `on_*_for` returns `Result<SubscriptionGuard, SubscriptionError>`. Drop the guard to unsubscribe and deregister. Refcount and force-unsubscribe: [Streaming](guides/streaming.md), [Events → `SubscriptionTerminatedEvent`](events.md#subscriptionterminatedevent).
+`on_*` returns `Result<HandlerHandle, SubscriptionError>`. Drop the handle to deregister the callback; the wire subscription stays until `unsubscribe_*`. `on_*_for` returns `Result<SubscriptionGuard, SubscriptionError>`. Drop the guard to unsubscribe and deregister. Refcount and force-unsubscribe: [Streaming](guides/streaming.md), [Events → `SubscriptionTerminatedEvent`](events.md#subscriptionterminatedevent).
 
-`snapshot: Option<bool>` is on `ticker`, `book_raw`, `trade`, and `ohlc` `subscribe_*` / `on_*_for`. `None` keeps Kraken's default. `Some(false)` suppresses the opening snapshot. `Some(true)` on `trade` pulls recent-trades history. Ticker also takes `event_trigger: Option<TickerTrigger>` (`Trades` or `Bbo`). Default is `Trades`. `on_book` / `subscribe_book` have no `snapshot` argument; they always request the opening snapshot. For delta-only use `on_book_raw_for(pairs, depth, Some(false), cb)`.
+`snapshot: Option<bool>` is on `ticker`, `book_raw`, `trade`, and `ohlc` `subscribe_*` / `on_*_for`. `None` keeps Kraken's default. `Some(false)` suppresses the opening snapshot. `Some(true)` on `trade` pulls recent-trades history, delivered with `TradeUpdate.is_snapshot` `true`. Ticker also takes `event_trigger: Option<TickerTrigger>` (`Trades` or `Bbo`). Default is `Trades`. `on_book` / `subscribe_book` have no `snapshot` argument; they always request the opening snapshot. For delta-only use `on_book_raw_for(pairs, depth, Some(false), cb)`.
 
 Book depth is fixed at first subscribe for that pair. A later subscribe at a different depth joins the existing subscription. After a termination, the next subscribe starts a new lifetime.
 
@@ -88,6 +132,7 @@ Asset codes in responses are modern form (`BTC`, `USD`, `USDC`). Legacy wire cod
 | `on_balances_for(cb)` | Register + subscribe. Returns `SubscriptionGuard` |
 
 Execution and balance channels are account-wide. Pair the plain `on_*` forms with `subscribe_executions()` / `subscribe_balances()`.
+`ExecutionUpdate.is_snapshot` is `true` for entries from the opening snapshot, including the one resent after a reconnect.
 
 ## trade namespace
 
@@ -117,6 +162,20 @@ All trade methods return `PendingTrade<Req, Resp>`. Chain `.via(Transport)` befo
 | `order_batch(req: AddOrderBatchRequest)` | Place 2–15 orders. Per-row `txid` or `error` |
 
 Targeted cancel and amend use `cl_ord_id` only. Orders without one are reachable only via `cancel_all` / `cancel_all_orders_after`. No txid-keyed cancel/amend in v1.
+
+### Futures methods (`client.trade().futures()`)
+
+Same `PendingTrade` shape. Futures orders always travel on the Unified private WebSocket: `.via(Transport::FuturesWs)` is the only transport, and `.via(Transport::Rest)` is `TradeError::UnsupportedTransport`. [Placing orders → Futures](guides/placing-orders.md#futures-orders).
+
+| Method | Description |
+|--------|-------------|
+| `order(req: FuturesOrderRequest)` | Place one order. `FuturesOrder::new` is a market order; set `.order_type(..)` for anything else |
+| `order_amend(req: FuturesOrderAmendRequest)` | Amend by `cl_ord_id` (`by_cl_ord_id`) or by the venue `order_id` (`by_order_id`), exactly one. Optional absolute `deadline`. The reply `amend_id` is empty |
+| `cancel(order: impl Into<FuturesOrderRef>)` | Cancel one order by `ClOrdId` or by the venue `TxId` (order id) |
+| `cancel_batch(cl_ord_ids: Vec<ClOrdId>)` | Cancel 2–50 orders in one request; the reply is a count only. `cl_ord_id` only: the venue refuses `order_id` on `batch_cancel` |
+| `cancel_all()` | Cancel all open Futures orders (Spot orders are untouched): [Placing orders → Deadlines and dead-man](guides/placing-orders.md#deadlines-and-dead-man) |
+| `cancel_all_orders_after(timeout: u32)` | Futures dead-man, independent of Spot's. `0` disarms |
+| `order_batch(req: FuturesOrderBatchRequest)` | Place 2–15 orders on one symbol. Per-row `txid` or `error` |
 
 ### Order types (`OrderType`)
 
@@ -150,10 +209,10 @@ Targeted cancel and amend use `cl_ord_id` only. Orders without one are reachable
 
 | Method | Description |
 |--------|-------------|
-| `.via(Transport)` | `Transport::Rest` or `Transport::WsV2Auth` |
-| `.cl_ord_id()` | `Option<&ClOrdId>` before `.await`. `Some` for place / cancel / amend. `None` for `cancel_all`, deadman, and `order_batch` |
+| `.via(Transport)` | Spot: `Transport::Rest` or `Transport::WsV2Auth`. Futures: `Transport::FuturesWs` only |
+| `.cl_ord_id()` | `Option<&ClOrdId>` before `.await`. `Some` for place, and for cancel / amend by `cl_ord_id`. `None` for `cancel_all`, deadman, the batch methods, and a Futures cancel / amend by order id |
 
-Default transport is auth WS. `.with_prefer_rest_for_orders(true)` flips the session default. Per-call `.via(...)` wins.
+Default Spot transport is auth WS. `.with_prefer_rest_for_orders(true)` flips the Spot session default. Per-call `.via(...)` wins. Futures orders always use the Unified private WS.
 
 ## subscription namespace
 
@@ -238,7 +297,7 @@ headers.insert(USER_AGENT, HeaderValue::from_static("my-app/1.4.0"));
 let client = Client::builder().with_headers(headers).build()?;
 ```
 
-Default without `with_headers`: `User-Agent: kraken-sdk-rust/<version>` and `x-korigin: 12003`. A caller `user-agent` is prepended; the SDK token is always appended (`my-app/1.4.0 kraken-sdk-rust/<version>`). WebSocket upgrades carry the SDK token and `x-korigin: 12004`. `with_headers` is REST-only.
+Default without `with_headers`: `User-Agent: kraken-sdk-rust/<version>` and `x-korigin: 12003`. A caller `user-agent` is prepended; the SDK token is always appended (`my-app/1.4.0 kraken-sdk-rust/<version>`). WebSocket upgrades carry the SDK token and `x-korigin: 12004`, except the Unified private upgrade, which omits `x-korigin`. `with_headers` is REST-only.
 
 `HeaderMap` / `HeaderValue` reject CR/LF and invalid names. Headers are telemetry and must not confer privilege. Not env- or file-sourceable. Combined with `with_transport`: `ConfigError::HeadersRequireSdkTransport` (`HEADERS_REQUIRE_SDK_TRANSPORT`). Reserved names `api-key`, `api-sign`, `content-type`, `accept`, `host`, `x-korigin` are rejected at `.build()` (`ConfigError::ReservedHeaderName`, `RESERVED_HEADER_NAME`). The transport gate wins if both apply. `reqwest::header` is re-exported as `kraken_sdk::header`.
 
@@ -270,7 +329,7 @@ Types: `MarketError`, `AccountError`, `TradeError`, `SubscriptionError`, `Events
 
 ## Out of scope in v1
 
-v1 is Spot trading and portfolio, crypto/forex only. These absences are intentional.
+Spot covers trading and portfolio, crypto/forex only. These Spot absences are intentional.
 
 ### Endpoints not exposed
 
@@ -286,9 +345,9 @@ v1 is Spot trading and portfolio, crypto/forex only. These absences are intentio
 | Endpoint(s) | Param | Why |
 |---|---|---|
 | Balance · BalanceEx · TradeBalance · OpenOrders · ClosedOrders · Ledgers · QueryLedgers · TradesHistory · OpenPositions · TradeVolume | `rebase_multiplier` | xStocks / tokenized display. Those pairs are `MarketError::SymbolNotFound` |
-| AddOrder · AddOrderBatch | `broker` | Partner IIBAN |
+| AddOrder · AddOrderBatch | `broker` | Partner IIBAN. Not sent for Spot; Futures orders carry it as `FuturesOrder::broker` |
 | ClosedOrders · Ledgers · TradesHistory | `without_count` | Not in v1 |
 | ClosedOrders · TradesHistory | `consolidate_taker` | Not in v1 |
 | OpenPositions | `consolidation` | Different row model |
 | TradeVolume | `fee_schedule` | SDK sends `fee-info` only |
-| AmendOrder | `deadline` | Not in v1 (AddOrder `deadline` likewise) |
+| AmendOrder | `deadline` | Not in v1 for Spot (AddOrder `deadline` likewise); Futures sends it, see `FuturesOrderAmendRequest` |

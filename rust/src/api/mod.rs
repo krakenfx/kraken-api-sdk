@@ -1,5 +1,4 @@
-//! Public API — caller-facing async namespaces. Every method here is `async` and
-//! must be awaited on a tokio runtime.
+//! Caller-facing async namespaces; methods are awaited on a tokio runtime.
 
 use std::collections::HashMap;
 
@@ -8,6 +7,7 @@ use serde_json::Value;
 pub mod account;
 pub mod await_handle;
 pub mod events;
+mod futures_subscription;
 pub mod market;
 pub mod subscription;
 pub mod subscription_guard;
@@ -24,17 +24,26 @@ pub(crate) use await_handle::{
 
 pub use account::{
     AccountError, AccountNamespace, Balance, BalanceUpdate, CloseTime, ClosedOrders,
-    ClosedOrdersRequest, ExecType, ExecutionFee, ExecutionUpdate, ExtendedBalance,
-    ExtendedBalanceEntry, KrakenTimestamp, LedgerEntry, LedgerType, LedgerTypeFilter, Ledgers,
+    ClosedOrdersRequest, ExecType, ExecutionFee, ExecutionTriggers, ExecutionUpdate,
+    ExtendedBalance, ExtendedBalanceEntry, FuturesAccountNamespace, FuturesBalanceUpdate,
+    FuturesExecutionUpdate, FuturesIsolatedMargin, FuturesMarginUpdate, FuturesMarginValues,
+    FuturesMultiCollateralMargin, FuturesPosition, FuturesPositionsUpdate,
+    FuturesPreferencesUpdate, FuturesSingleCollateralMargin, FuturesSingleCollateralWallet,
+    FuturesTradingPermission, KrakenTimestamp, LedgerEntry, LedgerType, LedgerTypeFilter, Ledgers,
     LedgersRequest, LifecyclePosition, MaskedBalance, OpenOrders, OpenOrdersRequest,
     OpenPositionEntry, OpenPositions, OrderDescr, OrderInfo, OrderStatus, PositionStatus,
     ReconciliationOutcome, TradeBalance, TradeHistoryEntry, TradeTypeFilter, TradeVolume,
     TradesHistoryRequest, TradesHistorySnapshot, Wallet, WsOrderStatus,
 };
 pub use events::{EventSubscription, EventsNamespace};
+pub use futures_subscription::FuturesSubscriptionNamespace;
 pub use market::{
-    AssetMeta, AssetPairMeta, AssetPairs, Assets, FeeTier, MarketError, MarketNamespace,
-    OhlcCandle, OhlcInterval, OhlcRequest, OhlcResult, OhlcUpdate, OrderBookLevel,
+    AssetMeta, AssetPairMeta, AssetPairs, Assets, FeeTier, FuturesEmergencyIncident,
+    FuturesExpiringTickerUpdate, FuturesIncidentStep, FuturesInstrumentAsset,
+    FuturesInstrumentPair, FuturesInstrumentSnapshot, FuturesMaintenanceWindow,
+    FuturesMarketNamespace, FuturesOhlcUpdate, FuturesPerpetualTickerUpdate,
+    FuturesSystemStatusUpdate, FuturesTickerUpdate, FuturesTradeUpdate, MarketError,
+    MarketNamespace, OhlcCandle, OhlcInterval, OhlcRequest, OhlcResult, OhlcUpdate, OrderBookLevel,
     OrderBookSnapshot, RecentTrade, ServerTime, SpreadEntry, SpreadsResult, SystemStatus,
     SystemStatusUpdate, Ticker, TickerDecodeError, TickerResult, TickerUpdate, TradeSide,
     TradeUpdate, TradesRequest, TradesResult,
@@ -42,21 +51,21 @@ pub use market::{
 pub use subscription_guard::SubscriptionGuard;
 pub use subscription_namespace::SubscriptionNamespace;
 pub use subscription_types::{
-    SubscribeFailureCause, SubscriptionError, SubscriptionInfo, SubscriptionRef, SubscriptionState,
-    SubscriptionsSummary,
+    FuturesSubscriptionInfo, FuturesSubscriptionRef, SubscribeFailureCause, SubscriptionError,
+    SubscriptionInfo, SubscriptionRef, SubscriptionState, SubscriptionsSummary,
 };
 pub use trade::{
     AddOrderBatchRequest, AddOrderBatchResponse, AddOrderDescr, AddOrderResponse, AmendId,
     AmendOrderResponse, BatchOrderEntry, BatchOrderResult, BatchResult, CancelAllRequest,
     CancelAllResponse, CancelBatchRequest, CancelBatchResponse, CancelOrderResponse, CancelRequest,
-    CloseOrderType, ConditionalClose, DeadlineSpec, DeadmanRequest, DeadmanResponse, OFlag,
-    OrderAmendRequest, OrderError, OrderRequest, OrderType, PendingTrade, Price, PriceUnit, Side,
-    StpType, TimeInForce, TimeSpec, TradeError, TradeNamespace, TriggerKind,
+    CloseOrderType, ConditionalClose, DeadlineSpec, DeadmanRequest, DeadmanResponse, FuturesOrder,
+    FuturesOrderAmendRequest, FuturesOrderBatchRequest, FuturesOrderRef, FuturesOrderRequest,
+    FuturesTradeNamespace, OFlag, OrderAmendRequest, OrderError, OrderRequest, OrderType,
+    PendingTrade, Price, PriceUnit, Side, StpType, TimeInForce, TimeSpec, TradeError,
+    TradeNamespace, TriggerKind,
 };
 
-/// Crate-internal seam so dispatch helpers stay generic over REST-encoded
-/// request types. `to_params`/`to_form` on each struct remain the wire-shape
-/// authority (WS JSON is separate); impls here only delegate.
+/// Lets dispatch helpers stay generic over REST-encoded requests; impls only delegate.
 pub(crate) trait WireRequest {
     /// Ordered wire key/value pairs for this request.
     fn wire_params(&self) -> Vec<(String, String)>;
@@ -128,13 +137,8 @@ impl WireRequest for AddOrderBatchRequest {
     }
 }
 
-/// Decode a Kraken `result` JSON object into a `HashMap<K, V>`, applying
-/// `from_entry` to each decoded `(key, Raw)` pair.
-///
-/// Shared by the market and account REST namespaces: `on_error` adapts a
-/// context-tagged message to the caller's error type; `from_entry` performs the
-/// per-entry `Raw -> (K, V)` transform. `result` is consumed so each row moves
-/// into `from_value` with no per-entry clone.
+/// Decodes a Kraken `result` object into a `HashMap<K, V>`, mapping each entry with `from_entry`.
+/// Takes `result` by value so each row moves into `from_value` without a per-entry clone.
 pub(crate) fn decode_object_map<Raw, K, V, E>(
     result: Value,
     ctx: &str,

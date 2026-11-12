@@ -6,6 +6,8 @@ mod checksum;
 mod wire;
 
 pub(crate) use builder::{ApplyError, OrderBookBuilder};
-pub use builder::{BookDelta, BookLevel, OrderBookUpdate, PriceLevel};
+pub use builder::{
+    BookDelta, BookLevel, FuturesBookDelta, FuturesOrderBookUpdate, OrderBookUpdate, PriceLevel,
+};
 pub use checksum::compute_book_crc32;
 pub(crate) use wire::{parse_book_frame, parse_book_frame_owned};

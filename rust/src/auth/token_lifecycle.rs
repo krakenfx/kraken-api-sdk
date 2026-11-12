@@ -1092,10 +1092,10 @@ mod tests {
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                if let Some((k, v)) = line.split_once('=') {
-                    if k.trim() == name {
-                        return Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
-                    }
+                if let Some((k, v)) = line.split_once('=')
+                    && k.trim() == name
+                {
+                    return Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
                 }
             }
             None

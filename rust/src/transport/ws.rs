@@ -8,10 +8,13 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::{Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderValue, header::USER_AGENT};
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+};
 
 use crate::dispatch::DispatchEventBus;
 use crate::transport::http::{SDK_KORIGIN_HEADER, SDK_KORIGIN_WS, SDK_USER_AGENT};
@@ -56,6 +59,25 @@ pub struct TokioTungsteniteWsSocket {
     writer_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
+pub(crate) async fn connect_tls(
+    request: Request,
+    tls: Arc<rustls::ClientConfig>,
+) -> Result<
+    (WebSocketStream<MaybeTlsStream<TcpStream>>, Response),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(4 * 1024 * 1024))
+        .max_frame_size(Some(4 * 1024 * 1024));
+    connect_async_tls_with_config(
+        request,
+        Some(ws_config),
+        false,
+        Some(Connector::Rustls(tls)),
+    )
+    .await
+}
+
 impl TokioTungsteniteWsSocket {
     /// Construct the socket, spawn the opener, return immediately.
     pub(crate) fn open_and_spawn(
@@ -63,6 +85,7 @@ impl TokioTungsteniteWsSocket {
         url_str: String,
         connection_id: u64,
         bus: Arc<DispatchEventBus>,
+        tls: Arc<rustls::ClientConfig>,
     ) -> Self {
         let (outbox_tx, outbox_rx) = mpsc::channel::<WsOutbound>(DEFAULT_OUTBOUND_CAPACITY);
         let (inbox_tx, inbox_rx) =
@@ -76,18 +99,18 @@ impl TokioTungsteniteWsSocket {
         let reader_task_for_opener = Arc::clone(&reader_task);
         let writer_task_for_opener = Arc::clone(&writer_task);
         let bus_for_opener = Arc::clone(&bus);
-        let ws_config = WebSocketConfig::default()
-            .max_message_size(Some(4 * 1024 * 1024))
-            .max_frame_size(Some(4 * 1024 * 1024));
         tokio::spawn(async move {
-            // Bare User-Agent + WS x-korigin on the upgrade (no app compose).
+            // Bare User-Agent; x-korigin only where WsUrl::sends_korigin is true (no app compose).
             let connect_result = match url_str.as_str().into_client_request() {
                 Err(e) => Err(e),
                 Ok(mut request) => {
                     let headers = request.headers_mut();
                     headers.insert(USER_AGENT, HeaderValue::from_static(SDK_USER_AGENT));
-                    headers.insert(SDK_KORIGIN_HEADER, HeaderValue::from_static(SDK_KORIGIN_WS));
-                    let connect = connect_async_with_config(request, Some(ws_config), false);
+                    if url.sends_korigin() {
+                        headers
+                            .insert(SDK_KORIGIN_HEADER, HeaderValue::from_static(SDK_KORIGIN_WS));
+                    }
+                    let connect = connect_tls(request, tls);
                     tokio::pin!(connect);
                     tokio::select! {
                         // Socket dropped mid-connect: abandon (don't park forever).
@@ -217,15 +240,15 @@ impl WsSocket for TokioTungsteniteWsSocket {
 
 impl Drop for TokioTungsteniteWsSocket {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.reader_task.lock() {
-            if let Some(h) = guard.take() {
-                h.abort();
-            }
+        if let Ok(mut guard) = self.reader_task.lock()
+            && let Some(h) = guard.take()
+        {
+            h.abort();
         }
-        if let Ok(mut guard) = self.writer_task.lock() {
-            if let Some(h) = guard.take() {
-                h.abort();
-            }
+        if let Ok(mut guard) = self.writer_task.lock()
+            && let Some(h) = guard.take()
+        {
+            h.abort();
         }
     }
 }
@@ -441,48 +464,61 @@ mod lifecycle_tests {
         );
     }
 
-    /// Upgrade carries bare User-Agent and WS x-korigin.
+    /// Every upgrade carries the bare User-Agent; WS x-korigin on all but Unified private.
     #[tokio::test]
     #[allow(clippy::result_large_err)] // accept_hdr_async's Callback dictates the Err type
-    async fn upgrade_request_carries_sdk_identity_headers() {
+    async fn upgrade_request_carries_sdk_identity_headers_per_url() {
+        use crate::transport::http::{SDK_KORIGIN_WS, SDK_USER_AGENT};
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let (hdr_tx, hdr_rx) = tokio::sync::oneshot::channel::<(String, String)>();
+        let cases = [
+            (WsUrl::Public, Some(SDK_KORIGIN_WS)),
+            (WsUrl::Auth, Some(SDK_KORIGIN_WS)),
+            (WsUrl::UnifiedPublic, Some(SDK_KORIGIN_WS)),
+            (WsUrl::UnifiedPrivate, None),
+        ];
+        assert_eq!(cases.map(|(url, _)| url), WsUrl::ALL);
 
-        let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.expect("accept");
-            let _ws = tokio_tungstenite::accept_hdr_async(tcp, |req: &Request, resp: Response| {
-                let get = |name: &str| {
-                    req.headers()
-                        .get(name)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_default()
-                        .to_string()
-                };
-                let _ = hdr_tx.send((get("user-agent"), get("x-korigin")));
-                Ok(resp)
-            })
-            .await
-            .expect("handshake");
-        });
+        for (url, expected_korigin) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (hdr_tx, hdr_rx) =
+                tokio::sync::oneshot::channel::<(Option<String>, Option<String>)>();
 
-        let _socket = TokioTungsteniteWsSocket::open_and_spawn(
-            WsUrl::Public,
-            format!("ws://{addr}"),
-            9,
-            test_bus(),
-        );
-        let (ua, korigin) = tokio::time::timeout(Duration::from_secs(5), hdr_rx)
-            .await
-            .expect("upgrade within budget")
-            .expect("headers captured");
-        assert_eq!(ua, crate::transport::http::SDK_USER_AGENT);
-        assert_eq!(korigin, crate::transport::http::SDK_KORIGIN_WS);
-        server.await.expect("server task");
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let _ws =
+                    tokio_tungstenite::accept_hdr_async(tcp, |req: &Request, resp: Response| {
+                        let get = |name: &str| {
+                            req.headers()
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string)
+                        };
+                        let _ = hdr_tx.send((get("user-agent"), get("x-korigin")));
+                        Ok(resp)
+                    })
+                    .await
+                    .expect("handshake");
+            });
+
+            let _socket = TokioTungsteniteWsSocket::open_and_spawn(
+                url,
+                format!("ws://{addr}"),
+                9,
+                test_bus(),
+                crate::transport::tls::default_client_config(),
+            );
+            let (ua, korigin) = tokio::time::timeout(Duration::from_secs(5), hdr_rx)
+                .await
+                .expect("upgrade within budget")
+                .expect("headers captured");
+            assert_eq!(ua.as_deref(), Some(SDK_USER_AGENT), "user-agent on {url:?}");
+            assert_eq!(korigin.as_deref(), expected_korigin, "x-korigin on {url:?}");
+            server.await.expect("server task");
+        }
     }
 
     /// Unparseable URL publishes WsUpgradeFailed (opener does not die silently).
@@ -505,6 +541,7 @@ mod lifecycle_tests {
             "not a url".to_string(),
             10,
             Arc::clone(&bus),
+            crate::transport::tls::default_client_config(),
         );
         tokio::time::timeout(Duration::from_secs(5), fail_rx)
             .await
@@ -541,6 +578,7 @@ mod lifecycle_tests {
             format!("ws://{addr}"),
             7,
             test_bus(),
+            crate::transport::tls::default_client_config(),
         );
         tokio::time::timeout(Duration::from_secs(5), accepted_rx)
             .await
@@ -591,6 +629,7 @@ mod lifecycle_tests {
             format!("ws://{addr}"),
             8,
             Arc::clone(&bus),
+            crate::transport::tls::default_client_config(),
         );
         tokio::time::timeout(Duration::from_secs(5), up_rx)
             .await
@@ -674,6 +713,7 @@ mod lifecycle_tests {
             format!("ws://{addr}"),
             10,
             test_bus(),
+            crate::transport::tls::default_client_config(),
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(socket);

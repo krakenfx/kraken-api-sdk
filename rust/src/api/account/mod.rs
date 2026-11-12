@@ -13,6 +13,8 @@ use crate::rest::RestSurface;
 use crate::types::{AssetCode, AuthProfile};
 
 mod error;
+mod futures;
+mod futures_ws_types;
 mod requests;
 mod types;
 mod ws;
@@ -22,6 +24,13 @@ mod ws_types;
 mod tests;
 
 pub use error::AccountError;
+pub use futures::FuturesAccountNamespace;
+pub use futures_ws_types::{
+    ExecutionTriggers, FuturesBalanceUpdate, FuturesExecutionUpdate, FuturesIsolatedMargin,
+    FuturesMarginUpdate, FuturesMarginValues, FuturesMultiCollateralMargin, FuturesPosition,
+    FuturesPositionsUpdate, FuturesPreferencesUpdate, FuturesSingleCollateralMargin,
+    FuturesSingleCollateralWallet, FuturesTradingPermission,
+};
 pub use requests::{ClosedOrdersRequest, LedgersRequest, OpenOrdersRequest, TradesHistoryRequest};
 pub use types::{
     Balance, CloseTime, ClosedOrders, ExtendedBalance, ExtendedBalanceEntry, KrakenTimestamp,
@@ -84,6 +93,7 @@ pub struct AccountNamespace {
     rest: Arc<RestSurface>,
     ws: Arc<WsSurface>,
     dispatch: Arc<DispatchTable>,
+    futures: FuturesAccountNamespace,
 }
 
 impl AccountNamespace {
@@ -92,7 +102,17 @@ impl AccountNamespace {
         ws: Arc<WsSurface>,
         dispatch: Arc<DispatchTable>,
     ) -> Self {
-        Self { rest, ws, dispatch }
+        Self {
+            rest,
+            ws: Arc::clone(&ws),
+            dispatch,
+            futures: FuturesAccountNamespace::new(ws),
+        }
+    }
+
+    /// Access the Unified Futures private account namespace.
+    pub fn futures(&self) -> &FuturesAccountNamespace {
+        &self.futures
     }
 
     async fn signed_dispatch(

@@ -1,0 +1,6 @@
+{
+  "error": "Missing 'params.asset_class'",
+  "method": "subscribe",
+  "req_id": 13,
+  "success": false
+}
