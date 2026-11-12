@@ -206,7 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => return,
             };
             let _ = exec_tx.try_send(Msg::Fill(signed));
-        });
+        })?;
         client.subscription().subscribe_executions()?;
         Some(handle)
     } else {

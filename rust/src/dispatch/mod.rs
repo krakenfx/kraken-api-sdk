@@ -12,9 +12,9 @@ pub use dispatch_table::{Op, Transport};
 pub use event_bus::{
     AckSource, CallbackSource, CallerInbound, ClientCloseReason, ClientFailureCause, ClosedReason,
     DeadmanDisarmCause, DispatchEventBus, DispatchEventBusConfig, ErrorClass, EventCallback,
-    EventEnvelope, EventPayload, EventType, GapCause, HandlerMutationOp, LoopFailureCause,
-    NonTransientClass, OrderOp, OrderSubmitStatus, PostReject, ReactorName, RegistryMutationOp,
-    TransientClass, WsFailReason, WsOp,
+    EventEnvelope, EventPayload, EventType, FuturesSubscribeAck, FuturesSubscribeFailureClass,
+    GapCause, HandlerMutationOp, LoopFailureCause, NonTransientClass, OrderOp, OrderSubmitStatus,
+    PostReject, ReactorName, RegistryMutationOp, TransientClass, WsFailReason, WsOp,
 };
 pub(crate) use handler_registry::{
     DataDelivery, DataInvoker, HandlerCallback, HandlerDecodeOutcome, HandlerDecoder,

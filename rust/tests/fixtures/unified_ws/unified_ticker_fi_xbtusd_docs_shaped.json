@@ -1,0 +1,20 @@
+{
+  "channel": "ticker",
+  "type": "update",
+  "data": [{
+    "symbol": "FI_XBTUSD_211231",
+    "timestamp": "2021-12-01T12:00:00.000000000Z",
+    "volume": 100,
+    "volume_quote": 2800200,
+    "suspended": false,
+    "bid": 28002,
+    "bid_qty": 900,
+    "last": 28002,
+    "open": 28002,
+    "mark": 28004.5,
+    "index": 28001.25,
+    "premium": 0.0001,
+    "open_interest": 1500,
+    "trades": 1
+  }]
+}

@@ -23,13 +23,14 @@ pub struct PriceLevel {
     pub qty_wire: String,
 }
 
-/// One price level on the maintained [`OrderBookUpdate`].
+/// One price level on a maintained [`OrderBookUpdate`] or Futures book update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct BookLevel {
     /// Price of this level; unique within its side.
     pub price: Decimal,
-    /// Quantity at this price; never zero (zero-qty levels are removed).
+    /// Quantity at this price; never zero on a maintained book. After maintenance degrades to
+    /// per-frame delivery, a removal arrives as `qty == 0`.
     pub qty: Decimal,
 }
 
@@ -83,6 +84,40 @@ pub struct BookDelta {
     pub exchange_timestamp: String,
 }
 
+/// Caller-facing maintained Futures-book update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct FuturesOrderBookUpdate {
+    /// Native Futures wire symbol (for example, `PI_XBTUSD`).
+    pub symbol: String,
+    /// Bid levels, highest price first, capped to the requested depth.
+    pub bids: Vec<BookLevel>,
+    /// Ask levels, lowest price first, capped to the requested depth.
+    pub asks: Vec<BookLevel>,
+    /// Kraken's CRC32 for this update, validated in maintained mode.
+    pub checksum: u32,
+    /// Exchange wall-clock timestamp from the wire.
+    pub exchange_timestamp: String,
+}
+
+/// Raw Futures-book frame. No CRC validation or maintained state is applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct FuturesBookDelta {
+    /// Native Futures wire symbol.
+    pub symbol: String,
+    /// Bid levels: complete on snapshots, changed levels on deltas (`qty == 0` removes).
+    pub bids: Vec<PriceLevel>,
+    /// Ask levels: complete on snapshots, changed levels on deltas (`qty == 0` removes).
+    pub asks: Vec<PriceLevel>,
+    /// Kraken's wire checksum, unvalidated in raw mode.
+    pub checksum: u32,
+    /// Whether the frame is a snapshot.
+    pub is_snapshot: bool,
+    /// Exchange wall-clock timestamp from the wire.
+    pub exchange_timestamp: String,
+}
+
 /// Errors from `apply_snapshot` / `apply_delta`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyError {
@@ -127,7 +162,7 @@ fn delta_level_deletes(lvl: &PriceLevel) -> bool {
 /// Maintained book state for one `(channel, symbol)`. Mutated only on the I/O reactor.
 #[derive(Debug, Clone)]
 pub struct OrderBookBuilder {
-    symbol: Symbol,
+    symbol: String,
     /// Depth maintained + trimmed to (possibly-bumped wire depth). Must be `> CHECKSUM_DEPTH`.
     maintained_depth: usize,
     /// Depth the caller requested — the cap `build_update` applies.
@@ -143,13 +178,13 @@ pub struct OrderBookBuilder {
 
 impl OrderBookBuilder {
     /// `maintained_depth` must be `> CHECKSUM_DEPTH`; `caller_depth <= maintained_depth`.
-    pub fn new(symbol: Symbol, maintained_depth: usize, caller_depth: usize) -> Self {
+    pub fn new(symbol: impl ToString, maintained_depth: usize, caller_depth: usize) -> Self {
         debug_assert!(
             caller_depth <= maintained_depth,
             "caller_depth {caller_depth} must not exceed maintained_depth {maintained_depth}",
         );
         Self {
-            symbol,
+            symbol: symbol.to_string(),
             maintained_depth,
             caller_depth,
             bids: BTreeMap::new(),
@@ -165,7 +200,7 @@ impl OrderBookBuilder {
         self.consecutive_gaps
     }
 
-    pub fn symbol(&self) -> &Symbol {
+    pub fn symbol(&self) -> &str {
         &self.symbol
     }
 
@@ -294,10 +329,39 @@ impl OrderBookBuilder {
     /// Caller-facing update, depth-capped to `caller_depth`.
     pub fn build_update(
         &self,
+        symbol: Symbol,
         checksum: u32,
         timestamp: Option<MonotonicInstant>,
         exchange_timestamp: String,
     ) -> OrderBookUpdate {
+        let (bids, asks) = self.capped_levels();
+        OrderBookUpdate {
+            symbol,
+            bids,
+            asks,
+            checksum,
+            timestamp,
+            exchange_timestamp,
+        }
+    }
+
+    /// Caller-facing Futures update, retaining the native wire symbol.
+    pub fn build_futures_update(
+        &self,
+        checksum: u32,
+        exchange_timestamp: String,
+    ) -> FuturesOrderBookUpdate {
+        let (bids, asks) = self.capped_levels();
+        FuturesOrderBookUpdate {
+            symbol: self.symbol.clone(),
+            bids,
+            asks,
+            checksum,
+            exchange_timestamp,
+        }
+    }
+
+    fn capped_levels(&self) -> (Vec<BookLevel>, Vec<BookLevel>) {
         let bids = self
             .bids
             .values()
@@ -310,14 +374,7 @@ impl OrderBookBuilder {
             .take(self.caller_depth)
             .map(BookLevel::from)
             .collect();
-        OrderBookUpdate {
-            symbol: self.symbol.clone(),
-            bids,
-            asks,
-            checksum,
-            timestamp,
-            exchange_timestamp,
-        }
+        (bids, asks)
     }
 }
 

@@ -1,0 +1,6 @@
+{
+  "error": "instrument channel does not accept symbols",
+  "method": "subscribe",
+  "req_id": 470002,
+  "success": false
+}

@@ -1,0 +1,20 @@
+{
+  "channel": "executions",
+  "asset_class": "derivatives",
+  "type": "snapshot",
+  "data": [
+    {
+      "cum_qty": 0.0,
+      "exec_type": "new",
+      "limit_price": 85000,
+      "order_id": "<redacted>",
+      "order_qty": 0.4998,
+      "order_status": "new",
+      "order_type": "limit",
+      "reduce_only": true,
+      "side": "sell",
+      "symbol": "PF_XBTUSD",
+      "timestamp": "2026-11-10T14:58:55.392554187Z"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "method": "subscribe",
+  "req_id": 11,
+  "result": {
+    "channel": "ticker",
+    "symbol": "PI_XBTUSD"
+  },
+  "success": true,
+  "time_in": "2026-09-05T11:47:50.061177Z",
+  "time_out": "2026-09-05T11:47:50.061338Z"
+}

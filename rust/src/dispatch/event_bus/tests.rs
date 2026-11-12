@@ -119,19 +119,47 @@ fn downgrade_to_drops_handler_id_for_callback_latency() {
 }
 
 #[test]
-fn callback_source_keeps_each_channel_distinct() {
-    use crate::types::ChannelName;
-    // Book and BookRaw share the wire "book" subscribe-frame name but are distinct
-    // callbacks (on_book vs on_book_raw); their latency samples must not collapse
-    // into one bucket.
-    assert_ne!(
-        CallbackSource::DataChannel(ChannelName::Book),
-        CallbackSource::DataChannel(ChannelName::BookRaw)
-    );
-    assert_ne!(
-        CallbackSource::DataChannel(ChannelName::Ticker),
-        CallbackSource::Event(EventType::SubscriptionGapEvent)
-    );
+fn callback_source_follows_the_connection_family() {
+    use crate::types::{ChannelName, WsUrl};
+    let futures = |url, channel| CallbackSource::FuturesDataChannel { url, channel };
+    for (url, channel, expected) in [
+        (
+            WsUrl::Public,
+            ChannelName::Ticker,
+            CallbackSource::DataChannel(ChannelName::Ticker),
+        ),
+        (
+            WsUrl::Auth,
+            ChannelName::Executions,
+            CallbackSource::DataChannel(ChannelName::Executions),
+        ),
+        (
+            WsUrl::Auth,
+            ChannelName::Balances,
+            CallbackSource::DataChannel(ChannelName::Balances),
+        ),
+        (
+            WsUrl::UnifiedPublic,
+            ChannelName::Ticker,
+            futures(WsUrl::UnifiedPublic, ChannelName::Ticker),
+        ),
+        (
+            WsUrl::UnifiedPrivate,
+            ChannelName::Executions,
+            futures(WsUrl::UnifiedPrivate, ChannelName::Executions),
+        ),
+        (
+            WsUrl::UnifiedPrivate,
+            ChannelName::Balances,
+            futures(WsUrl::UnifiedPrivate, ChannelName::Balances),
+        ),
+    ] {
+        assert_eq!(
+            CallbackSource::for_data_channel(url, channel),
+            expected,
+            "{url:?}/{channel:?}"
+        );
+    }
 }
 
 fn client_ready_envelope() -> EventEnvelope {
@@ -197,6 +225,142 @@ async fn callback_latency_emitted_on_long_lived_invocation() {
         }
         other => panic!("expected CallbackLatency, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn futures_data_callback_latency_retains_unified_url() {
+    use crate::dispatch::handler_registry::{DataDelivery, HandlerId};
+    use crate::types::{ChannelName, WsUrl};
+
+    let bus = new_bus();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<EventEnvelope>(8);
+    let _metric = bus.subscribe(
+        EventType::CallbackLatency,
+        Arc::new(move |env| {
+            let _ = tx.try_send(env.clone());
+        }),
+        2,
+    );
+    bus.publish_data(
+        DataDelivery {
+            invoke: Arc::new(|_| {}),
+            payload: Arc::new(()),
+        },
+        DataRouting {
+            url: WsUrl::UnifiedPublic,
+            channel: ChannelName::Ticker,
+            handler_id: HandlerId(99),
+        },
+    );
+
+    let env = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("Futures CallbackLatency not emitted within 200ms")
+        .expect("channel closed");
+    assert!(matches!(
+        env.payload,
+        EventPayload::CallbackLatency {
+            callback_event_type: CallbackSource::FuturesDataChannel {
+                url: WsUrl::UnifiedPublic,
+                channel: ChannelName::Ticker,
+            },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn unified_private_data_callbacks_use_futures_observability_source() {
+    use crate::dispatch::handler_registry::{DataDelivery, HandlerId};
+    use crate::types::{ChannelName, WsUrl};
+
+    let bus = new_bus();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<EventEnvelope>(8);
+    for event_type in [
+        EventType::CallbackLatency,
+        EventType::SlowCallbackWarning,
+        EventType::HandlerPanicWarning,
+    ] {
+        let tx = tx.clone();
+        let _metric = bus.subscribe(
+            event_type,
+            Arc::new(move |env| {
+                let _ = tx.try_send(env.clone());
+            }),
+            u16::MAX,
+        );
+    }
+    bus.publish_data(
+        DataDelivery {
+            invoke: Arc::new(|_| std::thread::sleep(std::time::Duration::from_millis(60))),
+            payload: Arc::new(()),
+        },
+        DataRouting {
+            url: WsUrl::UnifiedPrivate,
+            channel: ChannelName::Ticker,
+            handler_id: HandlerId(100),
+        },
+    );
+    bus.publish_data(
+        DataDelivery {
+            invoke: Arc::new(|_| panic!("test data callback panic")),
+            payload: Arc::new(()),
+        },
+        DataRouting {
+            url: WsUrl::UnifiedPrivate,
+            channel: ChannelName::Ticker,
+            handler_id: HandlerId(101),
+        },
+    );
+
+    let mut saw_latency = false;
+    let mut saw_slow = false;
+    let mut saw_panic = false;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !(saw_latency && saw_slow && saw_panic) {
+            let env = rx.recv().await.expect("observability channel closed");
+            match env.payload {
+                EventPayload::CallbackLatency {
+                    callback_event_type,
+                    ..
+                } => {
+                    assert_eq!(
+                        callback_event_type,
+                        CallbackSource::FuturesDataChannel {
+                            url: WsUrl::UnifiedPrivate,
+                            channel: ChannelName::Ticker,
+                        }
+                    );
+                    saw_latency = true;
+                }
+                EventPayload::SlowCallbackWarning {
+                    slow_event_type, ..
+                } => {
+                    assert_eq!(
+                        slow_event_type,
+                        CallbackSource::FuturesDataChannel {
+                            url: WsUrl::UnifiedPrivate,
+                            channel: ChannelName::Ticker,
+                        }
+                    );
+                    saw_slow = true;
+                }
+                EventPayload::HandlerPanicWarning { source, .. } => {
+                    assert_eq!(
+                        source,
+                        CallbackSource::FuturesDataChannel {
+                            url: WsUrl::UnifiedPrivate,
+                            channel: ChannelName::Ticker,
+                        }
+                    );
+                    saw_panic = true;
+                }
+                other => panic!("unexpected observability payload: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("Unified private observability events not emitted within 1s");
 }
 
 #[tokio::test]
@@ -1208,7 +1372,7 @@ fn queue_and_reactor_names_strum_display_matches_wire_strings() {
 
 /// Display must render the WS v2 `method` string; `from_method` must round-trip it.
 #[test]
-fn ws_op_strum_display_round_trips_method_strings() {
+fn ws_op_method_strings_round_trip_and_are_order_methods() {
     use super::WsOp;
     for (op, method) in [
         (WsOp::AddOrder, "add_order"),
@@ -1217,8 +1381,89 @@ fn ws_op_strum_display_round_trips_method_strings() {
         (WsOp::CancelAll, "cancel_all"),
         (WsOp::CancelAllOrdersAfter, "cancel_all_orders_after"),
         (WsOp::BatchAdd, "batch_add"),
+        (WsOp::BatchCancel, "batch_cancel"),
     ] {
         assert_eq!(op.to_string(), method);
         assert_eq!(WsOp::from_method(method), Some(op));
+        assert!(op.is_order_method(), "{method}");
     }
+}
+
+#[test]
+fn order_op_bridges_to_the_same_method_ws_op() {
+    use super::{OrderOp, WsOp};
+    for (order_op, ws_op) in [
+        (OrderOp::AddOrder, WsOp::AddOrder),
+        (OrderOp::AmendOrder, WsOp::AmendOrder),
+        (OrderOp::CancelOrder, WsOp::CancelOrder),
+        (OrderOp::CancelAll, WsOp::CancelAll),
+        (OrderOp::CancelAllOrdersAfter, WsOp::CancelAllOrdersAfter),
+        (OrderOp::OrderBatch, WsOp::BatchAdd),
+        (OrderOp::BatchCancel, WsOp::BatchCancel),
+    ] {
+        assert_eq!(WsOp::from(order_op), ws_op, "{order_op:?}");
+    }
+}
+
+#[tokio::test]
+async fn subscription_lifecycle_publishers_pin_the_event_family_and_version_per_url() {
+    use crate::types::{ChannelName, WsUrl};
+
+    let bus = new_bus();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<EventEnvelope>(16);
+    for event_type in [
+        EventType::FuturesSubscribedEvent,
+        EventType::SubscriptionTerminatedEvent,
+        EventType::FuturesSubscriptionTerminatedEvent,
+    ] {
+        let tx = tx.clone();
+        let _ = bus.subscribe(
+            event_type,
+            Arc::new(move |env| {
+                let _ = tx.try_send(env.clone());
+            }),
+            u16::MAX,
+        );
+    }
+    let now = crate::types::MonotonicInstant::now();
+    bus.publish_futures_subscribed(
+        now,
+        ChannelName::Ticker,
+        None,
+        FuturesSubscribeAck::default(),
+    );
+    let urls = [
+        WsUrl::Public,
+        WsUrl::Auth,
+        WsUrl::UnifiedPublic,
+        WsUrl::UnifiedPrivate,
+    ];
+    for url in urls {
+        bus.publish_subscription_terminated(
+            now,
+            url,
+            ChannelName::Ticker,
+            None,
+            crate::api::subscription::TerminationCause::ClientClosed,
+            None,
+        );
+    }
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        let env = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("lifecycle event delivered")
+            .expect("channel open");
+        seen.push((env.event_type, env.event_version));
+    }
+    assert_eq!(
+        seen,
+        [
+            (EventType::FuturesSubscribedEvent, 1),
+            (EventType::SubscriptionTerminatedEvent, 2),
+            (EventType::SubscriptionTerminatedEvent, 2),
+            (EventType::FuturesSubscriptionTerminatedEvent, 1),
+            (EventType::FuturesSubscriptionTerminatedEvent, 1),
+        ]
+    );
 }

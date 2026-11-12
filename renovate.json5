@@ -2,6 +2,7 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
   "rangeStrategy": "update-lockfile",
+  "constraints": { "rust": "1.88" },
   "automerge": false,
   "timezone": "Europe/Berlin",
   "schedule": ["before 5am every weekday"],
@@ -20,6 +21,10 @@
   },
   "osvVulnerabilityAlerts": true,
   "packageRules": [
+    {
+      "matchDepTypes": ["tool-constraint"],
+      "enabled": false,
+    },
     {
       "matchPackageNames": ["*"],
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],

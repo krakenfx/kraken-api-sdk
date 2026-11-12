@@ -16,3 +16,14 @@ impl Clock for SystemClock {
         MonotonicInstant::now()
     }
 }
+
+/// Test clock pinned at one instant (a duration since the monotonic epoch).
+#[cfg(test)]
+pub(crate) struct FixedClock(pub(crate) std::time::Duration);
+
+#[cfg(test)]
+impl Clock for FixedClock {
+    fn now(&self) -> MonotonicInstant {
+        MonotonicInstant(self.0)
+    }
+}

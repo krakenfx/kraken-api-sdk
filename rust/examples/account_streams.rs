@@ -32,32 +32,38 @@ async fn main() {
     client.ready();
 
     // Prints markers only — never qty, price, cost, or fee amounts.
-    let _exec = client.account().on_executions(|u: &ExecutionUpdate| {
-        let sym = u.symbol.as_ref().map(|s| s.as_str()).unwrap_or("<none>");
-        let status = format!("{:?}", u.order_status);
-        let fee_assets = u
-            .fees
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|f| f.asset.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        println!(
-            "[executions] exec_type={:?} order_status={} symbol={} cost_set={} fee_assets=[{}]",
-            u.exec_type,
-            status,
-            sym,
-            u.cost.is_some(),
-            fee_assets
-        );
-    });
+    let _exec = client
+        .account()
+        .on_executions(|u: &ExecutionUpdate| {
+            let sym = u.symbol.as_ref().map(|s| s.as_str()).unwrap_or("<none>");
+            let status = format!("{:?}", u.order_status);
+            let fee_assets = u
+                .fees
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|f| f.asset.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "[executions] exec_type={:?} order_status={} symbol={} cost_set={} fee_assets=[{}]",
+                u.exec_type,
+                status,
+                sym,
+                u.cost.is_some(),
+                fee_assets
+            );
+        })
+        .expect("register executions handler");
 
     // Prints asset name only — never balance amounts.
-    let _bal = client.account().on_balances(|u: &BalanceUpdate| {
-        let asset = u.asset.as_ref().map(|a| a.as_str()).unwrap_or("<none>");
-        println!("[balances] asset={}", asset);
-    });
+    let _bal = client
+        .account()
+        .on_balances(|u: &BalanceUpdate| {
+            let asset = u.asset.as_ref().map(|a| a.as_str()).unwrap_or("<none>");
+            println!("[balances] asset={}", asset);
+        })
+        .expect("register balances handler");
 
     if let Err(e) = client.subscription().subscribe_executions() {
         eprintln!("[main] subscribe_executions error: {e:?}");

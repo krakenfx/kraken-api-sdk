@@ -2,7 +2,7 @@ use super::*;
 use crate::auth::{AuthStack, SpotRestHmacSha512Signer, SystemClockNonceSource};
 use crate::dispatch::Transport;
 use crate::transport::{HttpTransport, TransportError};
-use crate::types::{ApiKey, ApiSecret, ClOrdId, Symbol};
+use crate::types::{ApiKey, ApiSecret, ClOrdId, Symbol, WsUrl};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rust_decimal::Decimal;
@@ -10,8 +10,6 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// A retry-disabled `RetryEngine` for the pre-retry trade tests: single attempt,
-/// zero jitter, so no backoff sleep runs and single-attempt timing is preserved.
 fn test_no_retry_engine() -> crate::rest::retry::RetryEngine {
     let mut knobs = crate::build::knobs::Knobs::defaults();
     knobs.rest_retry_max_attempts = 1;
@@ -76,42 +74,6 @@ fn buy_limit(pair: &str, vol: &str, price: &str) -> OrderRequest {
     req
 }
 
-/// Base `AddOrderWsView` with every optional field defaulted to None/false/empty.
-/// Call sites use functional-record-update to override only their meaningful fields:
-/// `AddOrderWsView { price: &p, ..base_add_view("buy", &sym, &vol, OrderType::Limit) }`.
-fn base_add_view<'a>(
-    side: &'a str,
-    pair: &'a Symbol,
-    volume: &'a Decimal,
-    order_type: OrderType,
-) -> AddOrderWsView<'a> {
-    AddOrderWsView {
-        side,
-        pair,
-        volume,
-        order_type,
-        price: &None,
-        price2: &None,
-        oflags: &[],
-        margin: false,
-        reduce_only: &None,
-        stp_type: &None,
-        trigger: &None,
-        time_in_force: &None,
-        display_vol: &None,
-        start_time: &None,
-        expire_time: &None,
-        userref: &None,
-        cl_ord_id: &None,
-        close_ordertype: &None,
-        close_price: &None,
-        close_price2: &None,
-        validate: false,
-    }
-}
-
-/// Shared auth + event-bus + rate-limit trackers for the make_namespace_* builders,
-/// all bound to `clock`. Each builder wires these into its own transport + surface.
 fn build_deps(
     clock: &Arc<dyn crate::clock::Clock>,
 ) -> (
@@ -151,9 +113,6 @@ fn build_deps(
     (auth, bus, api_rl, trading_rl)
 }
 
-/// A `BatchOrderEntry` with the four meaningful fields set and the rest defaulted.
-/// `Side`/`OrderType` have no `Default`, so they are required args; call sites use
-/// functional-record-update to set any remaining fields.
 fn base_entry(
     side: Side,
     ordertype: OrderType,
@@ -726,7 +685,7 @@ async fn cancel_batch_rejects_explicit_ws_with_rest_only_remedy() {
     );
     assert_eq!(
         err.message(),
-        "Transport WsV2Auth cannot serve this spot order operation; use `.via(Transport::Rest)`."
+        "Transport WsV2Auth cannot serve this order operation; use `.via(Transport::Rest)`."
     );
     let err = trade
         .cancel_batch(ids)
@@ -766,21 +725,18 @@ fn ws_add_order_params_use_ws_names_and_array_free_scalar_cl_ord_id() {
         price: &price,
         oflags: &[OFlag::Post],
         cl_ord_id: &cl,
-        ..base_add_view("buy", &sym, &vol, OrderType::Limit)
+        ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::Limit)
     });
     assert_eq!(params["order_type"], "limit");
     assert_eq!(params["side"], "buy");
     assert_eq!(params["symbol"], "BTC/USDC");
     assert_eq!(params["post_only"], true);
-    // WS cl_ord_id is scalar for add/amend, array for cancel.
     assert_eq!(params["cl_ord_id"], "33333333-3333-4333-8333-333333333333");
     assert!(!params["cl_ord_id"].is_array());
-    // order_qty / limit_price are JSON numbers (no f64 rounding).
     assert!(params["order_qty"].is_number());
     assert_eq!(params["order_qty"].as_str(), None);
     assert_eq!(params["order_qty"].to_string(), "0.0001");
     assert_eq!(params["limit_price"].to_string(), "33512.0");
-    // Composer never carries a token (reactor injects it).
     assert!(params.get("token").is_none());
 }
 
@@ -791,7 +747,7 @@ fn ws_add_order_params_omit_post_only_and_limit_price_when_unset() {
     let vol = dec("1");
     let params = compose_add_order_params(AddOrderWsView {
         cl_ord_id: &cl,
-        ..base_add_view("sell", &sym, &vol, OrderType::Market)
+        ..AddOrderWsView::new("sell", sym.as_str(), &vol, OrderType::Market)
     });
     assert_eq!(params["side"], "sell");
     assert!(
@@ -811,7 +767,7 @@ fn ws_add_order_params_emit_margin_only_when_set() {
     let view = |margin: bool, reduce_only: &'static Option<bool>| AddOrderWsView {
         margin,
         reduce_only,
-        ..base_add_view("buy", &sym, &vol, OrderType::Market)
+        ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::Market)
     };
     let p = compose_add_order_params(view(true, &Some(true)));
     assert_eq!(p["margin"], true);
@@ -871,6 +827,7 @@ fn ws_add_order_decode_maps_order_id_to_txid_and_descr_none() {
         success: true,
         result: json!({ "cl_ord_id": "66666666-6666-4666-8666-666666666666", "order_id": "OBQUSP-5FD4N-JYTGWJ" }),
         error: None,
+        retry_after_ms: None,
     };
     let decoded = decode_ws_add_order(resp, Some(cl.clone())).unwrap();
     assert_eq!(
@@ -885,18 +842,6 @@ fn ws_add_order_decode_maps_order_id_to_txid_and_descr_none() {
 }
 
 #[test]
-fn ws_add_order_decode_failure_classifies_error_string() {
-    let resp = WsResponse {
-        req_id: 2,
-        success: false,
-        result: json!(null),
-        error: Some("EOrder:Insufficient funds".to_string()),
-    };
-    let err = decode_ws_add_order(resp, Some(ClOrdId::allocate_v4())).unwrap_err();
-    assert!(matches!(err, TradeError::InsufficientFunds { .. }));
-}
-
-#[test]
 fn ws_add_order_validate_mode_empty_order_id_yields_none_txid() {
     let cl = ClOrdId::new("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
     let resp = WsResponse {
@@ -904,6 +849,7 @@ fn ws_add_order_validate_mode_empty_order_id_yields_none_txid() {
         success: true,
         result: json!({ "cl_ord_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "order_id": "" }),
         error: None,
+        retry_after_ms: None,
     };
     let decoded = decode_ws_add_order(resp, Some(cl)).unwrap();
     assert!(
@@ -921,6 +867,7 @@ fn ws_add_order_nonempty_order_id_yields_some_txid() {
         success: true,
         result: json!({ "cl_ord_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "order_id": "OABC-1234-DEFGHI" }),
         error: None,
+        retry_after_ms: None,
     };
     let decoded = decode_ws_add_order(resp, Some(cl)).unwrap();
     assert_eq!(
@@ -937,10 +884,30 @@ fn ws_cancel_decode_derives_count_one_pending_false() {
         success: true,
         result: json!({ "cl_ord_id": "77777777-7777-4777-8777-777777777777" }),
         error: None,
+        retry_after_ms: None,
     };
-    let decoded = decode_ws_cancel_order(resp).unwrap();
+    let decoded = decode_ws_cancel_order("cl_ord_id", resp).unwrap();
     assert_eq!(decoded.count, 1);
     assert!(!decoded.pending);
+}
+
+#[test]
+fn ws_cancel_decode_reads_the_identity_the_venue_echoes() {
+    let reply = || WsResponse {
+        req_id: 4,
+        success: true,
+        result: json!({ "order_id": "a3270acf-5190-41bd-83a0-4e433e852277" }),
+        error: None,
+        retry_after_ms: None,
+    };
+    assert!(decode_ws_cancel_order("order_id", reply()).is_ok());
+    assert!(
+        matches!(
+            decode_ws_cancel_order("cl_ord_id", reply()),
+            Err(TradeError::MalformedResponse { .. })
+        ),
+        "a reply echoing the other identity is not accepted as this one"
+    );
 }
 
 #[test]
@@ -950,27 +917,12 @@ fn ws_cancel_decode_missing_cl_ord_id_is_malformed_not_fabricated() {
         success: true,
         result: json!({}),
         error: None,
+        retry_after_ms: None,
     };
-    let err = decode_ws_cancel_order(resp).unwrap_err();
+    let err = decode_ws_cancel_order("cl_ord_id", resp).unwrap_err();
     assert!(
         matches!(err, TradeError::MalformedResponse { .. }),
         "expected MalformedResponse, got {:?}",
-        err
-    );
-}
-
-#[test]
-fn ws_cancel_decode_failure_classifies_error_string() {
-    let resp = WsResponse {
-        req_id: 6,
-        success: false,
-        result: json!(null),
-        error: Some("EOrder:Invalid order".to_string()),
-    };
-    let err = decode_ws_cancel_order(resp).unwrap_err();
-    assert!(
-        matches!(err, TradeError::InvalidOrder { .. }),
-        "expected InvalidOrder for EOrder:Invalid order, got {:?}",
         err
     );
 }
@@ -982,6 +934,7 @@ fn ws_cancel_all_decode_reads_count() {
         success: true,
         result: json!({ "count": 4 }),
         error: None,
+        retry_after_ms: None,
     };
     let decoded = decode_ws_cancel_all(resp).unwrap();
     assert_eq!(decoded.count, 4);
@@ -994,6 +947,7 @@ fn ws_cancel_all_decode_missing_count_is_malformed_not_fabricated_zero() {
         success: true,
         result: json!({}),
         error: None,
+        retry_after_ms: None,
     };
     let err = decode_ws_cancel_all(resp).unwrap_err();
     assert!(
@@ -1010,6 +964,7 @@ fn ws_cancel_all_decode_non_integer_count_is_malformed() {
         success: true,
         result: json!({ "count": "lots" }),
         error: None,
+        retry_after_ms: None,
     };
     let err = decode_ws_cancel_all(resp).unwrap_err();
     assert!(matches!(err, TradeError::MalformedResponse { .. }));
@@ -1022,9 +977,44 @@ fn ws_amend_decode_extracts_amend_id() {
         success: true,
         result: json!({ "amend_id": "TA-ABC-123", "cl_ord_id": "x" }),
         error: None,
+        retry_after_ms: None,
     };
-    let decoded = decode_ws_amend_order(resp).unwrap();
+    let decoded = decode_ws_amend_order(WsUrl::Auth, resp).unwrap();
     assert_eq!(decoded.amend_id.as_str(), "TA-ABC-123");
+}
+
+#[test]
+fn ws_amend_decode_accepts_the_empty_futures_amend_id_only_on_unified() {
+    let reply = || WsResponse {
+        req_id: 4,
+        success: true,
+        result: json!({ "amend_id": "", "cl_ord_id": "x", "order_id": "" }),
+        error: None,
+        retry_after_ms: None,
+    };
+    let futures = decode_ws_amend_order(WsUrl::UnifiedPrivate, reply()).unwrap();
+    assert_eq!(futures.amend_id.as_str(), "");
+    assert!(matches!(
+        decode_ws_amend_order(WsUrl::Auth, reply()),
+        Err(TradeError::MalformedResponse { .. })
+    ));
+}
+
+#[test]
+fn ws_amend_decode_treats_a_missing_futures_amend_id_as_empty_only_on_unified() {
+    let reply = || WsResponse {
+        req_id: 5,
+        success: true,
+        result: json!({ "cl_ord_id": "x", "order_id": "a332eae5-9ae9-4e1e-94ef-870810e46a1c" }),
+        error: None,
+        retry_after_ms: None,
+    };
+    let futures = decode_ws_amend_order(WsUrl::UnifiedPrivate, reply()).unwrap();
+    assert_eq!(futures.amend_id.as_str(), "");
+    assert!(matches!(
+        decode_ws_amend_order(WsUrl::Auth, reply()),
+        Err(TradeError::MalformedResponse { .. })
+    ));
 }
 
 #[test]
@@ -1078,14 +1068,8 @@ fn system_status_blocked_message_is_plain_language() {
 use crate::transport::TransportErrorKind;
 use std::future::IntoFuture;
 
-/// A transport mock returning a configurable `Result` on every POST; optionally
-/// blocks on a `Notify` before returning so a test can drop the order future
-/// mid-`.await`.
 struct ProgrammableMock {
-    /// `Ok(envelope)` (full `{error,result}`) or `Err(transport error)`.
     response: Result<serde_json::Value, TransportError>,
-    /// When set, `post_form_signed` awaits this before returning — lets a test
-    /// hold the wire await open and drop the future (mid-flight cancellation).
     block_until: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -1115,8 +1099,6 @@ impl HttpTransport for ProgrammableMock {
     }
 }
 
-/// Build a REST-only `TradeNamespace` with the bus wired (so `emit_*` helpers
-/// publish) and start the dispatch reactor. Returns the namespace + the bus.
 fn make_namespace_with_bus(
     mock: Arc<dyn HttpTransport>,
 ) -> (TradeNamespace, Arc<DispatchEventBus>) {
@@ -1137,7 +1119,6 @@ fn make_namespace_with_bus(
     (TradeNamespace::new(rest), bus)
 }
 
-/// Counts POSTs; every call rejects with `EAPI:Invalid nonce`.
 struct NonceRejectingMock {
     calls: std::sync::atomic::AtomicUsize,
 }
@@ -1163,8 +1144,6 @@ impl HttpTransport for NonceRejectingMock {
     }
 }
 
-/// `validate=true` routes the REST placement to the nonce-healed policy (one
-/// fresh-nonce re-sign); a live placement keeps the strict never-retry (zero).
 #[tokio::test]
 async fn rest_add_order_validate_mode_takes_the_nonce_heal() {
     let mock = Arc::new(NonceRejectingMock {
@@ -1203,7 +1182,6 @@ async fn rest_add_order_validate_mode_takes_the_nonce_heal() {
     );
 }
 
-/// The sell and batch REST arms carry the same validate-mode selection as buy.
 #[tokio::test]
 async fn rest_sell_and_batch_validate_mode_take_the_nonce_heal() {
     let mock = Arc::new(NonceRejectingMock {
@@ -1241,7 +1219,6 @@ async fn rest_sell_and_batch_validate_mode_take_the_nonce_heal() {
     );
 }
 
-/// Subscribe a counting capture for `et`, returning the receiver of payloads.
 fn capture(
     bus: &Arc<DispatchEventBus>,
     et: EventType,
@@ -1261,7 +1238,6 @@ fn ok_envelope(result: serde_json::Value) -> serde_json::Value {
     json!({ "error": [], "result": result })
 }
 
-/// A sent-ambiguous transport drop (request reached the wire).
 fn transport_err() -> TransportError {
     TransportError {
         kind: TransportErrorKind::RequestSentNoResponse,
@@ -1269,7 +1245,6 @@ fn transport_err() -> TransportError {
     }
 }
 
-/// A not-sent transport failure (never reached the wire).
 fn pre_send_transport_err() -> TransportError {
     TransportError {
         kind: TransportErrorKind::TcpRefused,
@@ -1279,19 +1254,6 @@ fn pre_send_transport_err() -> TransportError {
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 const SHORT: std::time::Duration = std::time::Duration::from_millis(120);
-
-#[test]
-fn order_op_to_ws_op_bridge_is_1_to_1() {
-    assert_eq!(WsOp::from(OrderOp::AddOrder), WsOp::AddOrder);
-    assert_eq!(WsOp::from(OrderOp::AmendOrder), WsOp::AmendOrder);
-    assert_eq!(WsOp::from(OrderOp::CancelOrder), WsOp::CancelOrder);
-    assert_eq!(WsOp::from(OrderOp::CancelAll), WsOp::CancelAll);
-    assert_eq!(
-        WsOp::from(OrderOp::CancelAllOrdersAfter),
-        WsOp::CancelAllOrdersAfter
-    );
-    assert_eq!(WsOp::from(OrderOp::OrderBatch), WsOp::BatchAdd);
-}
 
 #[tokio::test]
 async fn rest_add_order_success_emits_order_submitted_wire_sent() {
@@ -1322,12 +1284,14 @@ async fn rest_add_order_success_emits_order_submitted_wire_sent() {
             cl_ord_id,
             amend_id,
             op,
+            url,
             status,
             ..
         } => {
             assert_eq!(cl_ord_id, cl);
             assert_eq!(amend_id, None);
             assert_eq!(op, OrderOp::AddOrder);
+            assert_eq!(url, crate::types::WsUrl::Auth);
             assert_eq!(
                 status,
                 OrderSubmitStatus::WireSent {
@@ -1376,8 +1340,6 @@ async fn rest_add_order_wire_rejection_emits_order_submitted_wire_error() {
     }
 }
 
-/// The cancel_all REST decode-failure exit stamps the dispatch id (a garbage
-/// result shape fails typed decode AFTER the wire call was correlated).
 #[tokio::test]
 async fn rest_cancel_all_decode_failure_error_carries_request_id() {
     use crate::error::ApiError;
@@ -1400,7 +1362,6 @@ async fn rest_cancel_all_decode_failure_error_carries_request_id() {
     );
 }
 
-/// Same contract on the cancel_all_orders_after decode-failure exit.
 #[tokio::test]
 async fn rest_deadman_decode_failure_error_carries_request_id() {
     use crate::error::ApiError;
@@ -1774,11 +1735,13 @@ async fn rest_add_order_transport_drop_emits_placement_ambiguous() {
             cl_ord_id,
             amend_id,
             op,
+            url,
             ..
         } => {
             assert_eq!(cl_ord_id, cl);
             assert_eq!(amend_id, None);
             assert_eq!(op, OrderOp::AddOrder);
+            assert_eq!(url, crate::types::WsUrl::Auth);
         }
         other => panic!("expected OrderPlacementAmbiguousEvent, got {other:?}"),
     }
@@ -1786,6 +1749,42 @@ async fn rest_add_order_transport_drop_emits_placement_ambiguous() {
         tokio::time::timeout(SHORT, sub_rx.recv()).await.is_err(),
         "transport drop must NOT emit OrderSubmittedEvent"
     );
+}
+
+#[test]
+fn a_ws_drop_after_send_is_sent_ambiguous_only_for_placement_ops() {
+    use crate::error::{ApiError, ConnectionError};
+
+    let in_flight = ConnectionError::request_in_flight_when_dropped;
+    let closed = ConnectionError::client_closed;
+    let loop_closed = ConnectionError::loop_closed;
+    let not_open = ConnectionError::not_open;
+    let queue_full = ConnectionError::queue_full;
+    let timeout = ConnectionError::response_timeout;
+    // (op, error, retryable)
+    let cases = [
+        (OrderOp::AddOrder, in_flight(), false),
+        (OrderOp::AddOrder, closed(), false),
+        (OrderOp::AmendOrder, in_flight(), false),
+        (OrderOp::AmendOrder, loop_closed(), false),
+        (OrderOp::OrderBatch, in_flight(), false),
+        (OrderOp::AddOrder, timeout(), false),
+        (OrderOp::AddOrder, not_open(), true),
+        (OrderOp::AddOrder, queue_full(), true),
+        (OrderOp::CancelOrder, in_flight(), true),
+        (OrderOp::CancelAll, closed(), true),
+        (OrderOp::BatchCancel, in_flight(), true),
+        (OrderOp::CancelAllOrdersAfter, loop_closed(), true),
+        (OrderOp::CancelOrder, timeout(), false),
+    ];
+    for (op, error, retryable) in cases {
+        let mapped = super::ws_sent_error_to_trade(op, error.clone());
+        assert_eq!(
+            mapped.retryable(),
+            retryable,
+            "{op:?} {error:?} mapped to {mapped:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1951,9 +1950,12 @@ async fn cancel_emit_guard_fires_on_mid_flight_drop() {
         .expect("no cancellation event")
         .expect("channel closed");
     match payload {
-        EventPayload::OrderCancellationAttempted { cl_ord_id, op, .. } => {
+        EventPayload::OrderCancellationAttempted {
+            cl_ord_id, op, url, ..
+        } => {
             assert_eq!(cl_ord_id, cl);
             assert_eq!(op, OrderOp::AddOrder);
+            assert_eq!(url, crate::types::WsUrl::Auth);
         }
         other => panic!("expected OrderCancellationAttempted, got {other:?}"),
     }
@@ -2437,6 +2439,7 @@ fn decode_ws_batch_row_count_mismatch_is_malformed_not_miszipped() {
             {"cl_ord_id": "3923aaaa-0000-4000-8000-000000000001", "order_id": "OA5C2Q-2QTWU-BSR23N"}
         ]),
         error: None,
+        retry_after_ms: None,
     };
     let err = super::executors::decode_and_guard_ws_batch(2, resp)
         .expect_err("count mismatch must error on the WS arm");
@@ -2528,7 +2531,7 @@ async fn prefer_rest_for_orders_knob_routes_default_order_to_rest() {
     }));
     let mut knobs = crate::build::knobs::Knobs::defaults();
     knobs.prefer_rest_for_orders = true;
-    trade.knobs = Arc::new(knobs);
+    trade.core.knobs = Arc::new(knobs);
 
     trade
         .order(buy_limit("BTC/USD", "0.001", "50000"))
@@ -2550,6 +2553,7 @@ fn decode_ws_batch_add_partial_placement_returns_ok_with_live_sibling() {
             {"error": "EOrder:Insufficient funds"}
         ]),
         error: None,
+        retry_after_ms: None,
     };
     let decoded = super::ws_compose::decode_ws_batch_add(resp).expect("partial placement is Ok");
     assert_eq!(decoded.orders.len(), 2);
@@ -2575,6 +2579,7 @@ fn decode_ws_batch_add_validate_mode_is_ok_with_no_txid() {
             {"validation": "Validated Successfully"}
         ]),
         error: None,
+        retry_after_ms: None,
     };
     let decoded = super::ws_compose::decode_ws_batch_add(resp).expect("validate success is Ok");
     assert_eq!(decoded.orders.len(), 2);
@@ -2593,8 +2598,25 @@ fn decode_ws_batch_add_validation_reject_is_err() {
         success: false,
         result: serde_json::Value::Null,
         error: Some("Limit_price(s) not found".to_string()),
+        retry_after_ms: None,
     };
     assert!(super::ws_compose::decode_ws_batch_add(resp).is_err());
+}
+
+#[test]
+fn decode_ws_batch_add_success_without_rows_is_malformed() {
+    let resp = crate::conn::managed_connection::WsResponse {
+        req_id: 14,
+        success: true,
+        result: json!({}),
+        error: None,
+        retry_after_ms: None,
+    };
+    let err = super::ws_compose::decode_ws_batch_add(resp).expect_err("no rows");
+    assert!(
+        matches!(err, TradeError::MalformedResponse { .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -2805,12 +2827,7 @@ fn batch_to_form_cl_ord_id_in_entry_emits_key() {
     assert!(!batch_has(&form, "orders[1][cl_ord_id]"));
 }
 
-/// A transport mock that returns a different canned response per `cl_ord_id`
-/// value found in the request body. Unrecognised cl_ord_ids return an error
-/// envelope. Used only by the cancel_batch partial-failure test.
 struct PerIdMock {
-    /// Maps the string value of `cl_ord_id=<val>` in the POST body to the
-    /// response to return for that call.
     responses: HashMap<String, serde_json::Value>,
 }
 
@@ -2964,7 +2981,6 @@ async fn cancel_batch_empty_is_vacuous_success() {
     );
 }
 
-/// Returns a canned error response (never used for WS-guarded paths).
 fn ws_guard_canned() -> serde_json::Value {
     json!({ "error": [], "result": { "descr": { "order": "x" }, "txid": ["X"] } })
 }
@@ -3007,7 +3023,6 @@ async fn ws_guard_leverage_returns_typed_error() {
     );
 }
 
-/// REST amend renders `display_qty` on the wire; `None` omits the key.
 #[test]
 fn amend_to_form_renders_display_qty() {
     let mut req = OrderAmendRequest::new(ClOrdId::new("amend-dq-1").unwrap());
@@ -3080,7 +3095,6 @@ async fn ws_guard_absolute_close_price_passes_guard() {
         Price::Absolute(dec("60000")),
     ));
     let err = trade.order(req).via(Transport::WsV2Auth).await.unwrap_err();
-    // An absolute close price is WS-representable — the guard must NOT fire.
     assert!(
         !matches!(&err, TradeError::WsUnsupportedOrderField { .. }),
         "an absolute close price must NOT be WS-guarded; got {err:?}"
@@ -3186,19 +3200,8 @@ async fn ws_guard_does_not_fire_on_rest_path_for_validate() {
     assert!(resp.txid.is_none(), "validate mode returns no txid");
 }
 
-/// A clock pinned to a fixed `Duration` since the monotonic epoch.
-/// Used by rate-limit tests so `clock_now()` in production code
-/// returns a deterministic instant with no process-elapsed decay.
-struct FixedClock(std::time::Duration);
-impl crate::clock::Clock for FixedClock {
-    fn now(&self) -> crate::types::MonotonicInstant {
-        crate::types::MonotonicInstant(self.0)
-    }
-}
+use crate::clock::FixedClock;
 
-/// Build a namespace exposing its `ClOrdIdPairIndex` and trading tracker so tests
-/// can seed the index and pre-drain the counter. `clock` is injected so pre-drain,
-/// index `sent_at` and production `clock_now()` share one deterministic instant.
 fn make_namespace_with_index_refs(
     canned: serde_json::Value,
     clock: Arc<dyn crate::clock::Clock>,
@@ -3226,9 +3229,6 @@ fn make_namespace_with_index_refs(
     (TradeNamespace::new(rest), cl_ord_id_index, trading_rl)
 }
 
-/// `cancel_all` charges every tracked pair's trading counter +1, account-wide,
-/// saturating and non-rejecting. Two pairs seeded; both charged +1 after a REST
-/// `cancel_all`, which is never rate-limit-blocked.
 #[tokio::test]
 async fn cancel_all_rest_charges_every_tracked_pair_account_wide() {
     use crate::rate_limit::Scope;
@@ -3270,9 +3270,6 @@ async fn cancel_all_rest_charges_every_tracked_pair_account_wide() {
     assert!((h_eth - 39.0).abs() < 1e-6, "ETH headroom {h_eth}");
 }
 
-/// `AddOrderBatch` charges the trading counter n/2 (not n) for an n-order batch.
-/// A 2-order batch drops headroom by exactly 1.0 (= 2/2); a cost=n charge would
-/// drop it by 2.0.
 #[tokio::test]
 async fn order_batch_rest_charges_trading_counter_n_over_2() {
     use crate::rate_limit::Scope;
@@ -3307,9 +3304,6 @@ async fn order_batch_rest_charges_trading_counter_n_over_2() {
     );
 }
 
-/// REST `cancel_all` with `EOrder:Domain rate limit exceeded` reactively snaps
-/// the trading tracker at `Scope::ApiKey` — the same domain backstop the WS path
-/// carries.
 #[tokio::test]
 async fn cancel_all_rest_domain_rate_limit_snaps_trading_tracker() {
     use crate::rate_limit::Scope;
@@ -3348,9 +3342,6 @@ async fn cancel_all_rest_domain_rate_limit_snaps_trading_tracker() {
     );
 }
 
-/// HIT: cancelling a known cl_ord_id when the trading tracker is at (cap - cancel
-/// cost) pre-charges over cap and returns `TradeError::RateLimited` before the wire
-/// send. `FixedClock` at T=0 pins the age so cost is deterministic (no decay flake).
 #[tokio::test]
 async fn cancel_rest_hit_pre_charges_and_rejects_when_at_cap() {
     use crate::rate_limit::Scope;
@@ -3399,9 +3390,6 @@ async fn cancel_rest_hit_pre_charges_and_rejects_when_at_cap() {
     }
 }
 
-/// MISS: cancelling an UNKNOWN cl_ord_id (not indexed) skips the pre-charge, the
-/// cancel succeeds, and the trading tracker shows zero consumption (the miss path
-/// charges no scope).
 #[tokio::test]
 async fn cancel_rest_miss_skips_pre_charge_and_succeeds() {
     use crate::rate_limit::Scope;
@@ -3445,11 +3433,7 @@ async fn cancel_rest_miss_skips_pre_charge_and_succeeds() {
     );
 }
 
-/// A mock transport that returns a canned Kraken `error` array (no `result`).
-/// Used to simulate a wire rejection (e.g. `EOrder:Rate limit exceeded`) so the
-/// REST executor's `Err(RestError::Kraken(...))` branch fires.
 struct KrakenErrorMock {
-    /// The error codes returned in the `"error"` array.
     error_codes: Vec<&'static str>,
 }
 
@@ -3479,9 +3463,6 @@ impl HttpTransport for KrakenErrorMock {
     }
 }
 
-/// Build a namespace exposing its index, trading tracker, and api tracker. The
-/// transport is `KrakenErrorMock`, so the wire call returns a Kraken error
-/// (the `Err(RestError::Kraken)` branch).
 fn make_namespace_for_snap_tests(
     error_codes: Vec<&'static str>,
     clock: Arc<dyn crate::clock::Clock>,
@@ -3512,9 +3493,6 @@ fn make_namespace_for_snap_tests(
     )
 }
 
-/// REST cancel whose cl_ord_id IS in the index → `EOrder:Rate limit exceeded`
-/// → trading tracker snapped at `Scope::Pair`.
-/// Confirms the snapped tracker reads headroom == 0 (counter == cap).
 #[tokio::test]
 async fn snap_20b_rest_eorder_rate_limit_snaps_trading_pair_scope_on_hit() {
     use crate::rate_limit::Scope;
@@ -3558,8 +3536,6 @@ async fn snap_20b_rest_eorder_rate_limit_snaps_trading_pair_scope_on_hit() {
     );
 }
 
-/// REST cancel with `EOrder:Domain rate limit exceeded` → trading tracker
-/// snapped at `Scope::ApiKey`. Confirms all known pair counters are at cap.
 #[tokio::test]
 async fn snap_20b_rest_eorder_domain_rate_limit_snaps_trading_api_key_scope() {
     use crate::rate_limit::Scope;
@@ -3600,9 +3576,6 @@ async fn snap_20b_rest_eorder_domain_rate_limit_snaps_trading_api_key_scope() {
     );
 }
 
-/// REST cancel with `EAPI:Rate limit exceeded` snaps the API tracker but MUST NOT
-/// snap the trading tracker. The cl_ord_id is not indexed (MISS) so the trading
-/// counter is untouched, isolating the snap from the pre-charge.
 #[tokio::test]
 async fn snap_20b_rest_eapi_rate_limit_snaps_api_tracker_not_trading() {
     use crate::rate_limit::Scope;
@@ -3646,9 +3619,6 @@ async fn snap_20b_rest_eapi_rate_limit_snaps_api_tracker_not_trading() {
     );
 }
 
-/// A trade EAPI rejection through the full REST executor must emit exactly ONE
-/// `RateLimitExceededEvent`: the snap lives only in the `signed_post_costed` chokepoint;
-/// `snap_to_cap` is idempotent, so only the event count catches a double-fire.
 #[tokio::test]
 async fn snap_15_trade_eapi_emits_exactly_one_rate_limit_exceeded_event() {
     use crate::dispatch::EventType;
@@ -3685,8 +3655,6 @@ async fn snap_15_trade_eapi_emits_exactly_one_rate_limit_exceeded_event() {
     );
 }
 
-/// REST cancel with index MISS (cl_ord_id unknown) + `EOrder:Rate limit exceeded`
-/// → trading Pair snap SKIPPED (no valid pair); API tracker NOT touched.
 #[tokio::test]
 async fn snap_20b_rest_eorder_index_miss_skips_pair_snap() {
     use crate::rate_limit::Scope;
@@ -3724,9 +3692,6 @@ async fn snap_20b_rest_eorder_index_miss_skips_pair_snap() {
     );
 }
 
-/// Build a snap-test namespace that also wires the bus to the RestSurface so
-/// `snap_to_cap` event emissions reach subscribers. Returns the namespace, bus,
-/// index, trading tracker, and api tracker.
 fn make_namespace_for_snap_tests_with_bus(
     error_codes: Vec<&'static str>,
     clock: Arc<dyn crate::clock::Clock>,
@@ -3760,9 +3725,6 @@ fn make_namespace_for_snap_tests_with_bus(
     )
 }
 
-/// A REST rejection with the real wire form `EService:Throttled: <ts>` (timestamp
-/// suffix) MUST snap the API tracker to cap; an exact `==` match against
-/// `"EService:Throttled"` would miss the suffixed form.
 #[tokio::test]
 async fn snap_20b_eservice_throttled_with_timestamp_snaps_api_tracker() {
     use crate::rate_limit::Scope;
@@ -3803,8 +3765,6 @@ async fn snap_20b_eservice_throttled_with_timestamp_snaps_api_tracker() {
     );
 }
 
-/// EVENT guard: `snap_to_cap` MUST emit `RateLimitExceededEvent` with the
-/// correct `tracker`, `scope`, and `kraken_error` fields.
 #[tokio::test]
 async fn snap_20b_snap_to_cap_emits_rate_limit_exceeded_event() {
     use crate::dispatch::EventType;
@@ -3863,9 +3823,6 @@ async fn snap_20b_snap_to_cap_emits_rate_limit_exceeded_event() {
     }
 }
 
-/// Error codes that are NOT rate-limit signals MUST NOT classify as a snap,
-/// guarding against a broadened prefix (e.g. `starts_with("EAPI:")` wrongly firing
-/// on `EAPI:Invalid key` / `EAPI:Invalid nonce`).
 #[test]
 fn snap_20b_non_ratelimit_codes_do_not_snap_either_tracker() {
     use super::classify_rate_limit_snap;
@@ -3896,9 +3853,6 @@ fn snap_20b_non_ratelimit_codes_do_not_snap_either_tracker() {
     );
 }
 
-/// A batch of two accepted entries (both with txid) MUST populate the
-/// ClOrdIdPairIndex for each; `lookup_and_promote` returns Some(_) for both after
-/// the call. FixedClock@T=0 for determinism.
 #[tokio::test]
 async fn order_batch_rest_accept_populates_cl_ord_id_index_per_entry() {
     use std::time::Duration;
@@ -3963,8 +3917,6 @@ async fn order_batch_rest_accept_populates_cl_ord_id_index_per_entry() {
     );
 }
 
-/// validate=true entries carry no txid and MUST NOT be added to the
-/// ClOrdIdPairIndex (enforcing the `line.txid.is_some()` gate). FixedClock@T=0.
 #[tokio::test]
 async fn order_batch_rest_validate_mode_does_not_populate_index() {
     use std::time::Duration;
@@ -4010,9 +3962,6 @@ async fn order_batch_rest_validate_mode_does_not_populate_index() {
     );
 }
 
-/// A top-level `EOrder:Rate limit exceeded` on `order_batch` via REST snaps the
-/// trading tracker to cap on `Scope::Pair`; the API tracker MUST NOT snap (EOrder,
-/// not EAPI). FixedClock@T=0 for determinism.
 #[tokio::test]
 async fn order_batch_rest_eorder_rate_limit_snaps_trading_pair_scope() {
     use crate::rate_limit::Scope;
@@ -4068,9 +4017,6 @@ async fn order_batch_rest_eorder_rate_limit_snaps_trading_pair_scope() {
     );
 }
 
-/// A mixed batch (entry 0 placed, entry 1 rejected per-line) returns `Ok` with
-/// per-row results: the placed sibling keeps its txid and is indexed (cancellable
-/// by cl_ord_id); the rejected entry is not. FixedClock@T=0.
 #[tokio::test]
 async fn order_batch_rest_mixed_partial_placement_surfaces_txid_and_indexes_placed() {
     use std::time::Duration;
@@ -4129,9 +4075,6 @@ async fn order_batch_rest_mixed_partial_placement_surfaces_txid_and_indexes_plac
     );
 }
 
-/// An ALL-rejected batch (every entry carries an `error`, none placed) MUST still
-/// return `Ok` with each row's error surfaced — never a whole-batch Err — and
-/// index nothing.
 #[tokio::test]
 async fn order_batch_rest_all_rejected_surfaces_each_error_and_indexes_nothing() {
     use std::time::Duration;
@@ -4178,7 +4121,6 @@ async fn order_batch_rest_all_rejected_surfaces_each_error_and_indexes_nothing()
     assert!(idx.lookup_and_promote(&cl1).is_none());
 }
 
-/// The 7 per-order params each render under the `orders[N]` bracket.
 #[test]
 fn batch_to_form_renders_all_seven_per_order_params() {
     let req = AddOrderBatchRequest {
@@ -4212,8 +4154,6 @@ fn batch_to_form_renders_all_seven_per_order_params() {
     assert!(has("orders[0][expiretm]", "1783767671"));
 }
 
-/// TimeSpec renders the epoch integer on REST and RFC 3339 + `Z` on WS.
-/// Vectors: the epoch, the unix "billennium", a leap day, and the live-probe instant.
 #[test]
 fn timespec_renders_both_transports() {
     let cases = [
@@ -4251,7 +4191,7 @@ fn compose_validate_true_emits_validate_field() {
         price: &price,
         cl_ord_id: &id,
         validate: true,
-        ..base_add_view("buy", &sym, &vol, OrderType::Limit)
+        ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::Limit)
     });
     assert_eq!(
         params["validate"],
@@ -4267,7 +4207,7 @@ fn compose_limit_order_emits_limit_price_no_triggers() {
     let params = compose_add_order_params(AddOrderWsView {
         price: &price,
         cl_ord_id: &id,
-        ..base_add_view("buy", &sym, &vol, OrderType::Limit)
+        ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::Limit)
     });
     assert!(
         params.get("limit_price").is_some(),
@@ -4294,7 +4234,7 @@ fn compose_stop_loss_limit_emits_triggers_and_limit_price() {
         price2: &limit_price,
         trigger: &trigger,
         cl_ord_id: &id,
-        ..base_add_view("sell", &sym, &vol, OrderType::StopLossLimit)
+        ..AddOrderWsView::new("sell", sym.as_str(), &vol, OrderType::StopLossLimit)
     });
     let trig_obj = params
         .get("triggers")
@@ -4335,7 +4275,7 @@ fn compose_oflags_fan_out() {
             price: &price,
             oflags: &oflags,
             cl_ord_id: &id,
-            ..base_add_view("buy", &sym, &vol, OrderType::Limit)
+            ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::Limit)
         });
         assert_eq!(p[key], expected, "oflag {flag:?}");
     }
@@ -4348,7 +4288,7 @@ fn compose_userref_maps_to_order_userref_not_userref() {
     let params = compose_add_order_params(AddOrderWsView {
         userref: &userref,
         cl_ord_id: &id,
-        ..base_add_view("buy", &sym, &vol, OrderType::Market)
+        ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::Market)
     });
     assert_eq!(
         params["order_userref"],
@@ -4371,7 +4311,7 @@ fn compose_stp_type_cancel_both_underscore() {
         price: &price,
         stp_type: &stp,
         cl_ord_id: &id,
-        ..base_add_view("buy", &sym, &vol, OrderType::Limit)
+        ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::Limit)
     });
     assert_eq!(
         params["stp_type"],
@@ -4395,7 +4335,7 @@ fn compose_conditional_close_stop_loss_limit_maps_trigger_and_limit() {
         close_ordertype: &close_ot,
         close_price: &close_p,
         close_price2: &close_p2,
-        ..base_add_view("buy", &sym, &vol, OrderType::Limit)
+        ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::Limit)
     });
     let cond = params
         .get("conditional")
@@ -4425,7 +4365,7 @@ fn compose_deadline_is_not_emitted() {
     let params = compose_add_order_params(AddOrderWsView {
         price: &price,
         cl_ord_id: &id,
-        ..base_add_view("buy", &sym, &vol, OrderType::Limit)
+        ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::Limit)
     });
     assert!(
         params.get("deadline").is_none(),
@@ -4489,7 +4429,7 @@ fn compose_trailing_stop_uses_quote_price_type() {
     let params = compose_add_order_params(AddOrderWsView {
         price: &price,
         cl_ord_id: &id,
-        ..base_add_view("buy", &sym, &vol, OrderType::TrailingStop)
+        ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::TrailingStop)
     });
     let trig = params
         .get("triggers")
@@ -4520,7 +4460,7 @@ fn compose_trailing_stop_limit_quote_trigger_and_limit() {
         price: &price,
         price2: &price2,
         cl_ord_id: &id,
-        ..base_add_view("buy", &sym, &vol, OrderType::TrailingStopLimit)
+        ..AddOrderWsView::new("buy", sym.as_str(), &vol, OrderType::TrailingStopLimit)
     });
     assert_eq!(params["triggers"]["price_type"], "quote");
     assert_eq!(params["limit_price"], serde_json::json!(50));
@@ -4537,7 +4477,7 @@ fn compose_stop_loss_still_uses_static_price_type() {
     let params = compose_add_order_params(AddOrderWsView {
         price: &price,
         cl_ord_id: &id,
-        ..base_add_view("sell", &sym, &vol, OrderType::StopLoss)
+        ..AddOrderWsView::new("sell", sym.as_str(), &vol, OrderType::StopLoss)
     });
     assert_eq!(
         params["triggers"]["price_type"], "static",
@@ -4555,7 +4495,7 @@ fn compose_non_trailing_stop_loss_relative_offset_emits_quote_price_type() {
     let params = compose_add_order_params(AddOrderWsView {
         price: &price,
         cl_ord_id: &id,
-        ..base_add_view("sell", &sym, &vol, OrderType::StopLoss)
+        ..AddOrderWsView::new("sell", sym.as_str(), &vol, OrderType::StopLoss)
     });
     assert_eq!(
         params["triggers"]["price_type"], "quote",
@@ -4571,7 +4511,7 @@ fn compose_stop_loss_trigger_none_omits_reference() {
     let params = compose_add_order_params(AddOrderWsView {
         price: &price,
         cl_ord_id: &id,
-        ..base_add_view("sell", &sym, &vol, OrderType::StopLoss)
+        ..AddOrderWsView::new("sell", sym.as_str(), &vol, OrderType::StopLoss)
     });
     let trig = params
         .get("triggers")
@@ -4600,7 +4540,7 @@ fn compose_stop_loss_trigger_some_last_emits_reference() {
         price: &price,
         trigger: &trigger,
         cl_ord_id: &id,
-        ..base_add_view("sell", &sym, &vol, OrderType::StopLoss)
+        ..AddOrderWsView::new("sell", sym.as_str(), &vol, OrderType::StopLoss)
     });
     let trig = params
         .get("triggers")
@@ -4660,8 +4600,6 @@ fn batch_result_serializes_with_lowercase_tags() {
     assert_eq!(v["err"]["category"], "rate_limit");
 }
 
-/// REST `timeinforce` is the lowercase token for every variant, incl. `fok`,
-/// pinned on the `to_form` output (not just the enum's string form).
 #[test]
 fn to_form_pins_timeinforce_rest_tokens() {
     let cases = [
@@ -4680,8 +4618,6 @@ fn to_form_pins_timeinforce_rest_tokens() {
     }
 }
 
-/// REST `oflags` renders as a comma-joined CSV in slice order; a single flag
-/// renders bare. Pins the multi-flag token set post/fcib/fciq/nompp.
 #[test]
 fn to_form_pins_oflags_csv_rendering() {
     let val = |form: &[(String, String)], k: &str| {
@@ -4702,8 +4638,6 @@ fn to_form_pins_oflags_csv_rendering() {
     assert_eq!(val(&single.to_form(), "oflags").as_deref(), Some("post"));
 }
 
-/// `Price::to_rest_form` pins the relative-price grammar: absolute is bare,
-/// quote offsets carry an explicit sign, percent offsets add a `%` suffix.
 #[test]
 fn price_to_rest_form_pins_relative_grammar() {
     assert_eq!(Price::Absolute(dec("30000")).to_rest_form(), "30000");
@@ -4739,4 +4673,292 @@ fn price_to_rest_form_pins_relative_grammar() {
         .to_rest_form(),
         "-2.0%"
     );
+}
+
+#[test]
+fn only_placements_take_an_in_flight_slot() {
+    use crate::dispatch::WsOp::*;
+    // (op, placement)
+    let cases = [
+        (AddOrder, true),
+        (AmendOrder, true),
+        (BatchAdd, true),
+        (CancelOrder, false),
+        (BatchCancel, false),
+        (CancelAll, false),
+        (CancelAllOrdersAfter, false),
+    ];
+    for (op, placement) in cases {
+        assert_eq!(op.is_placement(), placement, "{op:?}");
+    }
+}
+
+#[test]
+fn the_in_flight_limit_is_off_for_none_and_zero() {
+    // (knob, permits)
+    let cases = [(None, None), (Some(0), None), (Some(3), Some(3))];
+    for (knob, permits) in cases {
+        let mut knobs = crate::build::knobs::Knobs::defaults();
+        knobs.futures_max_in_flight = knob;
+        assert_eq!(
+            in_flight_slots(&knobs).map(|s| s.available_permits()),
+            permits,
+            "{knob:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_amend_or_cancel_by_order_id_carries_no_cl_ord_id() {
+    let (ns, _mock) = make_namespace(json!({}));
+    let futures = ns.futures();
+    let order_id = crate::types::TxId::new("a3270acf-5190-41bd-83a0-4e433e852277");
+    let amend = FuturesOrderAmendRequest::by_order_id(order_id.clone()).order_volume(dec("1"));
+    assert!(futures.cancel(order_id).cl_ord_id().is_none());
+    assert!(futures.order_amend(amend).cl_ord_id().is_none());
+    let cl = ClOrdId::allocate_v4();
+    assert_eq!(futures.cancel(cl.clone()).cl_ord_id(), Some(&cl));
+}
+
+#[tokio::test]
+async fn futures_calls_resolve_locally_before_any_wire_work() {
+    let (ns, mock) = make_namespace(json!({}));
+    let futures = ns.futures();
+    let order = || FuturesOrder::new(Side::Buy, dec("1"));
+    let ids = |n: usize| (0..n).map(|_| ClOrdId::allocate_v4()).collect::<Vec<_>>();
+    fn rejected<T: std::fmt::Debug>(result: Result<T, TradeError>) -> TradeError {
+        result.expect_err("rejected locally")
+    }
+
+    for (label, error) in [
+        (
+            "bad symbol",
+            rejected(
+                futures
+                    .order(FuturesOrderRequest::new("BTC/USD", order()))
+                    .await,
+            ),
+        ),
+        (
+            "zero quantity",
+            rejected(
+                futures
+                    .order(FuturesOrderRequest::new(
+                        "PF_XBTUSD",
+                        FuturesOrder::new(Side::Buy, dec("0")),
+                    ))
+                    .await,
+            ),
+        ),
+        (
+            "zero amend quantity",
+            rejected(
+                futures
+                    .order_amend(
+                        FuturesOrderAmendRequest::by_cl_ord_id(ClOrdId::allocate_v4())
+                            .order_volume(dec("0")),
+                    )
+                    .await,
+            ),
+        ),
+    ] {
+        assert!(
+            matches!(error, TradeError::InvalidOrder { .. }),
+            "{label}: {error:?}"
+        );
+    }
+    let batch_errors = [
+        (
+            "one row",
+            rejected(
+                futures
+                    .order_batch(FuturesOrderBatchRequest::new("PF_XBTUSD", vec![order()]))
+                    .await,
+            ),
+            (2, 15),
+        ),
+        (
+            "sixteen rows",
+            rejected(
+                futures
+                    .order_batch(FuturesOrderBatchRequest::new(
+                        "PF_XBTUSD",
+                        vec![order(); 16],
+                    ))
+                    .await,
+            ),
+            (2, 15),
+        ),
+        (
+            "one id",
+            rejected(futures.cancel_batch(ids(1)).await),
+            (2, 50),
+        ),
+        (
+            "fifty-one ids",
+            rejected(futures.cancel_batch(ids(51)).await),
+            (2, 50),
+        ),
+    ];
+    for (label, error, (min, max)) in batch_errors {
+        assert!(
+            matches!(error, TradeError::BatchSizeOutOfRange { min: lo, max: hi } if (lo, hi) == (min, max)),
+            "{label}: {error:?}"
+        );
+    }
+    assert!(matches!(
+        rejected(
+            futures
+                .order_amend(FuturesOrderAmendRequest::by_cl_ord_id(
+                    ClOrdId::allocate_v4()
+                ))
+                .await
+        ),
+        TradeError::EmptyAmendRequest
+    ));
+    assert!(
+        mock.last_post.lock().unwrap().is_none(),
+        "no REST request is ever made for a Futures order"
+    );
+
+    for transport in [Transport::Rest, Transport::WsV2Auth] {
+        let error = futures
+            .cancel_all()
+            .via(transport)
+            .await
+            .expect_err("no such Futures route");
+        assert!(
+            matches!(&error, TradeError::UnsupportedTransport { legal, .. } if *legal == [Transport::FuturesWs]),
+            "{transport:?}: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Transport {transport:?} cannot serve this order operation; use `.via(Transport::FuturesWs)`."
+            )
+        );
+    }
+    let error = ns
+        .cancel_all()
+        .via(Transport::FuturesWs)
+        .await
+        .expect_err("Spot has no Futures route");
+    assert!(
+        matches!(&error, TradeError::UnsupportedTransport { legal, .. } if !legal.contains(&Transport::FuturesWs)),
+        "{error:?}"
+    );
+
+    assert!(matches!(
+        futures.cancel_all().await,
+        Err(TradeError::WsSurfaceUnavailable)
+    ));
+}
+
+#[test]
+fn futures_orders_carry_their_client_ids_before_they_are_awaited() {
+    let (ns, _mock) = make_namespace(json!({}));
+    let futures = ns.futures();
+    let order = || FuturesOrder::new(Side::Buy, dec("1"));
+
+    let placed = futures.order(FuturesOrderRequest::new("PF_XBTUSD", order()));
+    assert_eq!(
+        placed.cl_ord_id(),
+        placed.request().order.cl_ord_id.as_ref()
+    );
+    assert!(placed.cl_ord_id().is_some());
+
+    let explicit = ClOrdId::allocate_v4();
+    let kept = futures.order(FuturesOrderRequest::new(
+        "PF_XBTUSD",
+        order().cl_ord_id(explicit.clone()),
+    ));
+    assert_eq!(kept.cl_ord_id(), Some(&explicit));
+
+    let batch = futures.order_batch(FuturesOrderBatchRequest::new(
+        "PF_XBTUSD",
+        vec![order(), order().cl_ord_id(explicit.clone())],
+    ));
+    assert!(batch.cl_ord_id().is_none());
+    let rows = &batch.request().orders;
+    assert!(rows[0].cl_ord_id.is_some());
+    assert_eq!(rows[1].cl_ord_id.as_ref(), Some(&explicit));
+}
+
+#[test]
+fn a_reply_of_an_older_arm_cannot_re_arm_past_a_newer_one() {
+    let flag = DeadmanFlag::default();
+    let older = flag.arm();
+    flag.arm();
+    flag.clear_if_unchanged(flag.seen());
+    flag.rearm_if_latest(older);
+    assert!(
+        !flag.take(),
+        "a reply of an older arm cannot re-arm past a newer one"
+    );
+}
+
+#[test]
+fn a_fresh_deadman_flag_is_not_armed() {
+    let flag = DeadmanFlag::default();
+    assert!(!flag.take(), "a fresh flag is not armed");
+}
+
+#[test]
+fn deadman_take_clears_the_armed_bit_and_keeps_the_generation() {
+    let flag = DeadmanFlag::default();
+    let first = flag.arm();
+    assert_eq!(flag.seen(), first);
+    assert!(flag.take(), "an arm is taken once");
+    assert!(!flag.take(), "take clears the armed bit");
+    assert!(flag.arm() >> 1 > first >> 1, "take keeps the generation");
+}
+
+#[test]
+fn a_stale_deadman_clear_leaves_a_newer_arm_armed() {
+    let flag = DeadmanFlag::default();
+    let stale = flag.arm();
+    flag.arm();
+    flag.clear_if_unchanged(stale);
+    assert!(flag.take(), "a stale clear leaves a newer arm armed");
+}
+
+#[test]
+fn the_latest_arms_reply_re_arms_after_an_unchanged_clear() {
+    let flag = DeadmanFlag::default();
+    let mine = flag.arm();
+    flag.clear_if_unchanged(mine);
+    assert!(!flag.take(), "an unchanged clear disarms");
+    flag.rearm_if_latest(mine);
+    assert!(flag.take(), "the latest arm's reply re-arms");
+}
+
+#[test]
+fn unsupported_transport_lists_exactly_the_routed_transports() {
+    use crate::dispatch::Op;
+    use crate::dispatch::dispatch_table::{DispatchTable, Product};
+
+    let table = DispatchTable::with_default_table();
+    for product in [Product::Spot, Product::Futures] {
+        for op in [
+            Op::TradeOrder,
+            Op::TradeOrderCancel,
+            Op::TradeOrderAmend,
+            Op::TradeOrderCancelAll,
+            Op::TradeOrderCancelAllAfter,
+            Op::TradeOrderBatch,
+            Op::TradeOrderCancelBatch,
+        ] {
+            let routed: Vec<Transport> =
+                [Transport::Rest, Transport::WsV2Auth, Transport::FuturesWs]
+                    .into_iter()
+                    .filter(|&t| table.resolve(op, product, t).is_ok())
+                    .collect();
+            let TradeError::UnsupportedTransport { legal, .. } =
+                unsupported_transport(op, product, &table, Transport::WsV2Public)
+            else {
+                panic!("{product:?} {op:?}: expected UnsupportedTransport");
+            };
+            assert_eq!(legal, routed.as_slice(), "{product:?} {op:?}");
+        }
+    }
 }

@@ -1,5 +1,5 @@
-//! `ConnectionSupervisor` — thin caller-side facade over the Public + Auth
-//! managed connections: snapshot state reads and post-and-correlate `connect`.
+//! `ConnectionSupervisor` — thin caller-side facade over managed connections:
+//! snapshot state reads and post-and-correlate `connect`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,6 +9,55 @@ use crate::conn::rate_budget::ConnectionRateBudget;
 use crate::dispatch::{CallerInbound, DispatchEventBus};
 use crate::types::{CallerEvent, ConnectionHandle, ConnectionState, QueueFullError, WsUrl};
 
+/// Bare-order readiness hints the reactor maintains per token-requiring url for
+/// the caller-side `ensure_order_sendable`; reactor single-writer.
+#[derive(Default)]
+pub(crate) struct OrderGate {
+    auth: UrlGate,
+    unified_private: UrlGate,
+}
+
+#[derive(Default)]
+struct UrlGate {
+    has_subscriptions: AtomicBool,
+    send_ready: AtomicBool,
+}
+
+impl OrderGate {
+    fn url_gate(&self, url: WsUrl) -> Option<&UrlGate> {
+        match url {
+            WsUrl::Auth => Some(&self.auth),
+            WsUrl::UnifiedPrivate => Some(&self.unified_private),
+            WsUrl::Public | WsUrl::UnifiedPublic => None,
+        }
+    }
+
+    /// Does `url` have at least one subscription entry?
+    pub(crate) fn has_subscriptions(&self, url: WsUrl) -> bool {
+        self.url_gate(url)
+            .is_some_and(|gate| gate.has_subscriptions.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn set_has_subscriptions(&self, url: WsUrl, value: bool) {
+        if let Some(gate) = self.url_gate(url) {
+            gate.has_subscriptions.store(value, Ordering::Release);
+        }
+    }
+
+    /// Is `url` bare-order send-ready (`Authenticating` + empty registry for
+    /// the url + valid cached token)?
+    pub(crate) fn send_ready(&self, url: WsUrl) -> bool {
+        self.url_gate(url)
+            .is_some_and(|gate| gate.send_ready.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn set_send_ready(&self, url: WsUrl, value: bool) {
+        if let Some(gate) = self.url_gate(url) {
+            gate.send_ready.store(value, Ordering::Release);
+        }
+    }
+}
+
 /// Thin coordinator. Holds only the read-side state mirrors + caller-facing
 /// methods. Lifetime: Client-scoped.
 pub struct ConnectionSupervisor {
@@ -16,7 +65,7 @@ pub struct ConnectionSupervisor {
     /// supervisor reads (Acquire).
     state_mirrors: HashMap<WsUrl, Arc<AtomicU8>>,
 
-    /// Host-scoped sliding-window rate limiter. Shared with the reactor's
+    /// Sliding-window rate limiter: one instance for all four connections. Shared with the reactor's
     /// `ManagedConnection`s — every connection consults the SAME budget.
     rate_budget: Arc<ConnectionRateBudget>,
 
@@ -26,12 +75,8 @@ pub struct ConnectionSupervisor {
     /// auto-connect-on-first-subscribe draws from the SAME id space as `connect()`.
     next_handle_id: Arc<AtomicU64>,
 
-    /// Reactor-maintained flag: the AUTH connection has ≥1 active subscription.
-    auth_has_subscriptions: Arc<AtomicBool>,
-
-    /// Reactor-maintained flag: the auth connection is bare-order send-ready
-    /// (`Authenticating` + empty auth registry + valid cached token).
-    auth_send_ready: Arc<AtomicBool>,
+    /// Reactor-maintained per-url bare-order hints.
+    order_gate: Arc<OrderGate>,
 }
 
 impl ConnectionSupervisor {
@@ -57,9 +102,8 @@ impl ConnectionSupervisor {
     }
 
     fn with_rate_budget(bus: Arc<DispatchEventBus>, rate_budget: ConnectionRateBudget) -> Self {
-        // v1 = 2-WS topology (Public + Auth).
-        let mut state_mirrors = HashMap::with_capacity(2);
-        for url in [WsUrl::Public, WsUrl::Auth] {
+        let mut state_mirrors = HashMap::with_capacity(WsUrl::ALL.len());
+        for url in WsUrl::ALL {
             state_mirrors.insert(url, Arc::new(AtomicU8::new(ConnectionState::Idle.as_u8())));
         }
         Self {
@@ -67,33 +111,16 @@ impl ConnectionSupervisor {
             rate_budget: Arc::new(rate_budget),
             bus,
             next_handle_id: Arc::new(AtomicU64::new(1)),
-            auth_has_subscriptions: Arc::new(AtomicBool::new(false)),
-            auth_send_ready: Arc::new(AtomicBool::new(false)),
+            order_gate: Arc::new(OrderGate::default()),
         }
     }
 
-    /// Clone the reactor-maintained "auth has ≥1 subscription" flag.
-    pub(crate) fn auth_has_subscriptions_hint(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.auth_has_subscriptions)
+    /// Clone the reactor-maintained per-url bare-order hints.
+    pub(crate) fn order_gate(&self) -> Arc<OrderGate> {
+        Arc::clone(&self.order_gate)
     }
 
-    /// Does the auth connection have ≥1 subscription?
-    pub(crate) fn auth_has_subscriptions(&self) -> bool {
-        self.auth_has_subscriptions.load(Ordering::Acquire)
-    }
-
-    /// Clone the reactor-maintained "auth bare-order send-ready" flag.
-    pub(crate) fn auth_send_ready_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.auth_send_ready)
-    }
-
-    /// Is the auth connection bare-order send-ready now (`Authenticating` +
-    /// empty auth registry + valid cached token)?
-    pub(crate) fn auth_send_ready(&self) -> bool {
-        self.auth_send_ready.load(Ordering::Acquire)
-    }
-
-    /// Hand out clones of both state mirrors for the I/O Reactor task.
+    /// Hand out clones of the state mirrors for the I/O Reactor task.
     pub(crate) fn state_mirror_clones(&self) -> HashMap<WsUrl, Arc<AtomicU8>> {
         self.state_mirrors
             .iter()
@@ -106,8 +133,8 @@ impl ConnectionSupervisor {
         Arc::clone(&self.next_handle_id)
     }
 
-    /// Clone the host-scoped `ConnectionRateBudget` for the I/O Reactor's
-    /// `ManagedConnection`s.
+    /// Clone the shared `ConnectionRateBudget` (one instance across all managed
+    /// connections) for the I/O Reactor's `ManagedConnection`s.
     pub(crate) fn rate_budget_clone(&self) -> Arc<ConnectionRateBudget> {
         Arc::clone(&self.rate_budget)
     }
@@ -118,7 +145,7 @@ impl ConnectionSupervisor {
         let mirror = self
             .state_mirrors
             .get(&url)
-            .expect("state_mirrors invariant: both WsUrl present at construction");
+            .expect("state_mirrors invariant: every managed WsUrl is present at construction");
         let byte = mirror.load(Ordering::Acquire);
         ConnectionState::from_u8(byte)
             .expect("state_mirrors invariant: only valid ConnectionState bytes are written")
@@ -161,8 +188,9 @@ mod tests {
     #[test]
     fn current_state_returns_idle_for_all_urls_at_construction() {
         let sup = fixture();
-        assert_eq!(sup.current_state(WsUrl::Public), ConnectionState::Idle);
-        assert_eq!(sup.current_state(WsUrl::Auth), ConnectionState::Idle);
+        for url in WsUrl::ALL {
+            assert_eq!(sup.current_state(url), ConnectionState::Idle);
+        }
     }
 
     #[test]
@@ -175,12 +203,13 @@ mod tests {
     }
 
     #[test]
-    fn state_mirror_clones_returns_both_v1_urls() {
+    fn state_mirror_clones_returns_every_managed_url() {
         let sup = fixture();
         let mirrors = sup.state_mirror_clones();
-        assert_eq!(mirrors.len(), 2);
-        assert!(mirrors.contains_key(&WsUrl::Public));
-        assert!(mirrors.contains_key(&WsUrl::Auth));
+        assert_eq!(mirrors.len(), WsUrl::ALL.len());
+        for url in WsUrl::ALL {
+            assert!(mirrors.contains_key(&url), "missing mirror for {url:?}");
+        }
         mirrors[&WsUrl::Public].store(ConnectionState::Open.as_u8(), Ordering::Release);
         assert_eq!(sup.current_state(WsUrl::Public), ConnectionState::Open);
     }

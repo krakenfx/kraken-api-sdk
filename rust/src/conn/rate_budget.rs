@@ -1,6 +1,7 @@
-//! Host-scoped sliding-window rate limiter for WS CONNECT/UPGRADE attempts.
-//! One budget is shared across the Public + Auth connections to the same host;
-//! the per-window cap and window length are caller-tunable knobs (no fixed cap).
+//! Sliding-window rate limiter for WS CONNECT/UPGRADE attempts. One budget is
+//! shared across all managed connections (Spot Public + Auth, Unified Public +
+//! Private); the per-window cap and window length are caller-tunable knobs (no
+//! fixed cap).
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -27,8 +28,8 @@ pub struct ConnectionRateThrottled {
     pub throttle_until_monotonic: MonotonicInstant,
 }
 
-/// Host-scoped sliding-window rate limiter, consulted before each connect
-/// attempt across all connections targeting the same host.
+/// Sliding-window rate limiter, consulted before each connect attempt across
+/// all managed connections.
 pub struct ConnectionRateBudget {
     inner: Mutex<Inner>,
     window: Duration,

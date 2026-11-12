@@ -1,8 +1,9 @@
 //! Unit tests for `SubscriptionRegistry`.
 use super::*;
+use crate::types::Symbol;
 
-fn sym(s: &str) -> Symbol {
-    Symbol::new(s).unwrap()
+fn sym(s: &str) -> StreamSymbol {
+    StreamSymbol::from(Symbol::new(s).unwrap())
 }
 
 /// Per-pair ticker entry (the common test shape).
@@ -16,6 +17,135 @@ fn tk(url: WsUrl, pair: &str) -> SubscriptionEntry {
             event_trigger: None,
         },
     )
+}
+
+/// Channel-wide Spot executions entry.
+fn ex_entry() -> SubscriptionEntry {
+    SubscriptionEntry::new(
+        WsUrl::Auth,
+        ChannelName::Executions,
+        None,
+        SubscribeParams::Executions {
+            snap_orders: None,
+            snap_trades: None,
+        },
+    )
+}
+
+fn bal_entry() -> SubscriptionEntry {
+    SubscriptionEntry::new(
+        WsUrl::Auth,
+        ChannelName::Balances,
+        None,
+        SubscribeParams::Balances { snapshot: None },
+    )
+}
+
+/// Spot-routed (`Public`/`Auth`) shorthands over the URL-scoped registry API.
+impl SubscriptionRegistry {
+    pub fn note_sequence(
+        &mut self,
+        channel: ChannelName,
+        seq: u64,
+        is_snapshot: bool,
+    ) -> Option<u32> {
+        self.note_sequence_for(channel.spot_url(), channel, seq, is_snapshot)
+    }
+
+    pub fn release(&mut self, channel: ChannelName, pair: Option<StreamSymbol>) -> u32 {
+        self.release_for(channel.spot_url(), channel, pair)
+    }
+
+    pub(crate) fn record_guard_ref(
+        &mut self,
+        handler_id: HandlerId,
+        channel: ChannelName,
+        pair: &Option<StreamSymbol>,
+    ) {
+        self.record_guard_ref_for(handler_id, channel.spot_url(), channel, pair);
+    }
+
+    pub(crate) fn release_guard_ref(
+        &mut self,
+        handler_id: HandlerId,
+        channel: ChannelName,
+        pair: Option<StreamSymbol>,
+    ) -> u32 {
+        self.release_guard_ref_for(handler_id, channel.spot_url(), channel, pair)
+    }
+
+    pub fn deregister(&mut self, channel: ChannelName, pair: Option<StreamSymbol>) {
+        self.deregister_for(channel.spot_url(), channel, pair);
+    }
+
+    pub(crate) fn is_terminated(&self, channel: ChannelName, pair: &Option<StreamSymbol>) -> bool {
+        self.is_terminated_for(channel.spot_url(), channel, pair)
+    }
+
+    pub(crate) fn note_acked(&mut self, channel: ChannelName, pair: &Option<StreamSymbol>) {
+        self.note_acked_for(
+            channel.spot_url(),
+            channel,
+            pair,
+            crate::types::MonotonicInstant::now(),
+        );
+    }
+
+    pub(crate) fn note_terminated(
+        &mut self,
+        channel: ChannelName,
+        pair: &Option<StreamSymbol>,
+        cause: TerminationCause,
+        last_error: Option<String>,
+    ) {
+        self.note_terminated_for(channel.spot_url(), channel, pair, cause, last_error);
+    }
+
+    pub fn handle_update(
+        &mut self,
+        channel: ChannelName,
+        pair: Option<&StreamSymbol>,
+        is_snapshot: bool,
+        data: &serde_json::Value,
+    ) -> BookDriveOutcome {
+        self.handle_update_for(
+            channel.spot_url(),
+            channel,
+            pair,
+            is_snapshot,
+            data,
+            crate::types::MonotonicInstant::now,
+        )
+    }
+
+    pub fn begin_book_resync(&mut self, channel: ChannelName, pair: &StreamSymbol) {
+        self.begin_book_resync_for(channel.spot_url(), channel, pair);
+    }
+
+    pub fn is_book_resyncing(&self, channel: ChannelName, pair: &Option<StreamSymbol>) -> bool {
+        self.is_book_resyncing_for(channel.spot_url(), channel, pair)
+    }
+
+    pub fn note_reseed_timeout(
+        &mut self,
+        channel: ChannelName,
+        pair: &StreamSymbol,
+    ) -> ReseedTimeoutOutcome {
+        self.note_reseed_timeout_for(
+            channel.spot_url(),
+            channel,
+            pair,
+            crate::types::MonotonicInstant::now(),
+        )
+    }
+
+    pub(crate) fn params_for(
+        &self,
+        channel: ChannelName,
+        pair: &Option<StreamSymbol>,
+    ) -> Option<SubscribeParams> {
+        self.params_for_url(channel.spot_url(), channel, pair)
+    }
 }
 
 #[test]
@@ -36,6 +166,249 @@ fn register_and_deregister_per_pair() {
     assert_eq!(reg.len(), 1);
     reg.deregister(ChannelName::Ticker, Some(sym("BTC/USD")));
     assert_eq!(reg.len(), 1);
+}
+
+#[test]
+fn same_channel_and_symbol_on_spot_and_unified_are_distinct() {
+    let mut reg = SubscriptionRegistry::new();
+    let now = crate::types::MonotonicInstant::now();
+    let pair = sym("BTC/USD");
+
+    assert_eq!(reg.register(tk(WsUrl::Public, "BTC/USD"), now, false), 1);
+    assert_eq!(
+        reg.register(tk(WsUrl::UnifiedPublic, "BTC/USD"), now, false),
+        1,
+        "a Unified stream must not share Spot's refcount"
+    );
+    assert_eq!(reg.len(), 2);
+    let mirror = reg.mirror.read().unwrap();
+    assert!(mirror.contains_key(&(WsUrl::Public, ChannelName::Ticker, Some(pair.clone()))));
+    assert!(mirror.contains_key(&(
+        WsUrl::UnifiedPublic,
+        ChannelName::Ticker,
+        Some(pair.clone())
+    )));
+    drop(mirror);
+
+    reg.record_guard_ref_for(
+        HandlerId(7),
+        WsUrl::Public,
+        ChannelName::Ticker,
+        &Some(pair.clone()),
+    );
+    reg.record_guard_ref_for(
+        HandlerId(7),
+        WsUrl::UnifiedPublic,
+        ChannelName::Ticker,
+        &Some(pair.clone()),
+    );
+    assert_eq!(
+        reg.release_guard_ref_for(
+            HandlerId(7),
+            WsUrl::Public,
+            ChannelName::Ticker,
+            Some(pair.clone())
+        ),
+        0
+    );
+    assert_eq!(
+        reg.release_guard_ref_for(
+            HandlerId(7),
+            WsUrl::UnifiedPublic,
+            ChannelName::Ticker,
+            Some(pair),
+        ),
+        0
+    );
+    assert!(reg.is_empty());
+}
+
+#[test]
+fn unified_private_balances_omits_derivatives_asset_class() {
+    let balances = build_subscribe_frame(
+        WsUrl::UnifiedPrivate,
+        "subscribe",
+        ChannelName::Balances,
+        &[],
+        SubscribeParams::Balances { snapshot: None },
+        47,
+    );
+    assert_eq!(balances["params"]["channel"], "balances");
+    assert!(
+        balances["params"].get("asset_class").is_none(),
+        "the Unified balances channel rejects asset_class"
+    );
+
+    let positions = build_subscribe_frame(
+        WsUrl::UnifiedPrivate,
+        "subscribe",
+        ChannelName::Positions,
+        &[],
+        SubscribeParams::Positions { snapshot: None },
+        48,
+    );
+    assert_eq!(positions["params"]["asset_class"], "derivatives");
+}
+
+#[test]
+fn unified_private_account_frames_send_snapshot_options_only_when_set_on_subscribe() {
+    let executions = |snap_orders, snap_trades| SubscribeParams::Executions {
+        snap_orders,
+        snap_trades,
+    };
+    let cases = [
+        (
+            ChannelName::Balances,
+            SubscribeParams::Balances { snapshot: None },
+            "subscribe",
+            serde_json::json!({}),
+        ),
+        (
+            ChannelName::Balances,
+            SubscribeParams::Balances {
+                snapshot: Some(false),
+            },
+            "subscribe",
+            serde_json::json!({ "snapshot": false }),
+        ),
+        (
+            ChannelName::Balances,
+            SubscribeParams::Balances {
+                snapshot: Some(false),
+            },
+            "unsubscribe",
+            serde_json::json!({}),
+        ),
+        (
+            ChannelName::Positions,
+            SubscribeParams::Positions { snapshot: None },
+            "subscribe",
+            serde_json::json!({}),
+        ),
+        (
+            ChannelName::Positions,
+            SubscribeParams::Positions {
+                snapshot: Some(false),
+            },
+            "subscribe",
+            serde_json::json!({ "snapshot": false }),
+        ),
+        (
+            ChannelName::Executions,
+            executions(None, None),
+            "subscribe",
+            serde_json::json!({}),
+        ),
+        (
+            ChannelName::Executions,
+            executions(Some(false), None),
+            "subscribe",
+            serde_json::json!({ "snap_orders": false }),
+        ),
+        (
+            ChannelName::Executions,
+            executions(None, Some(false)),
+            "subscribe",
+            serde_json::json!({ "snap_trades": false }),
+        ),
+        (
+            ChannelName::Executions,
+            executions(Some(false), Some(true)),
+            "subscribe",
+            serde_json::json!({ "snap_orders": false, "snap_trades": true }),
+        ),
+        (
+            ChannelName::Executions,
+            executions(Some(false), Some(false)),
+            "unsubscribe",
+            serde_json::json!({}),
+        ),
+    ];
+    for (channel, params, method, expected) in cases {
+        let frame = build_subscribe_frame(WsUrl::UnifiedPrivate, method, channel, &[], params, 0);
+        let options: serde_json::Map<String, Value> = frame["params"]
+            .as_object()
+            .expect("params object")
+            .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "snapshot" | "snap_orders" | "snap_trades"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        assert_eq!(
+            Value::Object(options),
+            expected,
+            "{channel:?} {params:?} {method}"
+        );
+    }
+}
+
+#[test]
+fn account_channel_keeps_the_first_subscribers_snapshot_options() {
+    let mut reg = SubscriptionRegistry::new();
+    let balances = |snapshot| {
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPrivate,
+            ChannelName::Balances,
+            None,
+            SubscribeParams::Balances { snapshot },
+        )
+    };
+    let now = crate::types::MonotonicInstant::now();
+    assert_eq!(reg.register(balances(Some(false)), now, false), 1);
+    assert_eq!(reg.register(balances(None), now, false), 2);
+    assert_eq!(
+        reg.params_for_url(WsUrl::UnifiedPrivate, ChannelName::Balances, &None),
+        Some(SubscribeParams::Balances {
+            snapshot: Some(false)
+        })
+    );
+}
+
+#[test]
+fn futures_maintained_book_entry_seeds_a_native_symbol_builder() {
+    let entry = SubscriptionEntry::new(
+        WsUrl::UnifiedPublic,
+        ChannelName::Book,
+        Some(StreamSymbol::Futures("PI_XBTUSD".to_string())),
+        SubscribeParams::Book {
+            depth: BookDepth::D10,
+        },
+    );
+
+    assert_eq!(
+        entry.builder.as_ref().map(|builder| builder.symbol()),
+        Some("PI_XBTUSD")
+    );
+}
+
+#[test]
+fn futures_raw_book_entry_keeps_its_own_params_without_a_builder() {
+    let raw = SubscriptionEntry::new(
+        WsUrl::UnifiedPublic,
+        ChannelName::BookRaw,
+        Some(StreamSymbol::Futures("PI_XBTUSD".to_string())),
+        SubscribeParams::BookRaw {
+            depth: BookDepth::D10,
+            snapshot: Some(false),
+        },
+    );
+    let maintained = SubscriptionEntry::new(
+        WsUrl::UnifiedPublic,
+        ChannelName::Book,
+        Some(StreamSymbol::Futures("PI_XBTUSD".to_string())),
+        SubscribeParams::Book {
+            depth: BookDepth::D10,
+        },
+    );
+
+    assert!(raw.builder.is_none());
+    assert_eq!(
+        raw.params,
+        SubscribeParams::BookRaw {
+            depth: BookDepth::D10,
+            snapshot: Some(false),
+        }
+    );
+    assert!(maintained.builder.is_some());
 }
 
 #[test]
@@ -87,14 +460,7 @@ fn register_returns_post_register_count_a372() {
 #[test]
 fn register_channel_wide_returns_count_a372() {
     let mut reg = SubscriptionRegistry::new();
-    let mk = || {
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Balances,
-            None,
-            SubscribeParams::Balances,
-        )
-    };
+    let mk = || bal_entry();
     assert_eq!(
         reg.register(mk(), crate::types::MonotonicInstant::now(), false),
         1,
@@ -168,16 +534,7 @@ fn register_is_first_writer_wins_on_shared_pair() {
 #[test]
 fn channel_wide_entry_keyed_by_channel_only() {
     let mut reg = SubscriptionRegistry::new();
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Balances,
-            None,
-            SubscribeParams::Balances,
-        ),
-        crate::types::MonotonicInstant::now(),
-        false,
-    );
+    reg.register(bal_entry(), crate::types::MonotonicInstant::now(), false);
     assert_eq!(reg.len(), 1);
     assert!(matches!(
         reg.handle_update(ChannelName::Balances, None, false, &serde_json::json!({})),
@@ -625,16 +982,7 @@ fn compose_filters_by_url() {
         crate::types::MonotonicInstant::now(),
         false,
     );
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Executions,
-            None,
-            SubscribeParams::Executions,
-        ),
-        crate::types::MonotonicInstant::now(),
-        false,
-    );
+    reg.register(ex_entry(), crate::types::MonotonicInstant::now(), false);
     let public = reg.compose_subscribe_frames_for_url(WsUrl::Public);
     assert_eq!(public.len(), 1);
     assert_eq!(public[0].0, ChannelName::Ticker);
@@ -680,12 +1028,12 @@ fn compose_emits_deterministic_replay_order() {
             WsUrl::Public,
             ChannelName::Balances,
             None,
-            SubscribeParams::Balances,
+            SubscribeParams::Balances { snapshot: None },
         ),
         crate::types::MonotonicInstant::now(),
         false,
     );
-    let order: Vec<(ChannelName, Option<Symbol>)> = reg
+    let order: Vec<(ChannelName, Option<StreamSymbol>)> = reg
         .compose_subscribe_frames_for_url(WsUrl::Public)
         .into_iter()
         .map(|(c, p, _)| (c, p))
@@ -706,6 +1054,7 @@ fn compose_emits_deterministic_replay_order() {
 fn book_frame_carries_depth_and_snapshot() {
     let pairs = vec![sym("BTC/USD")];
     let frame = build_subscribe_frame(
+        WsUrl::Public,
         "subscribe",
         ChannelName::Book,
         &pairs,
@@ -728,6 +1077,7 @@ fn book_frame_carries_depth_and_snapshot() {
 fn book_frame_bumps_d10_wire_depth_to_d25() {
     let pairs = vec![sym("BTC/USD")];
     let d10 = build_subscribe_frame(
+        WsUrl::Public,
         "subscribe",
         ChannelName::Book,
         &pairs,
@@ -741,6 +1091,7 @@ fn book_frame_bumps_d10_wire_depth_to_d25() {
         "D10 caller subscribes at the bumped D25 wire depth"
     );
     let d25 = build_subscribe_frame(
+        WsUrl::Public,
         "subscribe",
         ChannelName::Book,
         &pairs,
@@ -759,6 +1110,7 @@ fn ticker_frame_carries_snapshot_and_event_trigger_md3882() {
     let pairs = vec![sym("BTC/USD")];
     let mk = |snapshot, event_trigger| {
         build_subscribe_frame(
+            WsUrl::Public,
             "subscribe",
             ChannelName::Ticker,
             &pairs,
@@ -783,6 +1135,7 @@ fn ticker_frame_carries_snapshot_and_event_trigger_md3882() {
     );
 
     let unsub = build_subscribe_frame(
+        WsUrl::Public,
         "unsubscribe",
         ChannelName::Ticker,
         &pairs,
@@ -796,6 +1149,201 @@ fn ticker_frame_carries_snapshot_and_event_trigger_md3882() {
     assert!(unsub["params"].get("event_trigger").is_none());
 }
 
+#[test]
+fn unified_subscribe_stamps_derivatives_without_changing_spot() {
+    let params = SubscribeParams::Ticker {
+        snapshot: None,
+        event_trigger: None,
+    };
+    let symbols = [sym("BTC/USD")];
+    let unified = build_subscribe_frame(
+        WsUrl::UnifiedPublic,
+        "subscribe",
+        ChannelName::Ticker,
+        &symbols,
+        params,
+        1,
+    );
+    let spot = build_subscribe_frame(
+        WsUrl::Public,
+        "subscribe",
+        ChannelName::Ticker,
+        &symbols,
+        params,
+        1,
+    );
+
+    assert_eq!(unified["params"]["asset_class"], "derivatives");
+    assert!(spot["params"].get("asset_class").is_none());
+}
+
+#[test]
+fn unified_private_preferences_frame_is_channel_wide_without_asset_class() {
+    let frame = build_subscribe_frame(
+        WsUrl::UnifiedPrivate,
+        "subscribe",
+        ChannelName::Preferences,
+        &[],
+        SubscribeParams::Preferences,
+        1,
+    );
+
+    assert_eq!(frame["params"]["channel"], "preferences");
+    assert!(frame["params"].get("asset_class").is_none());
+    assert!(frame["params"].get("symbol").is_none());
+}
+
+#[test]
+fn unified_ohlc_subscribe_stamps_derivatives_and_interval() {
+    let symbols = [StreamSymbol::Futures("PF_XBTUSD".to_string())];
+    let params = SubscribeParams::Ohlc {
+        interval: crate::types::OhlcInterval::H4,
+        snapshot: None,
+        tick_type: None,
+    };
+    let unified = build_subscribe_frame(
+        WsUrl::UnifiedPublic,
+        "subscribe",
+        ChannelName::Ohlc,
+        &symbols,
+        params,
+        1,
+    );
+
+    assert_eq!(unified["params"]["asset_class"], "derivatives");
+    assert_eq!(unified["params"]["interval"], 240);
+    assert_eq!(
+        unified["params"]["symbol"],
+        serde_json::json!(["PF_XBTUSD"])
+    );
+    assert!(unified["params"].get("snapshot").is_none());
+}
+
+#[test]
+fn unified_ohlc_explicit_trade_shares_the_default_identity_and_unsubscribe_echoes_tick_type() {
+    use crate::types::{FuturesOhlcTickType, OhlcInterval};
+
+    let mut reg = SubscriptionRegistry::new();
+    let now = crate::types::MonotonicInstant::now();
+    let identities = [
+        (OhlcInterval::M1, None),
+        (OhlcInterval::M1, Some(FuturesOhlcTickType::Mark)),
+        (OhlcInterval::M1, Some(FuturesOhlcTickType::Trade)),
+    ];
+    let counts: Vec<u32> = identities
+        .iter()
+        .map(|&(interval, tick_type)| {
+            let params = SubscribeParams::Ohlc {
+                interval,
+                snapshot: None,
+                tick_type,
+            };
+            reg.register(
+                SubscriptionEntry::new(
+                    WsUrl::UnifiedPublic,
+                    ChannelName::Ohlc,
+                    Some(params.futures_symbol("PF_XBTUSD".to_string())),
+                    params,
+                ),
+                now,
+                false,
+            )
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        vec![1, 1, 2],
+        "an explicit trade tick type is the default identity"
+    );
+
+    let mark = StreamSymbol::futures_ohlc(
+        "PF_XBTUSD".to_string(),
+        OhlcInterval::M1,
+        Some(FuturesOhlcTickType::Mark),
+    );
+    let held = reg
+        .params_for_url(WsUrl::UnifiedPublic, ChannelName::Ohlc, &Some(mark.clone()))
+        .expect("mark entry is live");
+    let frame = build_subscribe_frame(
+        WsUrl::UnifiedPublic,
+        "unsubscribe",
+        ChannelName::Ohlc,
+        &[mark],
+        held,
+        1,
+    );
+    assert_eq!(frame["params"]["interval"], 1);
+    assert_eq!(frame["params"]["tick_type"], "mark");
+    assert_eq!(frame["params"]["asset_class"], "derivatives");
+}
+
+#[test]
+fn unified_replay_separates_ohlc_intervals_and_batches_matching_ones() {
+    let mut reg = SubscriptionRegistry::new();
+    let now = crate::types::MonotonicInstant::now();
+    for (symbol, interval) in [
+        ("PF_XBTUSD", crate::types::OhlcInterval::M1),
+        ("PF_ETHUSD", crate::types::OhlcInterval::M1),
+        ("PI_XBTUSD", crate::types::OhlcInterval::M5),
+    ] {
+        reg.register(
+            SubscriptionEntry::new(
+                WsUrl::UnifiedPublic,
+                ChannelName::Ohlc,
+                Some(StreamSymbol::Futures(symbol.to_string())),
+                SubscribeParams::Ohlc {
+                    interval,
+                    snapshot: None,
+                    tick_type: None,
+                },
+            ),
+            now,
+            false,
+        );
+    }
+
+    let batches = reg.compose_unified_public_subscribe_batches(None);
+    assert_eq!(batches.len(), 2);
+    let mut shapes = batches
+        .iter()
+        .map(|batch| {
+            (
+                batch.2["params"]["interval"].as_u64().expect("interval"),
+                batch.2["params"]["symbol"]
+                    .as_array()
+                    .expect("symbols")
+                    .len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    shapes.sort_unstable();
+    assert_eq!(shapes, vec![(1, 2), (5, 1)]);
+}
+
+#[test]
+fn unified_private_replay_carries_token_and_derivatives() {
+    let mut registry = SubscriptionRegistry::new();
+    registry.register(
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPrivate,
+            ChannelName::Executions,
+            None,
+            SubscribeParams::Executions {
+                snap_orders: None,
+                snap_trades: None,
+            },
+        ),
+        crate::types::MonotonicInstant::now(),
+        false,
+    );
+
+    let frames =
+        registry.compose_subscribe_frames_for_url_authed(WsUrl::UnifiedPrivate, "probe-token");
+
+    assert_eq!(frames[0].2["params"]["asset_class"], "derivatives");
+    assert_eq!(frames[0].2["params"]["token"], "probe-token");
+}
+
 /// Maintained `Book` always seeds (`snapshot:true`, not caller-settable); `book_raw`, `trade`,
 /// `ohlc` omit `snapshot` when `None` (Kraken per-channel default applies) and render an
 /// explicit `Some`.
@@ -804,6 +1352,7 @@ fn snapshot_flag_per_channel_md3882() {
     let pairs = vec![sym("BTC/USD")];
 
     let book = build_subscribe_frame(
+        WsUrl::Public,
         "subscribe",
         ChannelName::Book,
         &pairs,
@@ -820,6 +1369,7 @@ fn snapshot_flag_per_channel_md3882() {
     // book_raw snapshot is caller-settable; None omits the field and Kraken's default applies - see streaming guide.
     let book_raw = |snapshot| {
         build_subscribe_frame(
+            WsUrl::Public,
             "subscribe",
             ChannelName::Book,
             &pairs,
@@ -847,6 +1397,7 @@ fn snapshot_flag_per_channel_md3882() {
 
     let trade = |snapshot| {
         build_subscribe_frame(
+            WsUrl::Public,
             "subscribe",
             ChannelName::Trade,
             &pairs,
@@ -859,12 +1410,14 @@ fn snapshot_flag_per_channel_md3882() {
 
     let ohlc = |snapshot| {
         build_subscribe_frame(
+            WsUrl::Public,
             "subscribe",
             ChannelName::Ohlc,
             &pairs,
             SubscribeParams::Ohlc {
                 interval: OhlcInterval::M5,
                 snapshot,
+                tick_type: None,
             },
             0,
         )
@@ -912,10 +1465,11 @@ fn book_entry_builder_decouples_maintained_from_caller_depth() {
 #[test]
 fn channel_wide_frame_omits_symbol() {
     let frame = build_subscribe_frame(
+        WsUrl::Public,
         "subscribe",
         ChannelName::Balances,
         &[],
-        SubscribeParams::Balances,
+        SubscribeParams::Balances { snapshot: None },
         7,
     );
     assert_eq!(frame["params"]["channel"], "balances");
@@ -925,16 +1479,7 @@ fn channel_wide_frame_omits_symbol() {
 #[test]
 fn authed_composer_injects_token_into_params() {
     let mut reg = SubscriptionRegistry::new();
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Executions,
-            None,
-            SubscribeParams::Executions,
-        ),
-        crate::types::MonotonicInstant::now(),
-        false,
-    );
+    reg.register(ex_entry(), crate::types::MonotonicInstant::now(), false);
     let frames = reg.compose_subscribe_frames_for_url_authed(WsUrl::Auth, "tok-XYZ");
     assert_eq!(frames.len(), 1);
     let params = &frames[0].2["params"];
@@ -957,26 +1502,8 @@ fn inject_token_is_noop_without_params_object() {
 #[test]
 fn first_and_remaining_signed_subscribes_split_the_golden_batch() {
     let mut reg = SubscriptionRegistry::new();
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Executions,
-            None,
-            SubscribeParams::Executions,
-        ),
-        crate::types::MonotonicInstant::now(),
-        false,
-    );
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Balances,
-            None,
-            SubscribeParams::Balances,
-        ),
-        crate::types::MonotonicInstant::now(),
-        false,
-    );
+    reg.register(ex_entry(), crate::types::MonotonicInstant::now(), false);
+    reg.register(bal_entry(), crate::types::MonotonicInstant::now(), false);
 
     let first = reg
         .compose_first_signed_subscribe_authed(WsUrl::Auth, "tok-A")
@@ -1001,30 +1528,12 @@ fn remaining_excludes_the_sent_first_by_identity_not_position() {
     // compose_remaining must exclude the already-sent entry by (channel, pair) identity, not
     // position: a mid-handshake Register can sort ahead of the sent head, so a positional
     let mut reg = SubscriptionRegistry::new();
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Executions,
-            None,
-            SubscribeParams::Executions,
-        ),
-        crate::types::MonotonicInstant::now(),
-        false,
-    );
+    reg.register(ex_entry(), crate::types::MonotonicInstant::now(), false);
     let first = reg
         .compose_first_signed_subscribe_authed(WsUrl::Auth, "tok")
         .expect("executions entry exists");
     assert_eq!(first.0, ChannelName::Executions);
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Balances,
-            None,
-            SubscribeParams::Balances,
-        ),
-        crate::types::MonotonicInstant::now(),
-        false,
-    );
+    reg.register(bal_entry(), crate::types::MonotonicInstant::now(), false);
     let remaining =
         reg.compose_remaining_signed_subscribes_authed(WsUrl::Auth, "tok", &(first.0, first.1));
     assert_eq!(
@@ -1056,16 +1565,6 @@ fn first_signed_subscribe_none_without_auth_entries() {
     );
 }
 
-/// Channel-wide executions entry for the sequence-tracking tests.
-fn ex_entry() -> SubscriptionEntry {
-    SubscriptionEntry::new(
-        WsUrl::Auth,
-        ChannelName::Executions,
-        None,
-        SubscribeParams::Executions,
-    )
-}
-
 /// A snapshot seeds the tracker, contiguous updates stay quiet, and a jump returns the
 /// dropped-frame count (`delta - 1`), after which the tracker has advanced to the observed
 /// sequence.
@@ -1093,16 +1592,7 @@ fn note_sequence_detects_jump_after_snapshot_seed() {
 #[test]
 fn note_sequence_snapshot_and_regression_reset() {
     let mut reg = SubscriptionRegistry::new();
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Balances,
-            None,
-            SubscribeParams::Balances,
-        ),
-        crate::types::MonotonicInstant::now(),
-        false,
-    );
+    reg.register(bal_entry(), crate::types::MonotonicInstant::now(), false);
     assert_eq!(reg.note_sequence(ChannelName::Balances, 5, true), None);
     assert_eq!(reg.note_sequence(ChannelName::Balances, 6, false), None);
     assert_eq!(reg.note_sequence(ChannelName::Balances, 1, true), None);
@@ -1134,7 +1624,8 @@ fn ack_on_tombstone_is_a_noop() {
         !reg.has_url_entry(WsUrl::Public),
         "tombstone stays absent for liveness after a stray ack"
     );
-    let row_state = mirror.read().unwrap()[&(ChannelName::Ticker, Some(sym("BTC/USD")))]
+    let row_state = mirror.read().unwrap()
+        [&(WsUrl::Public, ChannelName::Ticker, Some(sym("BTC/USD")))]
         .state
         .clone();
     assert!(
@@ -1170,12 +1661,11 @@ fn tombstone_retained_until_last_holder_releases() {
             reg.is_terminated(ChannelName::Ticker, &Some(sym("BTC/USD"))),
             "tombstone survives while holders remain"
         );
-        assert!(
-            mirror
-                .read()
-                .unwrap()
-                .contains_key(&(ChannelName::Ticker, Some(sym("BTC/USD"))))
-        );
+        assert!(mirror.read().unwrap().contains_key(&(
+            WsUrl::Public,
+            ChannelName::Ticker,
+            Some(sym("BTC/USD"))
+        )));
     }
     assert_eq!(reg.release(ChannelName::Ticker, Some(sym("BTC/USD"))), 0);
     assert!(
@@ -1183,10 +1673,11 @@ fn tombstone_retained_until_last_holder_releases() {
         "last holder's release clears the tombstone"
     );
     assert!(
-        !mirror
-            .read()
-            .unwrap()
-            .contains_key(&(ChannelName::Ticker, Some(sym("BTC/USD")))),
+        !mirror.read().unwrap().contains_key(&(
+            WsUrl::Public,
+            ChannelName::Ticker,
+            Some(sym("BTC/USD"))
+        )),
         "mirror row removed with the entry"
     );
 }
@@ -1246,7 +1737,7 @@ fn note_terminated_second_call_is_a_noop() {
     {
         let m = mirror.read().unwrap();
         let row = m
-            .get(&(ChannelName::Ticker, Some(sym("BTC/USD"))))
+            .get(&(WsUrl::Public, ChannelName::Ticker, Some(sym("BTC/USD"))))
             .expect("tombstone row visible");
         assert!(
             matches!(
@@ -1565,7 +2056,7 @@ fn row_state(
     reg.mirror
         .read()
         .unwrap()
-        .get(&(channel, pair.map(sym)))
+        .get(&(WsUrl::Public, channel, pair.map(sym)))
         .expect("mirror row present")
         .state
         .clone()
@@ -1583,7 +2074,9 @@ fn register_inserts_pending_row_and_dup_keeps_first_stamp() {
     reg.note_acked(ChannelName::Ticker, &Some(sym("BTC/USD")));
     reg.register(tk(WsUrl::Public, "BTC/USD"), now_at(99), false);
     let m = reg.mirror.read().unwrap();
-    let row = m.get(&(ChannelName::Ticker, Some(sym("BTC/USD")))).unwrap();
+    let row = m
+        .get(&(WsUrl::Public, ChannelName::Ticker, Some(sym("BTC/USD"))))
+        .unwrap();
     assert_eq!(row.state, EntrySubState::Acked);
     assert_eq!(row.registered_at, now_at(10));
 }
@@ -1637,7 +2130,7 @@ fn note_acked_and_terminated_drive_states_and_projection() {
         !reg.mirror
             .read()
             .unwrap()
-            .contains_key(&(ChannelName::Trade, None))
+            .contains_key(&(WsUrl::Public, ChannelName::Trade, None))
     );
 }
 
@@ -1660,7 +2153,9 @@ fn tombstone_revives_pending_on_resubscribe_with_fresh_stamp() {
     );
     {
         let m = reg.mirror.read().unwrap();
-        let row = m.get(&(ChannelName::Ticker, Some(sym("BTC/USD")))).unwrap();
+        let row = m
+            .get(&(WsUrl::Public, ChannelName::Ticker, Some(sym("BTC/USD"))))
+            .unwrap();
         assert_eq!(row.state, EntrySubState::Pending);
         assert_eq!(row.registered_at, now_at(50));
     }
@@ -1705,16 +2200,7 @@ fn deregister_all_drains_sorted_and_clears_mirror() {
         now_at(3),
         false,
     );
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Executions,
-            None,
-            SubscribeParams::Executions,
-        ),
-        now_at(4),
-        false,
-    );
+    reg.register(ex_entry(), now_at(4), false);
     // Tombstone one entry: forced removal takes it too.
     reg.note_terminated(
         ChannelName::Ticker,
@@ -1726,7 +2212,8 @@ fn deregister_all_drains_sorted_and_clears_mirror() {
     assert!(reg.is_terminated(ChannelName::Ticker, &Some(sym("ETH/USD"))));
     assert!(!reg.is_terminated(ChannelName::Ticker, &Some(sym("BTC/USD"))));
 
-    let removed = reg.deregister_all(None);
+    let mut removed = reg.deregister_all_for(WsUrl::Auth, None);
+    removed.extend(reg.deregister_all_for(WsUrl::Public, None));
     let kinds: Vec<RemovedEntryKind> = removed.iter().map(|(_, k)| *k).collect();
     assert_eq!(
         kinds,
@@ -1752,7 +2239,7 @@ fn deregister_all_drains_sorted_and_clears_mirror() {
     );
     assert!(reg.is_empty());
     assert!(reg.mirror.read().unwrap().is_empty());
-    assert!(reg.deregister_all(None).is_empty());
+    assert!(reg.deregister_all_for(WsUrl::Public, None).is_empty());
 }
 
 #[test]
@@ -1771,16 +2258,15 @@ fn deregister_all_channel_scoped_leaves_others() {
         now_at(2),
         false,
     );
-    let removed = reg.deregister_all(Some(ChannelName::Book));
+    let removed = reg.deregister_all_for(WsUrl::Public, Some(ChannelName::Book));
     assert_eq!(removed.len(), 1);
     assert_eq!(removed[0].0.channel, ChannelName::Book);
     assert_eq!(reg.len(), 1);
-    assert!(
-        reg.mirror
-            .read()
-            .unwrap()
-            .contains_key(&(ChannelName::Ticker, Some(sym("BTC/USD"))))
-    );
+    assert!(reg.mirror.read().unwrap().contains_key(&(
+        WsUrl::Public,
+        ChannelName::Ticker,
+        Some(sym("BTC/USD"))
+    )));
 }
 
 #[test]
@@ -1823,16 +2309,7 @@ fn tombstone_revival_takes_the_reviving_callers_params() {
 #[test]
 fn has_url_entry_ignores_terminated_tombstones() {
     let mut reg = SubscriptionRegistry::new();
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Executions,
-            None,
-            SubscribeParams::Executions,
-        ),
-        now_at(1),
-        false,
-    );
+    reg.register(ex_entry(), now_at(1), false);
     reg.register(tk(WsUrl::Public, "BTC/USD"), now_at(2), false);
     assert!(reg.has_url_entry(WsUrl::Auth));
     reg.note_terminated(
@@ -1866,7 +2343,7 @@ fn release_guard_ref_on_missing_key_consumes_record() {
     // Same invariant through the forced-teardown path.
     reg.register(tk(WsUrl::Public, "ETH/USD"), now_at(2), false);
     reg.record_guard_ref(HandlerId(8), ChannelName::Ticker, &Some(sym("ETH/USD")));
-    reg.deregister_all(None);
+    reg.deregister_all_for(WsUrl::Public, None);
     assert_eq!(
         reg.release_guard_ref(HandlerId(8), ChannelName::Ticker, Some(sym("ETH/USD"))),
         0
@@ -2079,7 +2556,7 @@ fn liveness_epoch_bumps_on_every_liveness_mutation() {
     assert!(reg.liveness_epoch() > e4, "release bumps");
     reg.register(tk(WsUrl::Public, "SOL/USD"), now_at(3), false);
     let e5 = reg.liveness_epoch();
-    reg.deregister_all(None);
+    reg.deregister_all_for(WsUrl::Public, None);
     assert!(reg.liveness_epoch() > e5, "deregister_all bumps");
 }
 
@@ -2141,16 +2618,7 @@ fn bare_release_cannot_consume_guard_held_slot() {
 #[test]
 fn bare_release_cannot_consume_guard_held_channel_wide_slot() {
     let mut reg = SubscriptionRegistry::new();
-    reg.register(
-        SubscriptionEntry::new(
-            WsUrl::Auth,
-            ChannelName::Executions,
-            None,
-            SubscribeParams::Executions,
-        ),
-        now_at(1),
-        true,
-    );
+    reg.register(ex_entry(), now_at(1), true);
     reg.record_guard_ref(HandlerId(44), ChannelName::Executions, &None);
     assert_eq!(
         reg.release(ChannelName::Executions, None),
@@ -2190,6 +2658,175 @@ fn surplus_bare_release_stops_at_the_guard_backed_floor() {
     );
 }
 
+#[test]
+fn unified_instrument_frame_is_channel_wide_and_derivatives_scoped() {
+    let mut reg = SubscriptionRegistry::new();
+    reg.register(
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPublic,
+            ChannelName::Instrument,
+            None,
+            SubscribeParams::Instrument,
+        ),
+        crate::types::MonotonicInstant::now(),
+        false,
+    );
+
+    let batches = reg.compose_unified_public_subscribe_batches(None);
+    assert_eq!(batches.len(), 1);
+    let (_, keys, frame) = &batches[0];
+    assert_eq!(keys, &vec![None]);
+    assert_eq!(frame["params"]["channel"], "instrument");
+    assert_eq!(frame["params"]["asset_class"], "derivatives");
+    assert!(frame["params"].get("symbol").is_none());
+}
+
+#[test]
+fn unified_instrument_unsubscribe_is_channel_wide_and_derivatives_scoped() {
+    let frame = build_subscribe_frame(
+        WsUrl::UnifiedPublic,
+        "unsubscribe",
+        ChannelName::Instrument,
+        &[],
+        SubscribeParams::Instrument,
+        17,
+    );
+
+    assert_eq!(frame["method"], "unsubscribe");
+    assert_eq!(frame["params"]["channel"], "instrument");
+    assert_eq!(frame["params"]["asset_class"], "derivatives");
+    assert!(frame["params"].get("symbol").is_none());
+}
+
+#[test]
+fn unified_replay_batches_matching_symbols_into_one_frame() {
+    let mut reg = SubscriptionRegistry::new();
+    let now = crate::types::MonotonicInstant::now();
+    for symbol in ["PI_XBTUSD", "PF_ETHUSD"] {
+        reg.register(
+            SubscriptionEntry::new(
+                WsUrl::UnifiedPublic,
+                ChannelName::Ticker,
+                Some(StreamSymbol::Futures(symbol.to_string())),
+                SubscribeParams::Ticker {
+                    snapshot: Some(true),
+                    event_trigger: None,
+                },
+            ),
+            now,
+            false,
+        );
+    }
+
+    let batches = reg.compose_unified_public_subscribe_batches(None);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].1.len(), 2, "entries remain independently keyed");
+    assert_eq!(
+        batches[0].2["params"]["symbol"],
+        serde_json::json!(["PF_ETHUSD", "PI_XBTUSD"])
+    );
+    assert_eq!(batches[0].2["params"]["asset_class"], "derivatives");
+}
+
+#[test]
+fn unified_initial_replay_batches_only_marked_entries() {
+    let mut reg = SubscriptionRegistry::new();
+    let now = crate::types::MonotonicInstant::now();
+    for symbol in ["PI_XBTUSD", "PF_ETHUSD"] {
+        reg.register(
+            SubscriptionEntry::new(
+                WsUrl::UnifiedPublic,
+                ChannelName::Ticker,
+                Some(StreamSymbol::Futures(symbol.to_string())),
+                SubscribeParams::Ticker {
+                    snapshot: Some(true),
+                    event_trigger: None,
+                },
+            ),
+            now,
+            false,
+        );
+    }
+    reg.register(
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPublic,
+            ChannelName::Book,
+            Some(StreamSymbol::Futures("PI_XBTUSD".to_string())),
+            SubscribeParams::Book {
+                depth: crate::types::BookDepth::D10,
+            },
+        ),
+        now,
+        false,
+    );
+
+    let replay_keys = std::collections::HashSet::from([
+        (
+            ChannelName::Ticker,
+            Some(StreamSymbol::Futures("PI_XBTUSD".to_string())),
+        ),
+        (
+            ChannelName::Book,
+            Some(StreamSymbol::Futures("PI_XBTUSD".to_string())),
+        ),
+    ]);
+    let batches = reg.compose_unified_public_subscribe_batches(Some(&replay_keys));
+
+    assert_eq!(batches.len(), 2);
+    assert!(batches.iter().any(|(channel, keys, _)| {
+        *channel == ChannelName::Ticker
+            && keys == &vec![Some(StreamSymbol::Futures("PI_XBTUSD".to_string()))]
+    }));
+    assert!(batches.iter().any(|(channel, keys, _)| {
+        *channel == ChannelName::Book
+            && keys == &vec![Some(StreamSymbol::Futures("PI_XBTUSD".to_string()))]
+    }));
+}
+
+/// Raw-then-maintained before the first open marks only the raw row. Replay
+/// must still emit the maintained row, which is the one the peer filter keeps.
+#[test]
+fn unified_initial_replay_substitutes_maintained_book_for_a_raw_only_key() {
+    let symbol = StreamSymbol::Futures("PI_XBTUSD".to_string());
+    let now = crate::types::MonotonicInstant::now();
+    let mut reg = SubscriptionRegistry::new();
+    reg.register(
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPublic,
+            ChannelName::BookRaw,
+            Some(symbol.clone()),
+            SubscribeParams::BookRaw {
+                depth: BookDepth::D25,
+                snapshot: Some(true),
+            },
+        ),
+        now,
+        false,
+    );
+    reg.register(
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPublic,
+            ChannelName::Book,
+            Some(symbol.clone()),
+            SubscribeParams::Book {
+                depth: BookDepth::D10,
+            },
+        ),
+        now,
+        false,
+    );
+
+    let raw_only = std::collections::HashSet::from([(ChannelName::BookRaw, Some(symbol.clone()))]);
+    let batches = reg.compose_unified_public_subscribe_batches(Some(&raw_only));
+
+    assert_eq!(batches.len(), 1, "one shared venue book subscribe");
+    assert_eq!(batches[0].0, ChannelName::Book);
+    assert_eq!(batches[0].1, vec![Some(symbol)]);
+    assert_eq!(batches[0].2["params"]["channel"], "book");
+    assert_eq!(batches[0].2["params"]["depth"], 25);
+    assert_eq!(batches[0].2["params"]["snapshot"], true);
+}
+
 /// A stray bare release cannot drain a tombstone countdown made of guard
 /// holders: the Failed row stays visible until its own holder releases.
 #[test]
@@ -2219,4 +2856,264 @@ fn bare_release_cannot_drain_guard_backed_tombstone() {
         reg.params_for(ChannelName::Ticker, &Some(sym("BTC/USD")))
             .is_none()
     );
+}
+
+#[test]
+fn book_sorts_before_book_raw_when_wire_names_match() {
+    let book = subscription_order_key(ChannelName::Book, Some("PI_XBTUSD"));
+    let raw = subscription_order_key(ChannelName::BookRaw, Some("PI_XBTUSD"));
+    assert!(book < raw);
+    assert_eq!(<&str>::from(ChannelName::BookRaw), "book");
+}
+
+#[test]
+fn revival_clears_the_seed_hold_and_its_held_reply() {
+    let mut reg = SubscriptionRegistry::new();
+    let pair = Some(StreamSymbol::Futures("PI_XBTUSD".to_string()));
+    let book = || {
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPublic,
+            ChannelName::Book,
+            pair.clone(),
+            SubscribeParams::Book {
+                depth: BookDepth::D10,
+            },
+        )
+    };
+    let now = crate::types::MonotonicInstant::now();
+    reg.register(book(), now, false);
+    reg.require_unified_book_seed_for(&pair);
+    reg.note_unified_book_acked_for(
+        WsUrl::UnifiedPublic,
+        ChannelName::Book,
+        &pair,
+        &crate::dispatch::FuturesSubscribeAck {
+            req_id: Some(7),
+            ..Default::default()
+        },
+        now,
+    );
+    reg.note_terminated_for(
+        WsUrl::UnifiedPublic,
+        ChannelName::Book,
+        &pair,
+        TerminationCause::NonTransientWireRejection,
+        None,
+    );
+    reg.register(book(), now, false);
+    let entry = reg
+        .entry(WsUrl::UnifiedPublic, ChannelName::Book, &pair)
+        .expect("revived book");
+    assert!(!entry.awaiting_seed_snapshot);
+    assert_eq!(entry.seed_ack, None);
+    assert!(matches!(entry.state, EntrySubState::Pending));
+}
+
+#[test]
+fn gap_budget_exhaustion_clears_seed_hold_and_activates_the_row() {
+    let mirror: SubscriptionMirror =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    let mut reg = SubscriptionRegistry::with_mirror(std::sync::Arc::clone(&mirror));
+    let pair = Some(StreamSymbol::Futures("PI_XBTUSD".to_string()));
+    reg.register(
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPublic,
+            ChannelName::Book,
+            pair.clone(),
+            SubscribeParams::Book {
+                depth: BookDepth::D10,
+            },
+        ),
+        crate::types::MonotonicInstant::now(),
+        false,
+    );
+    reg.require_unified_book_seed_for(&pair);
+    let bad = serde_json::json!({
+        "symbol": "PI_XBTUSD",
+        "bids": [{ "price": "99.0", "qty": "2.0" }],
+        "asks": [{ "price": "100.0", "qty": "1.5" }],
+        "checksum": 1u32,
+    });
+    for _ in 1..MAX_CONSECUTIVE_BOOK_GAPS {
+        assert!(matches!(
+            reg.handle_update_for(
+                WsUrl::UnifiedPublic,
+                ChannelName::Book,
+                pair.as_ref(),
+                true,
+                &bad,
+                crate::types::MonotonicInstant::now
+            ),
+            BookDriveOutcome::Gap { .. }
+        ));
+    }
+    assert!(matches!(
+        reg.handle_update_for(
+            WsUrl::UnifiedPublic,
+            ChannelName::Book,
+            pair.as_ref(),
+            true,
+            &bad,
+            crate::types::MonotonicInstant::now
+        ),
+        BookDriveOutcome::GapBudgetExhausted
+    ));
+    let entry = reg
+        .entry(WsUrl::UnifiedPublic, ChannelName::Book, &pair)
+        .expect("book row");
+    assert!(!entry.awaiting_seed_snapshot);
+    assert!(entry.builder.is_none());
+    assert!(matches!(entry.state, EntrySubState::Acked));
+    assert!(matches!(
+        mirror.read().expect("mirror")[&(WsUrl::UnifiedPublic, ChannelName::Book, pair.clone())]
+            .state,
+        EntrySubState::Acked
+    ));
+    // The degraded row stays pass-through.
+    assert!(matches!(
+        reg.handle_update_for(
+            WsUrl::UnifiedPublic,
+            ChannelName::Book,
+            pair.as_ref(),
+            true,
+            &bad,
+            crate::types::MonotonicInstant::now
+        ),
+        BookDriveOutcome::PassThrough
+    ));
+}
+
+#[test]
+fn reseed_timeout_exhaustion_clears_seed_hold() {
+    let mut reg = SubscriptionRegistry::new();
+    let pair = StreamSymbol::Futures("PI_XBTUSD".to_string());
+    reg.register(
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPublic,
+            ChannelName::Book,
+            Some(pair.clone()),
+            SubscribeParams::Book {
+                depth: BookDepth::D10,
+            },
+        ),
+        crate::types::MonotonicInstant::now(),
+        false,
+    );
+    reg.require_unified_book_seed_for(&Some(pair.clone()));
+    reg.begin_book_resync_for(WsUrl::UnifiedPublic, ChannelName::Book, &pair);
+    for _ in 1..MAX_CONSECUTIVE_BOOK_GAPS {
+        assert_eq!(
+            reg.note_reseed_timeout_for(
+                WsUrl::UnifiedPublic,
+                ChannelName::Book,
+                &pair,
+                crate::types::MonotonicInstant::now()
+            ),
+            ReseedTimeoutOutcome::Retry
+        );
+    }
+    assert_eq!(
+        reg.note_reseed_timeout_for(
+            WsUrl::UnifiedPublic,
+            ChannelName::Book,
+            &pair,
+            crate::types::MonotonicInstant::now()
+        ),
+        ReseedTimeoutOutcome::Exhausted
+    );
+    let entry = reg
+        .entry(WsUrl::UnifiedPublic, ChannelName::Book, &Some(pair))
+        .expect("book row");
+    assert!(!entry.awaiting_seed_snapshot);
+    assert!(matches!(entry.state, EntrySubState::Acked));
+}
+
+#[test]
+fn unified_book_without_entry_reports_no_entry() {
+    let mut reg = SubscriptionRegistry::new();
+    let pair = StreamSymbol::Futures("PI_XBTUSD".to_string());
+    let frame = serde_json::json!({
+        "symbol": "PI_XBTUSD",
+        "bids": [{ "price": "99.0", "qty": "2.0" }],
+        "asks": [{ "price": "100.0", "qty": "1.5" }],
+        "checksum": 0u32,
+    });
+    let drive = |reg: &mut SubscriptionRegistry, pair: Option<&StreamSymbol>| {
+        reg.handle_update_for(
+            WsUrl::UnifiedPublic,
+            ChannelName::Book,
+            pair,
+            false,
+            &frame,
+            crate::types::MonotonicInstant::now,
+        )
+    };
+    assert!(matches!(
+        drive(&mut reg, Some(&pair)),
+        BookDriveOutcome::NoEntry
+    ));
+    assert!(matches!(drive(&mut reg, None), BookDriveOutcome::NoEntry));
+    reg.register(
+        SubscriptionEntry::new(
+            WsUrl::UnifiedPublic,
+            ChannelName::BookRaw,
+            Some(pair.clone()),
+            SubscribeParams::BookRaw {
+                depth: BookDepth::D10,
+                snapshot: Some(true),
+            },
+        ),
+        crate::types::MonotonicInstant::now(),
+        false,
+    );
+    assert!(matches!(
+        drive(&mut reg, Some(&pair)),
+        BookDriveOutcome::NoEntry
+    ));
+}
+
+#[test]
+fn spot_book_and_unified_non_book_without_entry_stay_passthrough() {
+    let mut reg = SubscriptionRegistry::new();
+    let frame = serde_json::json!({
+        "symbol": "BTC/USD",
+        "bids": [{ "price": "99.0", "qty": "2.0" }],
+        "asks": [],
+        "checksum": 0u32,
+    });
+    for url in [WsUrl::Public, WsUrl::Auth] {
+        assert!(matches!(
+            reg.handle_update_for(
+                url,
+                ChannelName::Book,
+                Some(&sym("BTC/USD")),
+                false,
+                &frame,
+                crate::types::MonotonicInstant::now
+            ),
+            BookDriveOutcome::PassThrough
+        ));
+        assert!(matches!(
+            reg.handle_update_for(
+                url,
+                ChannelName::Book,
+                None,
+                false,
+                &frame,
+                crate::types::MonotonicInstant::now
+            ),
+            BookDriveOutcome::PassThrough
+        ));
+    }
+    assert!(matches!(
+        reg.handle_update_for(
+            WsUrl::UnifiedPublic,
+            ChannelName::Ticker,
+            Some(&StreamSymbol::Futures("PI_XBTUSD".to_string())),
+            false,
+            &frame,
+            crate::types::MonotonicInstant::now
+        ),
+        BookDriveOutcome::PassThrough
+    ));
 }

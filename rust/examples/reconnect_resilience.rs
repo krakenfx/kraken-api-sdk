@@ -173,9 +173,12 @@ async fn main() {
     println!("[2] client.ready() — reactor spawned; subscribed to connection events\n");
 
     // Register a ticker handler — required before subscribe.
-    let _h = client.market().on_ticker(|t: &TickerUpdate| {
-        println!("[ticker] {} last={}", t.symbol.as_str(), t.last);
-    });
+    let _h = client
+        .market()
+        .on_ticker(|t: &TickerUpdate| {
+            println!("[ticker] {} last={}", t.symbol.as_str(), t.last);
+        })
+        .expect("register ticker handler");
 
     println!("[3] subscribe_ticker(BTC/USD) — triggers the public WS connection");
     match client

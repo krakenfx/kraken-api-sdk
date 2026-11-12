@@ -1,0 +1,17 @@
+[
+  {
+    "method": "subscribe",
+    "req_id": 4705001,
+    "result": {
+      "channel": "preferences"
+    },
+    "success": true
+  },
+  {
+    "channel": "preferences",
+    "data": {
+      "futures_trading": "enabled"
+    },
+    "type": "snapshot"
+  }
+]

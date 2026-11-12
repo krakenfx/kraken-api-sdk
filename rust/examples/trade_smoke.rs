@@ -107,7 +107,7 @@ async fn main() -> ExitCode {
     }
     println!();
 
-    if env_or("KRAKEN_PLACE_REAL", "").is_empty() {
+    if env_or("KRAKEN_PLACE_REAL", "") != "1" {
         println!(
             "STAGE 2 — SKIPPED (set KRAKEN_PLACE_REAL=1 to place a real far-from-market order)"
         );

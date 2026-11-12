@@ -1,0 +1,9 @@
+{
+  "method": "subscribe",
+  "req_id": 470001,
+  "result": {
+    "channel": "instrument",
+    "symbol": "*"
+  },
+  "success": true
+}

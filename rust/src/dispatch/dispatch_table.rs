@@ -39,11 +39,21 @@ pub enum Op {
     TradeOrderCancelBatch,
 }
 
-/// Product family the operation targets. Spot is the only v1 target.
+/// Product family the operation targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Product {
     Spot,
     Futures,
+}
+
+impl Product {
+    /// The private WebSocket connection this product's orders are sent on.
+    pub(crate) const fn order_ws_url(self) -> crate::types::WsUrl {
+        match self {
+            Product::Spot => crate::types::WsUrl::Auth,
+            Product::Futures => crate::types::WsUrl::UnifiedPrivate,
+        }
+    }
 }
 
 /// Wire transport — third leg of `DispatchKey`. Disambiguates multi-transport
@@ -58,9 +68,10 @@ pub enum Transport {
     WsV2Auth,
     /// Unreachable in v1 — never seeded.
     WsV2L3,
-    /// Futures REST (v2).
+    /// Never seeded: no Futures operation is routable over REST.
     FuturesRest,
-    /// Futures WS (v2).
+    /// Futures trade ops over the Unified private WebSocket; the only Futures
+    /// transport, and the value `.via(...)` takes for them.
     FuturesWs,
 }
 
@@ -102,23 +113,27 @@ impl DispatchTable {
         Self { table }
     }
 
-    /// Construct with the v1 Spot table.
-    pub fn with_default_spot_table() -> Self {
+    /// Construct with the default Spot and Futures rows.
+    pub fn with_default_table() -> Self {
         use Op::*;
         use Transport::*;
         let mut table = HashMap::new();
+        let mut seed_for =
+            |product: Product, op: Op, transport: Transport, wire_target, requires_auth| {
+                table.insert(
+                    DispatchKey {
+                        op,
+                        product,
+                        transport,
+                    },
+                    AdapterEntry {
+                        wire_target,
+                        requires_auth,
+                    },
+                );
+            };
         let mut seed = |op: Op, transport: Transport, wire_target, requires_auth| {
-            table.insert(
-                DispatchKey {
-                    op,
-                    product: Product::Spot,
-                    transport,
-                },
-                AdapterEntry {
-                    wire_target,
-                    requires_auth,
-                },
-            );
+            seed_for(Product::Spot, op, transport, wire_target, requires_auth);
         };
         seed(MarketTicker, Rest, "/0/public/Ticker", false);
         seed(MarketOrderBook, Rest, "/0/public/Depth", false);
@@ -165,6 +180,17 @@ impl DispatchTable {
         // cancel_batch fans out via TradeOrderCancel; seed points at single-cancel.
         // No WsV2Auth entry — cancel_batch is REST-only.
         seed(TradeOrderCancelBatch, Rest, "/0/private/CancelOrder", true);
+        for (op, wire_target) in [
+            (TradeOrder, "add_order"),
+            (TradeOrderCancel, "cancel_order"),
+            (TradeOrderAmend, "amend_order"),
+            (TradeOrderCancelAll, "cancel_all"),
+            (TradeOrderCancelAllAfter, "cancel_all_orders_after"),
+            (TradeOrderBatch, "batch_add"),
+            (TradeOrderCancelBatch, "batch_cancel"),
+        ] {
+            seed_for(Product::Futures, op, FuturesWs, wire_target, true);
+        }
         Self::new(table)
     }
 
@@ -194,8 +220,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_spot_table_resolves_market_ticker_to_canonical_path() {
-        let dispatch = DispatchTable::with_default_spot_table();
+    fn default_table_resolves_market_ticker_to_canonical_path() {
+        let dispatch = DispatchTable::with_default_table();
         let entry = dispatch
             .resolve(Op::MarketTicker, Product::Spot, Transport::Rest)
             .expect("MarketTicker/Spot/Rest should resolve");
@@ -205,7 +231,7 @@ mod tests {
 
     #[test]
     fn trade_order_buy_has_both_rest_and_ws_entries() {
-        let dispatch = DispatchTable::with_default_spot_table();
+        let dispatch = DispatchTable::with_default_table();
         let rest = dispatch
             .resolve(Op::TradeOrder, Product::Spot, Transport::Rest)
             .expect("TradeOrder/Spot/Rest should resolve");
@@ -220,7 +246,7 @@ mod tests {
 
     #[test]
     fn account_read_resolves_to_private_path_with_auth() {
-        let dispatch = DispatchTable::with_default_spot_table();
+        let dispatch = DispatchTable::with_default_table();
         let entry = dispatch
             .resolve(Op::AccountBalance, Product::Spot, Transport::Rest)
             .expect("AccountBalance/Spot/Rest should resolve");
@@ -230,7 +256,7 @@ mod tests {
 
     #[test]
     fn wrong_transport_for_op_returns_not_in_table() {
-        let dispatch = DispatchTable::with_default_spot_table();
+        let dispatch = DispatchTable::with_default_table();
         let err = dispatch
             .resolve(Op::MarketTicker, Product::Spot, Transport::WsV2Public)
             .expect_err("ticker has no WsV2Public entry");
@@ -239,10 +265,10 @@ mod tests {
 
     #[test]
     fn futures_op_returns_not_in_table() {
-        let dispatch = DispatchTable::with_default_spot_table();
+        let dispatch = DispatchTable::with_default_table();
         let err = dispatch
             .resolve(Op::MarketTicker, Product::Futures, Transport::Rest)
-            .expect_err("Futures should be NotInTable in v1");
+            .expect_err("Futures has no market-data route");
         assert_eq!(err.op, Op::MarketTicker);
         assert_eq!(err.product, Product::Futures);
     }
@@ -261,7 +287,7 @@ mod tests {
     fn every_seeded_op_resolves_to_its_expected_endpoint() {
         use Op::*;
         use Transport::*;
-        let d = DispatchTable::with_default_spot_table();
+        let d = DispatchTable::with_default_table();
         let expected: &[(Op, Transport, &str, bool)] = &[
             (MarketTicker, Rest, "/0/public/Ticker", false),
             (MarketOrderBook, Rest, "/0/public/Depth", false),
@@ -308,12 +334,43 @@ mod tests {
             ),
             (TradeOrderBatch, WsV2Auth, "batch_add", true),
         ];
-        for (op, transport, target, auth) in expected {
+        let futures: &[(Op, &str)] = &[
+            (TradeOrder, "add_order"),
+            (TradeOrderCancel, "cancel_order"),
+            (TradeOrderAmend, "amend_order"),
+            (TradeOrderCancelAll, "cancel_all"),
+            (TradeOrderCancelAllAfter, "cancel_all_orders_after"),
+            (TradeOrderBatch, "batch_add"),
+            (TradeOrderCancelBatch, "batch_cancel"),
+        ];
+        let rows = expected
+            .iter()
+            .map(|(op, transport, target, auth)| (Product::Spot, *op, *transport, *target, *auth))
+            .chain(
+                futures
+                    .iter()
+                    .map(|(op, target)| (Product::Futures, *op, FuturesWs, *target, true)),
+            );
+        for (product, op, transport, target, auth) in rows {
             let e = d
-                .resolve(*op, Product::Spot, *transport)
-                .unwrap_or_else(|_| panic!("{op:?}/{transport:?} must resolve"));
-            assert_eq!(e.wire_target, *target, "{op:?}/{transport:?} endpoint");
-            assert_eq!(e.requires_auth, *auth, "{op:?}/{transport:?} auth");
+                .resolve(op, product, transport)
+                .unwrap_or_else(|_| panic!("{product:?}/{op:?}/{transport:?} must resolve"));
+            assert_eq!(
+                e.wire_target, target,
+                "{product:?}/{op:?}/{transport:?} endpoint"
+            );
+            assert_eq!(
+                e.requires_auth, auth,
+                "{product:?}/{op:?}/{transport:?} auth"
+            );
+        }
+        for op in [TradeOrder, TradeOrderBatch] {
+            for transport in [Rest, WsV2Auth] {
+                assert!(
+                    d.resolve(op, Product::Futures, transport).is_err(),
+                    "Futures {op:?} has no {transport:?} route"
+                );
+            }
         }
     }
 }

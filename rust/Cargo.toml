@@ -1,8 +1,8 @@
 [package]
 name = "kraken-sdk"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Async-native Rust SDK for the Kraken exchange — one unified interface across Kraken Spot REST and Spot WebSocket v2."
 repository = "https://github.com/krakenfx/kraken-api-sdk"
@@ -36,7 +36,7 @@ rust_decimal = { version = "1", features = ["serde-with-str"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Serialization for REST envelopes + WebSocket frames.
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 
 # Derived string forms (`Display`/`AsRefStr`/`IntoStaticStr`) for public
@@ -46,8 +46,7 @@ strum = { version = "0.28", features = ["derive"] }
 # TOML config-file parsing (one of the supported config sources).
 toml = "1.0"
 
-# HTTP client for REST. `rustls` verifies against the platform trust store — a
-# deployment image without a CA bundle fails every request.
+# HTTP client for REST. TLS trust comes from `transport::tls`, not the OS store.
 # Transitive MSRV caps (Cargo.lock): `idna_adapter` 1.2.1 + `icu_*` 2.1.x —
 # 1.2.2 / 2.2+ need rustc ≥ 1.86. Re-pin with `cargo update -p … --precise`
 # after a floating `cargo update`.
@@ -55,6 +54,8 @@ reqwest = { version = "0.13", features = ["json", "query", "rustls"], default-fe
 
 # WebSocket client for Spot WS v2.
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+webpki-roots = "1.0.10"
 futures-util = "0.3"   # Sink/Stream extensions for the WebSocket halves.
 
 # HMAC-SHA512 signing for Spot REST authentication.
@@ -67,7 +68,7 @@ crc32fast = "1"
 
 # Bounded LRU backing the `cl_ord_id → (pair, sent_at)` trading-cost index.
 # The std-HashMap backend (default-features off) avoids a second hashbrown major.
-lru = { version = "0.18.2", default-features = false }
+lru = { version = "0.19.0", default-features = false }
 
 # Volatile-write credential wiping; `ApiSecret`/`WsToken` buffers zero on drop.
 zeroize = { version = "1", features = ["derive"] }
@@ -80,8 +81,7 @@ async-trait = "0.1"
 
 # Structured logging / tracing.
 tracing = "0.1"
-# Exact pin: serde_with >= 3.18 needs rustc 1.88 (above rust-version 1.85).
-serde_with = { version = "=3.22.0", default-features = false, features = ["macros"] }
+serde_with = { version = "3.21", default-features = false, features = ["macros"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

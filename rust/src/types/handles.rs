@@ -65,7 +65,7 @@ pub enum ExpectedCompletionEvent {
     /// or `EventType::ClientFailed` (failure) — both carry the same `request_id`.
     ClientReady,
     /// `Client::close` completion. Correlates to `EventType::ClientClosedEvent`, emitted
-    /// once BOTH WS connections have drained and closed.
+    /// once all four WS connections have drained and closed.
     ClientClosed,
 }
 

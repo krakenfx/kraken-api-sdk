@@ -1,5 +1,5 @@
 use crate::conn::rate_budget::ConnectionRateThrottled;
-use crate::types::{ConnectionState, WsUrl};
+use crate::types::ConnectionState;
 
 use super::{AuthErrorKind, DrainCause, FsmEvent, ManagedConnection};
 
@@ -7,6 +7,19 @@ impl ManagedConnection {
     /// Drive the FSM by consuming one event. Bounded sync work per arm; the I/O
     /// Reactor is the sole caller.
     pub fn handle_event(&mut self, event: FsmEvent) {
+        let from = self.state;
+        self.handle_event_inner(event);
+        // A socket lost in either pre-`Open` phase strands queued
+        // subscribes unless they replay on the next upgrade.
+        if matches!(
+            from,
+            ConnectionState::Connecting | ConnectionState::Resubscribing
+        ) {
+            self.note_pre_open_socket_lost();
+        }
+    }
+
+    fn handle_event_inner(&mut self, event: FsmEvent) {
         use ConnectionState::*;
         use FsmEvent::*;
 
@@ -120,9 +133,10 @@ impl ManagedConnection {
                 self.server_connection_id = connection_id;
                 // Disarm the upgrade-timeout; else it leaks into Resubscribing/Authenticating.
                 self.timers.upgrade_timeout_due_at = None;
-                let next = match self.url {
-                    WsUrl::Public => Resubscribing,
-                    WsUrl::Auth => Authenticating,
+                let next = if self.url.requires_ws_token() {
+                    Authenticating
+                } else {
+                    Resubscribing
                 };
                 self.state = next;
                 self.arm_staleness();
@@ -250,6 +264,16 @@ impl ManagedConnection {
                     url = ?self.url,
                     "Connecting → Connecting (ForceReconnect; restart)"
                 );
+            }
+            (
+                Connecting,
+                WireSubscribeFailed {
+                    channel,
+                    pair,
+                    error,
+                },
+            ) if !self.url.requires_ws_token() => {
+                self.handle_subscribe_rejected(channel, pair, error);
             }
 
             (Authenticating, WireAuthHandshakeOk) => {
@@ -506,7 +530,7 @@ impl ManagedConnection {
                 } else {
                     self.state = Failed;
                     self.emit_connection_failed(
-                        format!("AuthRefreshFailed: {error}"),
+                        format!("{}{error}", crate::error::AUTH_REFRESH_FAILED_PREFIX),
                         false,
                         Some(crate::dispatch::NonTransientClass::ClientError),
                     );
@@ -531,7 +555,7 @@ impl ManagedConnection {
             (Authenticating, TimerSubscribeAckTimeout { channel, pair }) => {
                 // First signed subscribe is the auth probe; a lost ack is a
                 // per-entry transient — retry under budget, else tear down.
-                self.handle_subscribe_failure(channel, pair, true, None);
+                self.handle_subscribe_ack_timeout(channel, pair);
             }
 
             (Authenticating, CallClose { request_id }) => {
@@ -606,7 +630,7 @@ impl ManagedConnection {
                 );
             }
             (Resubscribing, TimerSubscribeAckTimeout { channel, pair }) => {
-                self.handle_subscribe_failure(channel, pair, true, None);
+                self.handle_subscribe_ack_timeout(channel, pair);
             }
             (
                 Resubscribing,
@@ -616,11 +640,7 @@ impl ManagedConnection {
                     error,
                 },
             ) => {
-                let crate::conn::SubscribeErrorKind::SubscribeRejected {
-                    transient,
-                    kraken_code,
-                } = error;
-                self.handle_subscribe_failure(channel, pair, transient, Some(kraken_code));
+                self.handle_subscribe_rejected(channel, pair, error);
             }
             (Resubscribing, WireCloseReceived { code, reason }) => {
                 self.exit_resubscribing_teardown();
@@ -741,15 +761,11 @@ impl ManagedConnection {
                 },
             ) => {
                 // Stay Open — one entry's failure never recycles the healthy connection.
-                let crate::conn::SubscribeErrorKind::SubscribeRejected {
-                    kraken_code,
-                    transient,
-                } = error;
-                self.handle_subscribe_failure(channel, pair, transient, Some(kraken_code));
+                self.handle_subscribe_rejected(channel, pair, error);
             }
             (Open, TimerSubscribeAckTimeout { channel, pair }) => {
                 // Per-entry TRANSIENT (frame out, no response), NOT a wire rejection.
-                self.handle_subscribe_failure(channel, pair, true, None);
+                self.handle_subscribe_ack_timeout(channel, pair);
             }
             (Open, WireCloseReceived { code, reason }) => {
                 // Drain in-flight WS requests BEFORE the ConnectionDroppedEvent below.

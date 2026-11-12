@@ -1,0 +1,21 @@
+[
+  {
+    "method": "subscribe",
+    "req_id": 475003,
+    "result": {
+      "channel": "ticker",
+      "symbol": "PI_XBTUSD"
+    },
+    "success": true
+  },
+  {
+    "error": "Unknown symbol: PI_NOTAREAL",
+    "method": "subscribe",
+    "req_id": 475003,
+    "result": {
+      "channel": "ticker",
+      "symbol": "PI_NOTAREAL"
+    },
+    "success": false
+  }
+]

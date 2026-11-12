@@ -1,0 +1,7 @@
+{
+  "method": "cancel_all",
+  "result": {
+    "count": 3
+  },
+  "success": true
+}

@@ -1,4 +1,4 @@
-//! Caller-facing channel-wide handler store, keyed by `ChannelName`.
+//! Caller-facing channel-wide handler store, keyed by `(WsUrl, ChannelName)`.
 //! Single-writer on the I/O reactor; `has_handlers` reads a shared presence mirror.
 
 use std::any::Any;
@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock, Weak};
 use serde_json::Value;
 
 use crate::dispatch::DispatchEventBus;
-use crate::types::ChannelName;
+use crate::types::{ChannelName, WsUrl};
 
 /// Opaque, never-recycled handler id. Not user-constructable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -99,7 +99,7 @@ impl HandlerCallback {
 /// Shared, caller-readable presence projection backing `has_handlers`.
 /// Stored as a count (not a bool) so concurrent register/deregister of
 /// sibling handlers on one channel never races the presence signal.
-pub type PresenceMirror = Arc<RwLock<HashMap<ChannelName, usize>>>;
+pub type PresenceMirror = Arc<RwLock<HashMap<(WsUrl, ChannelName), usize>>>;
 
 /// One registered callback, stored in registration order (deterministic fan-out).
 #[derive(Clone)]
@@ -119,8 +119,8 @@ impl std::fmt::Debug for HandlerEntry {
 
 /// Single-writer (I/O reactor task) registry of channel-wide handlers.
 pub struct HandlerRegistry {
-    /// Channel → ordered handlers. Reactor-owned, single-writer.
-    handlers: HashMap<ChannelName, Vec<HandlerEntry>>,
+    /// `(URL, channel)` → ordered handlers. Reactor-owned, single-writer.
+    handlers: HashMap<(WsUrl, ChannelName), Vec<HandlerEntry>>,
 
     /// Id allocator for the test `register` path; live path uses `register_with_id`.
     #[cfg(test)]
@@ -146,34 +146,36 @@ impl HandlerRegistry {
     #[cfg(test)]
     pub fn register(&mut self, channel: ChannelName, callback: HandlerCallback) -> HandlerId {
         let id = HandlerId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let url = channel.spot_url();
         self.handlers
-            .entry(channel)
+            .entry((url, channel))
             .or_default()
             .push(HandlerEntry { id, callback });
         if let Ok(mut mirror) = self.presence_mirror.write() {
-            *mirror.entry(channel).or_insert(0) += 1;
+            *mirror.entry((url, channel)).or_insert(0) += 1;
         }
         id
     }
 
     /// Register with a caller-allocated id. Reactor task only. Does NOT touch the
     /// presence mirror — the caller already bumped it at id-allocation.
-    pub fn register_with_id(
+    pub fn register_with_id_for_url(
         &mut self,
+        url: WsUrl,
         channel: ChannelName,
         id: HandlerId,
         callback: HandlerCallback,
     ) {
         self.handlers
-            .entry(channel)
+            .entry((url, channel))
             .or_default()
             .push(HandlerEntry { id, callback });
     }
 
     /// Remove the handler with `id` from `channel`. Idempotent. Decrements the
     /// presence mirror on confirmed removal. Reactor task only.
-    pub fn deregister(&mut self, channel: ChannelName, id: HandlerId) {
-        let removed = match self.handlers.get_mut(&channel) {
+    pub fn deregister_for_url(&mut self, url: WsUrl, channel: ChannelName, id: HandlerId) {
+        let removed = match self.handlers.get_mut(&(url, channel)) {
             Some(vec) => {
                 let before = vec.len();
                 vec.retain(|e| e.id != id);
@@ -184,30 +186,30 @@ impl HandlerRegistry {
         if !removed {
             return;
         }
-        if let Ok(mut mirror) = self.presence_mirror.write() {
-            if let Some(count) = mirror.get_mut(&channel) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    mirror.remove(&channel);
-                }
+        if let Ok(mut mirror) = self.presence_mirror.write()
+            && let Some(count) = mirror.get_mut(&(url, channel))
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                mirror.remove(&(url, channel));
             }
         }
     }
 
     /// Borrow registered handlers for `channel`. Reactor task, lock-free.
     /// Empty slice when none.
-    pub fn handlers_for(&self, channel: ChannelName) -> &[HandlerEntry] {
+    pub fn handlers_for_url(&self, url: WsUrl, channel: ChannelName) -> &[HandlerEntry] {
         self.handlers
-            .get(&channel)
+            .get(&(url, channel))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
 }
 
 /// Caller-thread presence gate. Does NOT touch the reactor-owned `handlers` map.
-pub fn presence_has_handlers(mirror: &PresenceMirror, channel: ChannelName) -> bool {
+pub fn presence_has_handlers(mirror: &PresenceMirror, url: WsUrl, channel: ChannelName) -> bool {
     match mirror.read() {
-        Ok(guard) => guard.get(&channel).is_some_and(|&c| c > 0),
+        Ok(guard) => guard.get(&(url, channel)).is_some_and(|&c| c > 0),
         Err(_) => false,
     }
 }
@@ -217,6 +219,7 @@ pub fn presence_has_handlers(mirror: &PresenceMirror, channel: ChannelName) -> b
 #[must_use = "dropping the handle deregisters the callback"]
 pub struct HandlerHandle {
     id: HandlerId,
+    url: WsUrl,
     channel: ChannelName,
     weak_bus: Weak<DispatchEventBus>,
 }
@@ -224,11 +227,13 @@ pub struct HandlerHandle {
 impl HandlerHandle {
     pub(crate) fn new(
         id: HandlerId,
+        url: WsUrl,
         channel: ChannelName,
         weak_bus: Weak<DispatchEventBus>,
     ) -> Self {
         Self {
             id,
+            url,
             channel,
             weak_bus,
         }
@@ -249,6 +254,7 @@ impl std::fmt::Debug for HandlerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HandlerHandle")
             .field("id", &self.id)
+            .field("url", &self.url)
             .field("channel", &self.channel)
             .finish()
     }
@@ -260,15 +266,17 @@ impl Drop for HandlerHandle {
             return;
         };
         let handler_id = self.id;
+        let url = self.url;
         let channel = self.channel;
         tracing::debug!(
             target: "kraken_sdk::dispatch",
-            %handler_id,
+            %handler_id, ?url,
             %channel,
             "handler {handler_id} for {channel} deregistered on HandlerHandle drop; the wire subscription persists — \
              use on_*_for / SubscriptionGuard for atomic teardown",
         );
         bus.post_teardown(crate::dispatch::CallerInbound::HandlerMutation {
+            url: self.url,
             channel: self.channel,
             op: crate::dispatch::HandlerMutationOp::Deregister { id: self.id },
         });
@@ -302,12 +310,26 @@ mod tests {
         let sink = Arc::new(Mutex::new(Vec::new()));
         let a = reg.register(ChannelName::Ticker, counting_cb(Arc::clone(&sink)));
         let b = reg.register(ChannelName::Ticker, counting_cb(Arc::clone(&sink)));
-        assert!(b.0 > a.0);
-        assert!(presence_has_handlers(&mirror, ChannelName::Ticker));
+        let c = reg.register(ChannelName::Executions, counting_cb(sink));
+        assert!(b.0 > a.0 && c.0 > b.0);
+        assert!(presence_has_handlers(
+            &mirror,
+            WsUrl::Public,
+            ChannelName::Ticker
+        ));
         assert_eq!(
-            *mirror.read().unwrap().get(&ChannelName::Ticker).unwrap(),
+            *mirror
+                .read()
+                .unwrap()
+                .get(&(WsUrl::Public, ChannelName::Ticker))
+                .unwrap(),
             2
         );
+        assert!(presence_has_handlers(
+            &mirror,
+            WsUrl::Auth,
+            ChannelName::Executions
+        ));
     }
 
     #[test]
@@ -317,7 +339,7 @@ mod tests {
         let a = reg.register(ChannelName::Book, counting_cb(Arc::clone(&sink)));
         let b = reg.register(ChannelName::Book, counting_cb(Arc::clone(&sink)));
         let ids: Vec<_> = reg
-            .handlers_for(ChannelName::Book)
+            .handlers_for_url(WsUrl::Public, ChannelName::Book)
             .iter()
             .map(|e| e.id)
             .collect();
@@ -331,25 +353,56 @@ mod tests {
         let sink = Arc::new(Mutex::new(Vec::new()));
         let a = reg.register(ChannelName::Trade, counting_cb(Arc::clone(&sink)));
         let b = reg.register(ChannelName::Trade, counting_cb(Arc::clone(&sink)));
-        reg.deregister(ChannelName::Trade, a);
-        assert_eq!(*mirror.read().unwrap().get(&ChannelName::Trade).unwrap(), 1);
-        assert_eq!(reg.handlers_for(ChannelName::Trade).len(), 1);
-        reg.deregister(ChannelName::Trade, a);
-        assert_eq!(*mirror.read().unwrap().get(&ChannelName::Trade).unwrap(), 1);
-        reg.deregister(ChannelName::Trade, b);
-        assert!(!presence_has_handlers(&mirror, ChannelName::Trade));
+        reg.deregister_for_url(WsUrl::Public, ChannelName::Trade, a);
+        assert_eq!(
+            *mirror
+                .read()
+                .unwrap()
+                .get(&(WsUrl::Public, ChannelName::Trade))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reg.handlers_for_url(WsUrl::Public, ChannelName::Trade)
+                .len(),
+            1
+        );
+        reg.deregister_for_url(WsUrl::Public, ChannelName::Trade, a);
+        assert_eq!(
+            *mirror
+                .read()
+                .unwrap()
+                .get(&(WsUrl::Public, ChannelName::Trade))
+                .unwrap(),
+            1
+        );
+        reg.deregister_for_url(WsUrl::Public, ChannelName::Trade, b);
+        assert!(!presence_has_handlers(
+            &mirror,
+            WsUrl::Public,
+            ChannelName::Trade
+        ));
     }
 
     #[test]
     fn presence_gate_false_for_unregistered_channel() {
         let mirror = empty_mirror();
         let _reg = HandlerRegistry::new(Arc::clone(&mirror));
-        assert!(!presence_has_handlers(&mirror, ChannelName::Ohlc));
+        assert!(!presence_has_handlers(
+            &mirror,
+            WsUrl::Public,
+            ChannelName::Ohlc
+        ));
     }
 
     #[test]
     fn handler_handle_drop_is_safe_with_dead_bus() {
-        let handle = HandlerHandle::new(HandlerId(1), ChannelName::Ticker, Weak::new());
+        let handle = HandlerHandle::new(
+            HandlerId(1),
+            WsUrl::Public,
+            ChannelName::Ticker,
+            Weak::new(),
+        );
         drop(handle);
     }
 
@@ -364,23 +417,32 @@ mod tests {
 
         {
             let mut m = mirror.write().unwrap();
-            *m.entry(ChannelName::Ticker).or_insert(0) += 1;
+            *m.entry((WsUrl::Public, ChannelName::Ticker)).or_insert(0) += 1;
         }
         assert_eq!(
-            *mirror.read().unwrap().get(&ChannelName::Ticker).unwrap(),
+            *mirror
+                .read()
+                .unwrap()
+                .get(&(WsUrl::Public, ChannelName::Ticker))
+                .unwrap(),
             1,
             "after caller bump"
         );
 
         let id = HandlerId(42);
-        reg.register_with_id(ChannelName::Ticker, id, noop_cb());
+        reg.register_with_id_for_url(WsUrl::Public, ChannelName::Ticker, id, noop_cb());
         assert_eq!(
-            *mirror.read().unwrap().get(&ChannelName::Ticker).unwrap(),
+            *mirror
+                .read()
+                .unwrap()
+                .get(&(WsUrl::Public, ChannelName::Ticker))
+                .unwrap(),
             1,
             "A371: register_with_id must not double-count the presence mirror"
         );
         assert_eq!(
-            reg.handlers_for(ChannelName::Ticker).len(),
+            reg.handlers_for_url(WsUrl::Public, ChannelName::Ticker)
+                .len(),
             1,
             "callback stored"
         );
@@ -393,15 +455,22 @@ mod tests {
 
         {
             let mut m = mirror.write().unwrap();
-            *m.entry(ChannelName::Trade).or_insert(0) += 1;
+            *m.entry((WsUrl::Public, ChannelName::Trade)).or_insert(0) += 1;
         }
         let id = HandlerId(7);
-        reg.register_with_id(ChannelName::Trade, id, noop_cb());
-        assert_eq!(*mirror.read().unwrap().get(&ChannelName::Trade).unwrap(), 1);
+        reg.register_with_id_for_url(WsUrl::Public, ChannelName::Trade, id, noop_cb());
+        assert_eq!(
+            *mirror
+                .read()
+                .unwrap()
+                .get(&(WsUrl::Public, ChannelName::Trade))
+                .unwrap(),
+            1
+        );
 
-        reg.deregister(ChannelName::Trade, id);
+        reg.deregister_for_url(WsUrl::Public, ChannelName::Trade, id);
         assert!(
-            !presence_has_handlers(&mirror, ChannelName::Trade),
+            !presence_has_handlers(&mirror, WsUrl::Public, ChannelName::Trade),
             "mirror must reach 0 after deregister — no phantom presence"
         );
     }
@@ -413,29 +482,40 @@ mod tests {
 
         {
             let mut m = mirror.write().unwrap();
-            *m.entry(ChannelName::Book).or_insert(0) += 1;
-            *m.entry(ChannelName::Book).or_insert(0) += 1;
+            *m.entry((WsUrl::Public, ChannelName::Book)).or_insert(0) += 1;
+            *m.entry((WsUrl::Public, ChannelName::Book)).or_insert(0) += 1;
         }
         let id_a = HandlerId(1);
         let id_b = HandlerId(2);
-        reg.register_with_id(ChannelName::Book, id_a, noop_cb());
-        reg.register_with_id(ChannelName::Book, id_b, noop_cb());
-        assert_eq!(*mirror.read().unwrap().get(&ChannelName::Book).unwrap(), 2);
-
-        reg.deregister(ChannelName::Book, id_a);
+        reg.register_with_id_for_url(WsUrl::Public, ChannelName::Book, id_a, noop_cb());
+        reg.register_with_id_for_url(WsUrl::Public, ChannelName::Book, id_b, noop_cb());
         assert_eq!(
-            *mirror.read().unwrap().get(&ChannelName::Book).unwrap(),
+            *mirror
+                .read()
+                .unwrap()
+                .get(&(WsUrl::Public, ChannelName::Book))
+                .unwrap(),
+            2
+        );
+
+        reg.deregister_for_url(WsUrl::Public, ChannelName::Book, id_a);
+        assert_eq!(
+            *mirror
+                .read()
+                .unwrap()
+                .get(&(WsUrl::Public, ChannelName::Book))
+                .unwrap(),
             1,
             "one remaining"
         );
         assert!(
-            presence_has_handlers(&mirror, ChannelName::Book),
+            presence_has_handlers(&mirror, WsUrl::Public, ChannelName::Book),
             "still present"
         );
 
-        reg.deregister(ChannelName::Book, id_b);
+        reg.deregister_for_url(WsUrl::Public, ChannelName::Book, id_b);
         assert!(
-            !presence_has_handlers(&mirror, ChannelName::Book),
+            !presence_has_handlers(&mirror, WsUrl::Public, ChannelName::Book),
             "both dropped → zero"
         );
     }
@@ -444,7 +524,14 @@ mod tests {
     fn no_register_yields_no_presence() {
         let mirror = empty_mirror();
         let reg = HandlerRegistry::new(Arc::clone(&mirror));
-        assert!(!presence_has_handlers(&mirror, ChannelName::Ticker));
-        assert!(reg.handlers_for(ChannelName::Ticker).is_empty());
+        assert!(!presence_has_handlers(
+            &mirror,
+            WsUrl::Public,
+            ChannelName::Ticker
+        ));
+        assert!(
+            reg.handlers_for_url(WsUrl::Public, ChannelName::Ticker)
+                .is_empty()
+        );
     }
 }

@@ -9,7 +9,7 @@ pub enum ConnectionState {
     Idle = 0,
     /// TCP/TLS + WebSocket handshake in progress.
     Connecting = 1,
-    /// Handshake done; exchanging the auth token (auth connection only).
+    /// Handshake done; exchanging the auth token (private connections only: Spot auth and Unified private).
     Authenticating = 2,
     /// Replaying prior channel subscriptions after a (re)connect.
     Resubscribing = 3,

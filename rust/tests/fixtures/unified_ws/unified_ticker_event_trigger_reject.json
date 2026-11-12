@@ -1,0 +1,6 @@
+{
+  "error": "Unknown 'params' key: event_trigger",
+  "method": "subscribe",
+  "req_id": 471002,
+  "success": false
+}

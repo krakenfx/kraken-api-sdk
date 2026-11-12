@@ -1,6 +1,9 @@
 # Architecture
 
-The SDK is an async client over Spot REST and Spot WebSocket v2. Callers use domain methods (`client.market()`, `client.trade()`, …). Transport, credentials, queues, and reconnect policy are wired at `.build()`.
+The SDK is an async client over Spot REST and Spot WebSocket v2, plus Futures
+streams and orders on the Unified WebSocket. Callers use domain methods
+(`client.market()`, `client.trade()`, …). Transport, credentials, queues, and
+reconnect policy are wired at `.build()`.
 
 WebSocket work runs on two loops: an I/O loop that owns the sockets, and a dispatch loop that runs callbacks. Connections open on first use. Operational signals go to the event bus.
 
@@ -13,7 +16,7 @@ Module layout and internals: [Development](development.md). Task-level frame and
 Locked at build:
 
 - Credentials
-- Endpoint URLs (`rest_base_url`, `ws_public_url`, `ws_auth_url`), request timeout, TLS
+- Endpoint URLs (`rest_base_url`, `ws_public_url`, `ws_auth_url`, `unified_ws_public_url`, `unified_ws_private_url`), request timeout, TLS
 - Rate-limit tier
 - Reconnect backoff (`backoff_base_ms`, `backoff_max_ms`, `backoff_factor`, `backoff_jitter`)
 - REST retry (`rest_retry_max_attempts`, `rest_retry_base_ms`, …)
@@ -45,14 +48,28 @@ A full caller-to-I/O queue rejects before send: `TradeError::QueueFull` / `Subsc
 
 ## Connections
 
-Two WebSocket connections:
+The client manages four WebSocket connections: two Spot and two Unified.
 
 | Role | Default URL |
 |------|-------------|
-| Public | `wss://ws.kraken.com/v2` |
-| Auth | `wss://ws-auth.kraken.com/v2` |
+| Public (Spot) | `wss://ws.kraken.com/v2` |
+| Auth (Spot) | `wss://ws-auth.kraken.com/v2` |
+| Unified Public (Futures) | `wss://uws.kraken.com/v2/public` |
+| Unified Private (Futures) | `wss://uws.kraken.com/v2/private` |
 
-Override with construction-only `ws_public_url` / `ws_auth_url`. `client.ready()` starts the I/O loop. TCP/TLS starts on the first subscribe or WebSocket order for that endpoint. Failure of one connection does not close the other.
+Override with construction-only `ws_public_url` / `ws_auth_url` (Spot) and `unified_ws_public_url` / `unified_ws_private_url` (Unified). `client.ready()` starts the I/O loop. TCP/TLS starts on the first subscribe or WebSocket order for that endpoint; Unified Public also starts when the first Futures system-status handler is registered, since status has no subscribe. Failure of one connection does not close the others.
+
+Public Futures market data uses a separate lazy Unified Public connection. It
+is isolated from both Spot connections and carries only
+`client.market().futures()` / `client.subscription().futures()` streams
+(`status`, `instrument`, `ticker`, `trade`, `ohlc`, and `book`). Futures symbols remain
+native wire strings such as `PI_XBTUSD`.
+
+Futures private account streams use a separate lazy Unified Private
+connection, isolated from the other three. Futures order entry
+(`client.trade().futures()`) sends on this same connection; it can open it with a
+bare order, as Spot's auth connection can.
+Surface and semantics: [Features → Futures streams](features.md#futures-streams).
 
 ## Event bus
 
@@ -79,5 +96,5 @@ Shorthands and `order(OrderRequest)` allocate a UUID v4 `cl_ord_id` on the `Pend
 - Credentials stay in memory. They are not logged, written to disk, or included in error messages.
 - The base64 secret passed to `with_api_key` is zeroed after decode, success or failure.
 - Logs redact key, secret, token, and nonce unconditionally.
-- TLS 1.2+ with certificate verification. Cleartext `rest_base_url` / `ws_public_url` / `ws_auth_url` is `ConfigError::InsecureEndpointScheme` at `.build()`.
+- TLS 1.2+ with certificate verification against the roots of the CAs in the `kraken.com` CAA record, plus `tls_extra_root_certs_file` ([configuration guide](guides/configuration.md#tls-trust)). Cleartext `rest_base_url` / `ws_public_url` / `ws_auth_url` / `unified_ws_public_url` / `unified_ws_private_url` is `ConfigError::InsecureEndpointScheme`, and a host outside `kraken.com` / `kraken.zone` is `ConfigError::UntrustedEndpointHost`, at `.build()`.
 - No cancel-on-disconnect API. Venue-side protection is `trade().cancel_all_orders_after(seconds)`.

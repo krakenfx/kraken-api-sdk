@@ -8,7 +8,7 @@ use crate::book::{BookDelta, BookLevel, OrderBookUpdate};
 use crate::conn::SubscribeParams;
 use crate::dispatch::HandlerHandle;
 
-use crate::api::ws_decode::{extract_data, wrap_typed};
+use crate::api::ws_decode::{dedupe_first_seen, extract_data, is_snapshot_frame, wrap_typed};
 use crate::types::{BookDepth, ChannelName, Symbol, TickerTrigger};
 
 use super::MarketNamespace;
@@ -21,12 +21,21 @@ use super::ws_types::{
 impl MarketNamespace {
     /// Register a streaming `ticker` handler for all subscribed pairs; the
     /// returned handle's `Drop` deregisters it. Does not subscribe any pair itself.
-    pub fn on_ticker<F>(&self, cb: F) -> HandlerHandle
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::QueueFull`], [`SubscriptionError::LoopDead`],
+    /// or [`SubscriptionError::ClientClosed`] when the handler cannot be posted.
+    pub fn on_ticker<F>(&self, cb: F) -> Result<HandlerHandle, SubscriptionError>
     where
         F: Fn(&TickerUpdate) + Send + Sync + 'static,
     {
         let wrapped = wrap_typed(cb, decode_ticker);
-        self.ws.register_handler(ChannelName::Ticker, wrapped)
+        self.ws.register_handler_for_checked(
+            ChannelName::Ticker.spot_url(),
+            ChannelName::Ticker,
+            wrapped,
+        )
     }
 
     /// Register a `ticker` handler and subscribe `pairs` in one call, returning a
@@ -61,22 +70,40 @@ impl MarketNamespace {
     /// Register a maintained-book handler for all subscribed pairs; the returned
     /// handle's `Drop` deregisters it. Delivers the reactor-maintained, CRC-validated
     /// [`OrderBookUpdate`].
-    pub fn on_book<F>(&self, cb: F) -> HandlerHandle
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::QueueFull`], [`SubscriptionError::LoopDead`],
+    /// or [`SubscriptionError::ClientClosed`] when the handler cannot be posted.
+    pub fn on_book<F>(&self, cb: F) -> Result<HandlerHandle, SubscriptionError>
     where
         F: Fn(&OrderBookUpdate) + Send + Sync + 'static,
     {
         let wrapped = wrap_typed(cb, decode_book);
-        self.ws.register_handler(ChannelName::Book, wrapped)
+        self.ws.register_handler_for_checked(
+            ChannelName::Book.spot_url(),
+            ChannelName::Book,
+            wrapped,
+        )
     }
 
     /// Register a raw-delta book handler ([`BookDelta`], no CRC maintenance); the
     /// returned handle's `Drop` deregisters it.
-    pub fn on_book_raw<F>(&self, cb: F) -> HandlerHandle
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::QueueFull`], [`SubscriptionError::LoopDead`],
+    /// or [`SubscriptionError::ClientClosed`] when the handler cannot be posted.
+    pub fn on_book_raw<F>(&self, cb: F) -> Result<HandlerHandle, SubscriptionError>
     where
         F: Fn(&BookDelta) + Send + Sync + 'static,
     {
         let wrapped = wrap_typed(cb, decode_book_raw);
-        self.ws.register_handler(ChannelName::BookRaw, wrapped)
+        self.ws.register_handler_for_checked(
+            ChannelName::BookRaw.spot_url(),
+            ChannelName::BookRaw,
+            wrapped,
+        )
     }
 
     /// Register a maintained-book handler and subscribe `pairs` at `depth`, returning
@@ -135,23 +162,41 @@ impl MarketNamespace {
     /// Register a streaming `trade` handler for all subscribed pairs; the returned
     /// handle's `Drop` deregisters it. A `trade` frame carries an array of prints;
     /// the callback fires once per print.
-    pub fn on_trade<F>(&self, cb: F) -> HandlerHandle
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::QueueFull`], [`SubscriptionError::LoopDead`],
+    /// or [`SubscriptionError::ClientClosed`] when the handler cannot be posted.
+    pub fn on_trade<F>(&self, cb: F) -> Result<HandlerHandle, SubscriptionError>
     where
         F: Fn(&TradeUpdate) + Send + Sync + 'static,
     {
         let wrapped = wrap_typed(cb, decode_trade);
-        self.ws.register_handler(ChannelName::Trade, wrapped)
+        self.ws.register_handler_for_checked(
+            ChannelName::Trade.spot_url(),
+            ChannelName::Trade,
+            wrapped,
+        )
     }
 
     /// Register a streaming `ohlc` (candle) handler for all subscribed pairs; the
     /// returned handle's `Drop` deregisters it. `snapshot`/`update` frames carry an
     /// array of candles; the callback fires once per candle.
-    pub fn on_ohlc<F>(&self, cb: F) -> HandlerHandle
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::QueueFull`], [`SubscriptionError::LoopDead`],
+    /// or [`SubscriptionError::ClientClosed`] when the handler cannot be posted.
+    pub fn on_ohlc<F>(&self, cb: F) -> Result<HandlerHandle, SubscriptionError>
     where
         F: Fn(&OhlcUpdate) + Send + Sync + 'static,
     {
         let wrapped = wrap_typed(cb, decode_ohlc);
-        self.ws.register_handler(ChannelName::Ohlc, wrapped)
+        self.ws.register_handler_for_checked(
+            ChannelName::Ohlc.spot_url(),
+            ChannelName::Ohlc,
+            wrapped,
+        )
     }
 
     /// Register a `trade` handler and subscribe `pairs` in one call, returning a
@@ -181,12 +226,21 @@ impl MarketNamespace {
 
     /// Register a `status` handler for the exchange system-status channel; the
     /// returned handle's `Drop` deregisters it. Channel-wide (no `symbol`, no `_for`).
-    pub fn on_system_status<F>(&self, cb: F) -> HandlerHandle
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::QueueFull`], [`SubscriptionError::LoopDead`],
+    /// or [`SubscriptionError::ClientClosed`] when the handler cannot be posted.
+    pub fn on_system_status<F>(&self, cb: F) -> Result<HandlerHandle, SubscriptionError>
     where
         F: Fn(&SystemStatusUpdate) + Send + Sync + 'static,
     {
         let wrapped = wrap_typed(cb, decode_system_status);
-        self.ws.register_handler(ChannelName::Status, wrapped)
+        self.ws.register_handler_for_checked(
+            ChannelName::Status.spot_url(),
+            ChannelName::Status,
+            wrapped,
+        )
     }
 
     /// Register an `ohlc` handler and subscribe `pairs` at `interval`, returning a
@@ -211,7 +265,11 @@ impl MarketNamespace {
             cb,
             ChannelName::Ohlc,
             pairs,
-            SubscribeParams::Ohlc { interval, snapshot },
+            SubscribeParams::Ohlc {
+                interval,
+                snapshot,
+                tick_type: None,
+            },
         )
     }
 
@@ -224,10 +282,7 @@ impl MarketNamespace {
         pairs: &[Symbol],
         params: SubscribeParams,
     ) -> Result<SubscriptionGuard, SubscriptionError> {
-        // Dedupe: a duplicate pair would register twice under one guard record and over-release on drop.
-        let mut pairs = pairs.to_vec();
-        let mut seen = std::collections::HashSet::new();
-        pairs.retain(|p| seen.insert(p.clone()));
+        let pairs = dedupe_first_seen(pairs.to_vec());
         let wrapped = wrap_typed(filter_by_pairs(pairs.clone(), cb), decode_fn);
         self.ws
             .register_and_subscribe_guarded(channel, pairs, params, wrapped)
@@ -314,11 +369,7 @@ pub(crate) fn decode_book(v: Value) -> Option<OrderBookUpdate> {
 
 /// The envelope `type` must be read before [`extract_data`] consumes the value.
 pub(crate) fn decode_book_raw(v: Value) -> Option<BookDelta> {
-    let is_snapshot = v
-        .get("type")
-        .and_then(Value::as_str)
-        .map(|t| t == "snapshot")
-        .unwrap_or(false);
+    let is_snapshot = is_snapshot_frame(&v);
     let data = extract_data(v)?;
     let parsed = crate::book::parse_book_frame_owned(data)?;
     Some(BookDelta {
@@ -334,6 +385,7 @@ pub(crate) fn decode_book_raw(v: Value) -> Option<BookDelta> {
 
 /// One print per invocation — the reactor unpacks the frame's print array.
 pub(super) fn decode_trade(v: Value) -> Option<TradeUpdate> {
+    let is_snapshot = is_snapshot_frame(&v);
     let data = extract_data(v)?;
     let raw: RawTradeData = serde_json::from_value(data).ok()?;
     let price = parse_wire_decimal(&raw.price)?;
@@ -346,6 +398,7 @@ pub(super) fn decode_trade(v: Value) -> Option<TradeUpdate> {
         ord_type: raw.ord_type,
         trade_id: raw.trade_id,
         timestamp: raw.timestamp,
+        is_snapshot,
     })
 }
 

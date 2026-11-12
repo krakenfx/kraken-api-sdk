@@ -27,7 +27,7 @@ pub enum EventType {
     ConnectionConnectingEvent,
     /// A WS connection completed its upgrade/handshake.
     ConnectionOpenEvent,
-    /// Emitted when the auth connection reached bare-order send-readiness.
+    /// Emitted when a private connection (Spot auth or Unified private) reached bare-order send-readiness.
     ConnectionSendReadyEvent,
     /// A WS connection reached terminal closed (see `ClosedReason` / `AckSource`).
     ConnectionClosedEvent,
@@ -96,6 +96,10 @@ pub enum EventType {
     /// `SubscriptionGapEvent` (which carries `dropped_count`) in parallel, so book
     /// callers get a typed event without filtering the generic gap stream.
     OrderBookGapEvent,
+    /// Futures-specific maintained-book CRC32 gap.
+    FuturesOrderBookGapEvent,
+    /// Futures subscription gap: with a Futures book gap, or alone for an undecodable Unified Public row.
+    FuturesSubscriptionGapEvent,
 
     /// A `sequence` jump on a channel-wide account subscription
     /// (`executions`/`balances`) — frames lost mid-connection.
@@ -103,17 +107,24 @@ pub enum EventType {
 
     /// Wire-side subscription termination. Rekeyed to `(channel, pair)`.
     SubscriptionTerminatedEvent,
+    /// Unified Futures subscription acknowledgement for one wire symbol.
+    FuturesSubscribedEvent,
+    /// Unified Futures subscription attempt failed for one wire symbol.
+    FuturesSubscribeFailedEvent,
+    /// Unified Futures subscription terminated for one wire symbol.
+    FuturesSubscriptionTerminatedEvent,
 
     /// A registered handler panicked during fan-out; other handlers on the
     /// channel continue.
     HandlerPanicWarning,
 
     /// Inbound frame arrived for a channel with zero registered handlers.
-    /// Rate-limited once per `period` per channel; `count` aggregates over the
-    /// window. The `status` channel is exempt (auto-seeded system-status push).
+    /// Rate-limited once per `period` per URL-and-channel stream; `count`
+    /// aggregates over the window. The `status` channel is exempt (auto-seeded
+    /// system-status push).
     MessageDroppedNoHandler,
 
-    /// An in-flight WS request was abandoned because the auth connection dropped or
+    /// An in-flight WS request was abandoned because a private connection dropped or
     /// the client closed while pending. Emitted once per pending request
     /// (before `ConnectionDroppedEvent`); no request body.
     WsRequestFailedEvent,
@@ -181,6 +192,9 @@ pub enum EventPayload {
     /// failed; the close completes regardless. `retry_at_monotonic` is `None` in v1
     /// (a wall-clock hint has no lossless conversion to the monotonic clock).
     DeadmanDisarmFailedEvent {
+        /// The product whose dead-man timer may still be armed: `Auth` for the Spot
+        /// REST disarm, `UnifiedPrivate` for the Futures disarm.
+        url: WsUrl,
         /// Why the disarm call failed (network / rate limit / timeout).
         cause: DeadmanDisarmCause,
         /// Always `None` in v1 — reserved for a future retry hint.
@@ -212,7 +226,7 @@ pub enum EventPayload {
     /// `opened_at_monotonic`); the envelope `timestamp_monotonic` owns the
     /// emit-stamp.
     ConnectionSendReadyEvent {
-        /// The auth WS endpoint that reached send-readiness.
+        /// The private WS endpoint that reached send-readiness: `Auth` or `UnifiedPrivate`.
         url: WsUrl,
         /// Monotonic instant bare-order send-readiness was reached.
         ready_at_monotonic: MonotonicInstant,
@@ -319,7 +333,7 @@ pub enum EventPayload {
     /// `ConnectionFailedEvent` for an auth cause (M-cap / bad-creds /
     /// permission-denied / refresh-REST failure).
     AuthenticationFailedEvent {
-        /// The auth WS endpoint that failed.
+        /// The private WS endpoint that failed: `Auth` or `UnifiedPrivate`.
         url: WsUrl,
         /// Terminal cause: bad creds, permission denied, client error, or retry-cap.
         non_transient_class: NonTransientClass,
@@ -329,7 +343,7 @@ pub enum EventPayload {
 
     /// Per-failure auth-handshake signal (including token-stale and transient).
     AuthHandshakeFailedEvent {
-        /// The auth WS endpoint whose handshake failed.
+        /// The private WS endpoint whose handshake failed: `Auth` or `UnifiedPrivate`.
         url: WsUrl,
         /// The connection's overall attempt tally at this failure — not the consecutive-auth-fail counter.
         attempt: u32,
@@ -540,9 +554,38 @@ pub enum EventPayload {
         cause: GapCause,
     },
 
+    /// Futures maintained-book CRC32 mismatch.
+    FuturesOrderBookGapEvent {
+        /// The book channel the gap occurred on.
+        channel: crate::types::ChannelName,
+        /// Native Futures wire symbol.
+        symbol: String,
+        /// What produced the gap.
+        cause: GapCause,
+    },
+
+    /// Futures subscription gap: emitted with [`Self::FuturesOrderBookGapEvent`] on a maintained-book
+    /// CRC gap, and alone (cause `MalformedFrame`) when a Unified Public row fails to decode.
+    FuturesSubscriptionGapEvent {
+        /// The channel the gap occurred on.
+        channel: crate::types::ChannelName,
+        /// Native Futures wire symbol.
+        symbol: String,
+        /// OHLC interval read from the malformed row; `None` if absent, invalid or not OHLC.
+        interval: Option<crate::types::OhlcInterval>,
+        /// OHLC tick type read from the malformed row; `None` if absent, invalid or not OHLC.
+        tick_type: Option<crate::types::FuturesOhlcTickType>,
+        /// Number of frames dropped in the gap.
+        dropped_count: u32,
+        /// What produced the gap.
+        cause: GapCause,
+    },
+
     /// A `sequence` jump on a channel-wide account subscription. No symbol —
     /// a lost frame's symbols are unknowable. Broadcast; no auto-resubscribe.
     ChannelGapEvent {
+        /// Connection whose sequence jumped. Spot and Futures share channel names.
+        url: WsUrl,
         /// The account channel whose sequence jumped.
         channel: crate::types::ChannelName,
         /// Frames lost: the observed sequence delta minus one.
@@ -566,6 +609,62 @@ pub enum EventPayload {
         terminated_at_monotonic: MonotonicInstant,
     },
 
+    /// Unified Futures subscription acknowledgement. Futures symbols remain
+    /// native wire strings and never pass through Spot's `Symbol` type.
+    FuturesSubscribedEvent {
+        /// Unified Futures channel acknowledged by the venue.
+        channel: crate::types::ChannelName,
+        /// Native Futures wire symbol; `None` for channel-wide streams.
+        symbol: Option<String>,
+        /// OHLC candle interval; `None` for every other channel.
+        interval: Option<crate::types::OhlcInterval>,
+        /// OHLC candle tick type; `None` for every other channel.
+        tick_type: Option<crate::types::FuturesOhlcTickType>,
+        /// Monotonic instant the acknowledgement was observed.
+        subscribed_at_monotonic: MonotonicInstant,
+        /// Fields the venue's subscribe reply echoed.
+        ack: FuturesSubscribeAck,
+    },
+
+    /// Unified Futures subscription failure for one entry in a batch.
+    FuturesSubscribeFailedEvent {
+        /// Unified Futures channel that failed.
+        channel: crate::types::ChannelName,
+        /// Native Futures wire symbol; `None` for channel-wide streams.
+        symbol: Option<String>,
+        /// OHLC candle interval; `None` for every other channel.
+        interval: Option<crate::types::OhlcInterval>,
+        /// OHLC candle tick type; `None` for every other channel.
+        tick_type: Option<crate::types::FuturesOhlcTickType>,
+        /// One-based subscribe attempt count.
+        attempt: u32,
+        /// `Transient` is an ack timeout, outbound backpressure or a venue
+        /// rate-limit reject. `NonTransient` is any other wire rejection.
+        error_class: FuturesSubscribeFailureClass,
+        /// Venue error text; `None` when no reply arrived.
+        error: Option<String>,
+        /// Fields the venue's subscribe reply echoed.
+        ack: FuturesSubscribeAck,
+    },
+
+    /// Unified Futures subscription terminal state for one entry in a batch.
+    FuturesSubscriptionTerminatedEvent {
+        /// Unified Futures channel that terminated.
+        channel: crate::types::ChannelName,
+        /// Native Futures wire symbol; `None` for channel-wide streams.
+        symbol: Option<String>,
+        /// OHLC candle interval; `None` for every other channel.
+        interval: Option<crate::types::OhlcInterval>,
+        /// OHLC candle tick type; `None` for every other channel.
+        tick_type: Option<crate::types::FuturesOhlcTickType>,
+        /// Why the subscription terminated.
+        cause: crate::api::subscription::TerminationCause,
+        /// Last exchange error, preserved verbatim when available.
+        last_error: Option<String>,
+        /// Monotonic instant the terminal state was observed.
+        terminated_at_monotonic: MonotonicInstant,
+    },
+
     /// Handler panic caught during fan-out. `panic_message` is truncated to
     /// ≤1KB at the emit-site.
     HandlerPanicWarning {
@@ -579,9 +678,11 @@ pub enum EventPayload {
     },
 
     /// Inbound frame dropped because `channel` had zero handlers. Rate-limited once
-    /// per `period` per channel; `count` aggregates over the window. The `status`
-    /// channel is exempt (its auto-seeded system-status push).
+    /// per `period` per URL-and-channel stream; `count` aggregates over the
+    /// window. The `status` channel is exempt (its auto-seeded system-status push).
     MessageDroppedNoHandler {
+        /// Connection that delivered the row. Spot and Futures share channel names.
+        url: WsUrl,
         /// The channel whose frames had no registered handler.
         channel: crate::types::ChannelName,
         /// Frames dropped for this channel within the aggregation window.
@@ -591,13 +692,15 @@ pub enum EventPayload {
     },
 
     /// An in-flight WS request was abandoned on connection drop / client close.
-    /// Carries no request body — only `req_id`, `op`, `reason`. Emitted once per
-    /// pending request.
+    /// Carries no request body — only `req_id`, `op`, `url`, `reason`. Emitted
+    /// once per pending request.
     WsRequestFailedEvent {
         /// The WS v2 `req_id` of the abandoned request.
         req_id: u64,
         /// Which order op the abandoned request carried.
         op: WsOp,
+        /// Private connection the request was sent on.
+        url: WsUrl,
         /// Coarse drain cause: connection lost or client closed.
         reason: WsFailReason,
     },
@@ -630,7 +733,7 @@ pub enum EventPayload {
         outcome: crate::api::account::ReconciliationOutcome,
     },
 
-    /// `{ cl_ord_id, amend_id, op, status, request_id }`. Emitted on a definitive wire
+    /// `{ cl_ord_id, amend_id, op, url, status, request_id }`. Emitted on a definitive wire
     /// response for an add/amend/cancel op ([`OrderSubmitStatus`] carries the
     /// outcome); `amend_id` is `Some` only on an amend that minted one.
     OrderSubmittedEvent {
@@ -640,6 +743,8 @@ pub enum EventPayload {
         amend_id: Option<crate::api::trade::AmendId>,
         /// Which order op this wire response answers.
         op: OrderOp,
+        /// Product connection the order belongs to: `Auth` for every Spot order, REST included; `UnifiedPrivate` for Futures.
+        url: WsUrl,
         /// Definitive wire outcome — see [`OrderSubmitStatus`].
         status: OrderSubmitStatus,
         /// Per-dispatch correlation id (REST UUID / WS req_id, stringified);
@@ -657,6 +762,8 @@ pub enum EventPayload {
         amend_id: Option<crate::api::trade::AmendId>,
         /// Which order op was mid-send when the transport dropped.
         op: OrderOp,
+        /// Product connection the order belongs to: `Auth` for every Spot order, REST included; `UnifiedPrivate` for Futures.
+        url: WsUrl,
         /// Monotonic instant the wire send started.
         sent_at_monotonic: MonotonicInstant,
         /// Per-dispatch correlation id (REST UUID / WS req_id, stringified).
@@ -671,6 +778,8 @@ pub enum EventPayload {
         cl_ord_id: crate::types::ClOrdId,
         /// Which order op's await was dropped.
         op: OrderOp,
+        /// Product connection the order belongs to: `Auth` for every Spot order, REST included; `UnifiedPrivate` for Futures.
+        url: WsUrl,
         /// Per-dispatch correlation id (REST UUID / WS req_id, stringified).
         request_id: Option<String>,
     },
@@ -730,8 +839,26 @@ impl EventPayload {
 pub enum CallbackSource {
     /// A lifecycle event-bus subscriber, keyed by the `EventType` it subscribed to.
     Event(EventType),
-    /// A WS data callback, keyed by the channel whose decoded frames it consumes.
+    /// A Spot WS data callback, keyed by the channel whose decoded frames it consumes.
     DataChannel(crate::types::ChannelName),
+    /// A Futures WS data callback, keyed by its Unified URL and channel.
+    FuturesDataChannel {
+        /// The Unified endpoint that delivered the callback.
+        url: WsUrl,
+        /// The Futures channel whose decoded frames it consumes.
+        channel: crate::types::ChannelName,
+    },
+}
+
+impl CallbackSource {
+    /// Data-callback source for a frame on `url` / `channel`.
+    pub(crate) fn for_data_channel(url: WsUrl, channel: crate::types::ChannelName) -> Self {
+        if url.is_unified() {
+            Self::FuturesDataChannel { url, channel }
+        } else {
+            Self::DataChannel(channel)
+        }
+    }
 }
 
 /// `SubscriptionGapEvent.cause` / `OrderBookGapEvent.cause` /
@@ -778,15 +905,17 @@ pub enum ClientCloseReason {
 
 /// `DeadmanDisarmFailedEvent.cause`. Why the `CancelAllOrdersAfter(0)` disarm
 /// during `Client::close()` failed (non-classifiable errors are logged, not
-/// emitted). `AuthConnectionFailed` is unreachable on this REST-HMAC path.
+/// emitted). `AuthConnectionFailed` is reserved and never emitted: an auth
+/// refusal on either disarm path is logged only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DeadmanDisarmCause {
-    /// The disarm REST call failed at the network/transport layer.
+    /// The disarm call failed at the network/transport layer, including a Futures
+    /// disarm that could not be sent.
     NetworkError,
     /// The disarm call was rejected by rate limiting.
     RateLimitExceeded,
-    /// Auth-connection failure — unreachable on this REST-HMAC path (kept for contract parity).
+    /// Reserved; never emitted (auth refusals on the disarm are logged only).
     AuthConnectionFailed,
     /// The disarm call timed out.
     Timeout,
@@ -827,7 +956,9 @@ pub enum NonTransientClass {
     PermissionDenied,
     /// Non-creds client-side terminal (e.g. a `force_refresh` REST failure).
     ClientError,
-    /// M-consecutive auth-handshake retry cap exhausted.
+    /// A retry cap ran out: consecutive token-stale auth handshakes
+    /// (`max_auth_handshake_failures`, also raises `AuthenticationFailedEvent`) or
+    /// reconnect attempts (`reconnect_attempts`). Callers see both as `NotOpen`.
     RetryCapExhausted,
 }
 
@@ -851,6 +982,38 @@ pub enum TransientClass {
     /// Transient token-refresh (GetWebSocketsToken) transport failure during
     /// the auth handshake.
     TokenRefreshTransient,
+}
+
+/// Subscribe-reply fields echoed on the Futures subscribe events; absent keys are `None` or empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FuturesSubscribeAck {
+    /// Wire `snapshot`.
+    pub snapshot: Option<bool>,
+    /// Wire `snap_orders`.
+    pub snap_orders: Option<bool>,
+    /// Wire `snap_trades`.
+    pub snap_trades: Option<bool>,
+    /// Wire `depth`.
+    pub depth: Option<u32>,
+    /// Wire `warnings`.
+    pub warnings: Vec<String>,
+    /// Wire `req_id`.
+    pub req_id: Option<u64>,
+    /// Wire `time_in`.
+    pub time_in: Option<String>,
+    /// Wire `time_out`.
+    pub time_out: Option<String>,
+}
+
+/// `FuturesSubscribeFailedEvent.error_class`. This is a closed, two-variant
+/// discriminator: `Transient` or `NonTransient`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuturesSubscribeFailureClass {
+    /// Retryable failure; the subscription retry budget remains in effect.
+    Transient,
+    /// Terminal failure for this Futures subscription entry.
+    NonTransient,
 }
 
 /// `CredentialRefreshFailedEvent.error_class`. Classifies the auth error from a
@@ -948,6 +1111,8 @@ pub enum WsOp {
     CancelAllOrdersAfter,
     /// `batch_add` — place 2-15 orders in one frame (per-row results).
     BatchAdd,
+    /// `batch_cancel` — cancel 2-50 orders in one frame (count only).
+    BatchCancel,
 }
 
 impl WsOp {
@@ -963,7 +1128,19 @@ impl WsOp {
                 | WsOp::CancelAll
                 | WsOp::CancelAllOrdersAfter
                 | WsOp::BatchAdd
+                | WsOp::BatchCancel
         )
+    }
+
+    /// Ops that place or change exposure; cancels and the dead-man are not placements.
+    pub(crate) const fn is_placement(self) -> bool {
+        match self {
+            Self::AddOrder | Self::AmendOrder | Self::BatchAdd => true,
+            Self::CancelOrder
+            | Self::CancelAll
+            | Self::CancelAllOrdersAfter
+            | Self::BatchCancel => false,
+        }
     }
 
     /// Parse a WS v2 request `method` string into a [`WsOp`]. Returns `None` for any
@@ -976,6 +1153,7 @@ impl WsOp {
             "cancel_all" => Some(WsOp::CancelAll),
             "cancel_all_orders_after" => Some(WsOp::CancelAllOrdersAfter),
             "batch_add" => Some(WsOp::BatchAdd),
+            "batch_cancel" => Some(WsOp::BatchCancel),
             _ => None,
         }
     }
@@ -999,6 +1177,22 @@ pub enum OrderOp {
     CancelAllOrdersAfter,
     /// Batch placement — 2-15 orders in one frame, per-row results.
     OrderBatch,
+    /// Batch cancel — 2-50 orders in one frame, count only.
+    BatchCancel,
+}
+
+impl OrderOp {
+    pub(crate) const fn has_per_row_results(self) -> bool {
+        match self {
+            Self::OrderBatch => true,
+            Self::AddOrder
+            | Self::AmendOrder
+            | Self::CancelOrder
+            | Self::CancelAll
+            | Self::CancelAllOrdersAfter
+            | Self::BatchCancel => false,
+        }
+    }
 }
 
 impl From<OrderOp> for WsOp {
@@ -1011,6 +1205,7 @@ impl From<OrderOp> for WsOp {
             OrderOp::CancelAll => WsOp::CancelAll,
             OrderOp::CancelAllOrdersAfter => WsOp::CancelAllOrdersAfter,
             OrderOp::OrderBatch => WsOp::BatchAdd,
+            OrderOp::BatchCancel => WsOp::BatchCancel,
         }
     }
 }
@@ -1039,7 +1234,7 @@ pub enum OrderSubmitStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WsFailReason {
-    /// The auth connection dropped (server/abnormal close, staleness,
+    /// A private connection (Spot auth or Unified private) dropped (server/abnormal close, staleness,
     /// force-reconnect) with the request in flight.
     ConnectionLost,
     /// The client was closed while the request was in flight.

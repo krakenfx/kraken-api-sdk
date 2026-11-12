@@ -1,11 +1,13 @@
 //! Wire-form trading pair identifiers.
 
+use std::sync::Arc;
+
 use serde::Serialize;
 /// Wire-form trading pair, e.g. `"BTC/USD"` — the modern `BASE/QUOTE` form.
 /// Legacy aliases (`XBT`, `XXBT`/`ZUSD` forms) are rejected at construction;
 /// `Ord` is lexicographic over the wire string for a stable resubscription sort.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Symbol(String);
+pub struct Symbol(Arc<str>);
 
 impl Symbol {
     /// Construct from a wire-form string, validating shape only (modern
@@ -24,7 +26,12 @@ impl Symbol {
         Self::validate_leg(base)?;
         Self::validate_leg(quote)?;
         // Uppercase to match Kraken's uppercase pair echo (ack routing). See docs/guides/wire-quirks.md.
-        Ok(Self(s.to_ascii_uppercase()))
+        let upper = if s.bytes().any(|b| b.is_ascii_lowercase()) {
+            s.to_ascii_uppercase()
+        } else {
+            s
+        };
+        Ok(Self(upper.into()))
     }
 
     /// Validate one leg: non-empty, alphanumeric, non-legacy. Digits allowed
@@ -88,6 +95,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_uppercase_wire_symbol_costs_no_more_allocations_than_a_string_symbol_did() {
+        let _ = Symbol::new("BTC/USD");
+        let (symbol, allocs) = crate::alloc_probe::count_allocs(|| Symbol::new("BTC/USD"));
+        assert_eq!(symbol.expect("canonical").as_str(), "BTC/USD");
+        assert!(
+            allocs <= 4,
+            "Symbol::new made {allocs} allocations, the String-backed type made 4"
+        );
+    }
+
+    #[test]
     fn symbol_accepts_canonical_form() {
         let s = Symbol::new("BTC/USD").expect("BTC/USD is canonical");
         assert_eq!(s.as_str(), "BTC/USD");
@@ -109,6 +127,27 @@ mod tests {
         assert_eq!(Symbol::new("btc/usd").unwrap().as_str(), "BTC/USD");
         assert_eq!(Symbol::new("Eth/Usd").unwrap().as_str(), "ETH/USD");
         assert_eq!(Symbol::new("1inch/usd").unwrap().as_str(), "1INCH/USD");
+    }
+
+    #[test]
+    fn symbol_clone_shares_wire_storage() {
+        let symbol = Symbol::new("BTC/USD").unwrap();
+        let clone = symbol.clone();
+
+        assert!(Arc::ptr_eq(&symbol.0, &clone.0));
+    }
+
+    #[test]
+    fn symbol_clone_preserves_public_value_semantics() {
+        use std::collections::HashSet;
+
+        let symbol = Symbol::new("BTC/USD").unwrap();
+        let clone = symbol.clone();
+
+        assert_eq!(clone, symbol);
+        assert_eq!(clone.cmp(&symbol), std::cmp::Ordering::Equal);
+        assert_eq!(serde_json::to_string(&clone).unwrap(), "\"BTC/USD\"");
+        assert_eq!(HashSet::from([symbol, clone]).len(), 1);
     }
 
     #[test]

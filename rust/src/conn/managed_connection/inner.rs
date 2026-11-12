@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 
 use crate::dispatch::event_bus::{DispatchEventBus, WsFailReason, WsOp};
 use crate::error::ConnectionError;
-use crate::types::{ChannelName, MonotonicInstant, Symbol};
+use crate::types::{ChannelName, MonotonicInstant, StreamSymbol, WsUrl};
 
 /// Op-agnostic decoded shape of an inbound `req_id`-bearing WS response frame.
 /// On failure `error` is a single wire string (not an array).
@@ -22,6 +22,28 @@ pub struct WsResponse {
     pub result: serde_json::Value,
     /// Top-level `error` STRING on `success:false` (single string, not an array).
     pub error: Option<String>,
+    /// Top-level `retry_after_ms` on a throttled reply; `None` unless a non-negative integer.
+    pub retry_after_ms: Option<u64>,
+}
+
+impl WsResponse {
+    pub(crate) fn from_frame(req_id: u64, success: bool, json: &serde_json::Value) -> Self {
+        Self {
+            req_id,
+            success,
+            result: json
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            error: json
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            retry_after_ms: json
+                .get("retry_after_ms")
+                .and_then(serde_json::Value::as_u64),
+        }
+    }
 }
 
 /// One in-flight WS request awaiting its `req_id`-matched response.
@@ -64,12 +86,19 @@ impl DrainCause {
 
 /// Maps `req_id` → pending caller correlation; reactor single-writer. Drained
 /// before `ConnectionDroppedEvent` on every exit from `Open`.
-#[derive(Default)]
 pub(crate) struct PendingRequestMap {
+    url: WsUrl,
     entries: HashMap<u64, PendingRequest>,
 }
 
 impl PendingRequestMap {
+    pub(crate) fn new(url: WsUrl) -> Self {
+        Self {
+            url,
+            entries: HashMap::new(),
+        }
+    }
+
     pub(crate) fn record(&mut self, pending: PendingRequest) {
         self.entries.insert(pending.req_id, pending);
     }
@@ -105,7 +134,12 @@ impl PendingRequestMap {
                 event_version: 1,
                 timestamp_monotonic: bus.clock().now(),
                 request_id: None, // not awaited — req_id is in the payload
-                payload: crate::dispatch::EventPayload::WsRequestFailedEvent { req_id, op, reason },
+                payload: crate::dispatch::EventPayload::WsRequestFailedEvent {
+                    req_id,
+                    op,
+                    url: self.url,
+                    reason,
+                },
             });
         }
     }
@@ -123,31 +157,7 @@ impl PendingRequestMap {
         }
     }
 
-    /// Drain a single order's pending entry with a retryable error and emit its
-    /// `WsRequestFailedEvent`. Orders are never auto-resent.
-    pub(crate) fn drain_one_retryable(&mut self, req_id: u64, bus: &Arc<DispatchEventBus>) {
-        let Some(p) = self.entries.remove(&req_id) else {
-            return;
-        };
-        let op = p.op;
-        // Resolve the future FIRST (matching `drain`'s order), then emit.
-        let _ =
-            p.tx.send(Err(ConnectionError::request_in_flight_when_dropped()));
-        bus.publish(crate::dispatch::EventEnvelope {
-            event_type: crate::dispatch::EventType::WsRequestFailedEvent,
-            event_version: 1,
-            timestamp_monotonic: bus.clock().now(),
-            request_id: None, // not awaited — req_id is in the payload
-            payload: crate::dispatch::EventPayload::WsRequestFailedEvent {
-                req_id,
-                op,
-                reason: WsFailReason::ConnectionLost,
-            },
-        });
-    }
-
     /// Number of currently-recorded pending requests.
-    #[cfg(test)]
     pub(crate) fn pending_request_count(&self) -> usize {
         self.entries.len()
     }
@@ -282,17 +292,23 @@ pub(crate) struct TimerSet {
     pub staleness_due_at: Option<crate::types::MonotonicInstant>,
     pub close_timeout_due_at: Option<crate::types::MonotonicInstant>,
     pub rate_budget_window_advanced_at: Option<crate::types::MonotonicInstant>,
-    pub per_entry_subscribe_ack_timeouts:
-        std::collections::HashMap<(ChannelName, Option<Symbol>), crate::types::MonotonicInstant>,
+    pub per_entry_subscribe_ack_timeouts: std::collections::HashMap<
+        (ChannelName, Option<StreamSymbol>),
+        crate::types::MonotonicInstant,
+    >,
     /// Per-entry subscribe resend timers. Armed on `Backpressure` send failure.
     /// Single-shot.
-    pub per_entry_subscribe_resend_due:
-        std::collections::HashMap<(ChannelName, Option<Symbol>), crate::types::MonotonicInstant>,
+    pub per_entry_subscribe_resend_due: std::collections::HashMap<
+        (ChannelName, Option<StreamSymbol>),
+        crate::types::MonotonicInstant,
+    >,
     /// Per-`(Book, symbol)` reseed snapshot-liveness timers. Degrades to
     /// PassThrough after `MAX_CONSECUTIVE_BOOK_GAPS`. Single-shot.
-    pub per_entry_book_reseed_snapshot:
-        std::collections::HashMap<(ChannelName, Option<Symbol>), crate::types::MonotonicInstant>,
-    /// Proactive WS-token refresh tick (auth MC only). Kept armed through
+    pub per_entry_book_reseed_snapshot: std::collections::HashMap<
+        (ChannelName, Option<StreamSymbol>),
+        crate::types::MonotonicInstant,
+    >,
+    /// Proactive WS-token refresh tick (the timer-owning MC only). Kept armed through
     /// `BackingOff` so the warm cache survives reconnect.
     pub token_refresh_due_at: Option<crate::types::MonotonicInstant>,
 }
